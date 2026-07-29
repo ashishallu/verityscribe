@@ -6,9 +6,7 @@ import type { Session, User } from '@supabase/supabase-js'
 
 interface UserProfile {
   id: string
-  email: string
-  first_name: string
-  last_name: string
+  full_name: string
   role: 'super_admin' | 'hospital_admin' | 'staff'
 }
 
@@ -66,9 +64,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           // Fetch user profile
           const { data: profileData, error: profileError } = await supabase
             .from('profiles')
-            .select('*')
+            .select('id, full_name, role')
             .eq('id', currentSession.user.id)
-            .single()
+            .maybeSingle()
 
           if (!profileError && profileData) {
             setProfile(profileData)
@@ -95,9 +93,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // Fetch profile when session changes
         const { data: profileData } = await supabase
           .from('profiles')
-          .select('*')
+          .select('id, full_name, role')
           .eq('id', newSession.user.id)
-          .single()
+          .maybeSingle()
 
         setProfile(profileData ?? null)
       } else {
@@ -126,7 +124,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signUp = useCallback(async (email: string, password: string, firstName: string, lastName: string) => {
     if (!supabase) throw new Error('Supabase not initialized')
     
-    const { data: { user: newUser }, error: signUpError } = await supabase.auth.signUp({
+    const { error: signUpError } = await supabase.auth.signUp({
       email,
       password,
       options: {
@@ -143,22 +141,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       throw signUpError
     }
 
-    // Create profile immediately
-    if (newUser && supabase) {
-      const { error: profileError } = await supabase
-        .from('profiles')
-        .insert({
-          id: newUser.id,
-          email: newUser.email,
-          first_name: firstName,
-          last_name: lastName,
-          role: 'staff',
-        })
-
-      if (profileError) {
-        console.error('[v0] Profile creation error:', profileError)
-      }
-    }
+    // The database trigger creates a profile securely for every new auth user.
   }, [supabase])
 
   const signOut = useCallback(async () => {

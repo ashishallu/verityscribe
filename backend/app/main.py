@@ -8,8 +8,16 @@ from .middleware import RequestContextMiddleware
 config = settings()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 app = FastAPI(title=config.app_name, version="0.1.0", openapi_url=f"{config.api_prefix}/openapi.json")
-app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in config.cors_origins.split(',')], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(RequestContextMiddleware)
+# Add CORS last so it is the outermost middleware and also decorates errors.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
+)
 
 @app.get("/health")
 async def health() -> dict: return {"status": "ok", "environment": config.environment}
