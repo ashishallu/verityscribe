@@ -167,7 +167,7 @@ export default function DashboardPage() {
 
               <Avatar>
                 <AvatarFallback className="bg-slate-700 text-cyan-500">
-                  {profile?.first_name?.[0]}{profile?.last_name?.[0]}
+                  {profile?.full_name?.split(' ').map((name) => name[0]).join('').slice(0, 2)}
                 </AvatarFallback>
               </Avatar>
             </div>
