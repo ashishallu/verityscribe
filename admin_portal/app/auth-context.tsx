@@ -2,12 +2,13 @@
 
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
+import type { UserRole } from '@/lib/types/database'
 import type { Session, User } from '@supabase/supabase-js'
 
 interface UserProfile {
   id: string
   full_name: string
-  role: 'super_admin' | 'hospital_admin' | 'staff'
+  role: UserRole
 }
 
 interface AuthContextType {
@@ -132,7 +133,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         data: {
           first_name: firstName,
           last_name: lastName,
-          role: 'staff', // Default role for new signups
+          role: 'patient',
         },
       },
     })

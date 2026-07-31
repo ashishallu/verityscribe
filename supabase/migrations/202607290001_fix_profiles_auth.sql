@@ -12,7 +12,7 @@ begin
       nullif(trim(concat_ws(' ', new.raw_user_meta_data ->> 'first_name', new.raw_user_meta_data ->> 'last_name')), ''),
       split_part(coalesce(new.email, 'User'), '@', 1)
     ),
-    'staff'
+    'patient'
   )
   on conflict (id) do nothing;
   return new;
