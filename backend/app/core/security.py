@@ -33,3 +33,13 @@ def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(be
     except Exception:
         logger.exception("Supabase access-token validation failed")
         raise HTTPException(status_code=401, detail="Invalid access token")
+
+
+def require_roles(*roles: str):
+    def guard(claims: dict = Depends(current_claims)) -> dict:
+        role = claims.get("app_metadata", {}).get("role")
+        if role not in roles:
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return claims
+
+    return guard
