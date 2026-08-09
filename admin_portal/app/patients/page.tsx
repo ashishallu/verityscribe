@@ -1,16 +1,18 @@
 'use client'
 
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Users, Plus } from 'lucide-react'
 import { AdvancedTable } from '@/components/advanced-table'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useResource } from '@/lib/api/use-resource'
 import { ProtectedRoute } from '@/components/protected-route'
 
 export default function PatientsPage() {
   const { data: patients, total, loading, error, reload, remove } = useResource<any>('patients')
+  const [isAddPatientOpen, setIsAddPatientOpen] = useState(false)
 
   const handleView = (patient: any) => {
     console.log('[v0] View patient:', patient)
@@ -53,7 +55,7 @@ export default function PatientsPage() {
             </div>
             <p className="text-slate-400">Comprehensive patient database and management system</p>
           </div>
-          <Button className="gap-2 bg-cyan-600 hover:bg-cyan-700">
+          <Button className="gap-2 bg-cyan-600 hover:bg-cyan-700" onClick={() => setIsAddPatientOpen(true)}>
             <Plus className="h-4 w-4" />
             Add Patient
           </Button>
@@ -117,6 +119,22 @@ export default function PatientsPage() {
             )}
           </CardContent>
         </Card>
+
+        <Dialog open={isAddPatientOpen} onOpenChange={setIsAddPatientOpen}>
+          <DialogContent className="border-slate-700 bg-slate-950 text-slate-100">
+            <DialogHeader>
+              <DialogTitle>Add Patient</DialogTitle>
+              <DialogDescription className="text-slate-400">
+                Patient registration will be available here.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setIsAddPatientOpen(false)}>
+                Close
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   </ProtectedRoute>
