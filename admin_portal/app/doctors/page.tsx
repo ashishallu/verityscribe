@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useState } from 'react'
+import { FormEvent, useCallback, useMemo, useState } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -9,10 +9,31 @@ import { AdvancedTable } from '@/components/advanced-table'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useResource } from '@/lib/api/use-resource'
 import { ProtectedRoute } from '@/components/protected-route'
+import { useAuth } from '@/app/auth-context'
+import { ApiError, FastApiClient } from '@/lib/api/client'
+
+type DoctorForm = { email: string; first_name: string; last_name: string; phone: string; hospital_id: string; department_id: string; license_number: string; specialization: string; experience_years: string; qualification: string; consultation_fee_inr: string; is_available: boolean }
+const initialForm: DoctorForm = { email: '', first_name: '', last_name: '', phone: '', hospital_id: '', department_id: '', license_number: '', specialization: '', experience_years: '0', qualification: '', consultation_fee_inr: '0', is_available: true }
 
 export default function DoctorsPage() {
   const { data: doctors, total, loading, error, reload, remove } = useResource<any>('doctors')
   const [isAddDoctorOpen, setIsAddDoctorOpen] = useState(false)
+  const { session } = useAuth()
+  const apiClient = useMemo(() => new FastApiClient(async () => session), [session])
+  const [form, setForm] = useState<DoctorForm>(initialForm)
+  const [formError, setFormError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+
+  const handleProvision = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setFormError(null)
+    const experience = Number(form.experience_years); const fee = Number(form.consultation_fee_inr)
+    if (!form.hospital_id.trim() || !form.department_id.trim()) return setFormError('Hospital and department IDs are required.')
+    if (!Number.isInteger(experience) || experience < 0 || experience > 80 || !Number.isFinite(fee) || fee < 0) return setFormError('Enter valid experience and consultation fee values.')
+    setSubmitting(true)
+    try { await apiClient.create('doctors/provision', { ...form, hospital_id: form.hospital_id.trim(), department_id: form.department_id.trim(), experience_years: experience, consultation_fee_inr: fee, phone: form.phone.trim() || undefined }); setForm(initialForm); setIsAddDoctorOpen(false); await reload() }
+    catch (cause) { setFormError(cause instanceof ApiError ? cause.message : 'Unable to provision doctor. Please try again.') }
+    finally { setSubmitting(false) }
+  }
 
   const handleView = (doctor: any) => {
     console.log('[v0] View doctor:', doctor)
@@ -134,14 +155,17 @@ export default function DoctorsPage() {
             <DialogHeader>
               <DialogTitle>Add Doctor</DialogTitle>
               <DialogDescription className="text-slate-400">
-                Doctor registration will be available here.
+                An invitation will be sent and the doctor will be linked to the canonical account.
               </DialogDescription>
             </DialogHeader>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setIsAddDoctorOpen(false)}>
-                Close
-              </Button>
-            </DialogFooter>
+            <form className="grid max-h-[70vh] gap-3 overflow-y-auto sm:grid-cols-2" onSubmit={handleProvision}>
+              {(['first_name','last_name','email','phone','hospital_id','department_id','license_number','specialization','qualification'] as const).map((field) => <label key={field} className="grid gap-1 text-sm capitalize">{field.replaceAll('_',' ')}<input required={!['phone'].includes(field)} type={field === 'email' ? 'email' : 'text'} value={form[field]} onChange={(e) => setForm({ ...form, [field]: e.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>)}
+              <label className="grid gap-1 text-sm">Experience (years)<input required type="number" min="0" max="80" value={form.experience_years} onChange={(e) => setForm({ ...form, experience_years: e.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
+              <label className="grid gap-1 text-sm">Consultation fee (INR)<input required type="number" min="0" step="0.01" value={form.consultation_fee_inr} onChange={(e) => setForm({ ...form, consultation_fee_inr: e.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
+              <label className="flex items-center gap-2 text-sm sm:col-span-2"><input type="checkbox" checked={form.is_available} onChange={(e) => setForm({ ...form, is_available: e.target.checked })} /> Available for consultations</label>
+              {formError && <p className="text-sm text-red-300 sm:col-span-2" role="alert">{formError}</p>}
+              <DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" onClick={() => setIsAddDoctorOpen(false)}>Cancel</Button><Button type="submit" disabled={submitting}>{submitting ? 'Inviting…' : 'Create Doctor'}</Button></DialogFooter>
+            </form>
           </DialogContent>
         </Dialog>
       </div>
