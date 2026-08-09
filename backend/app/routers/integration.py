@@ -320,6 +320,48 @@ def medicine_catalog(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1
     return {"data": result.data or [], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
 
 
+@router.get("/medicines/{medicine_id}")
+def medicine_detail(medicine_id: str, _: dict = Depends(current_claims)):
+    result = db().table("medicines").select("*").eq("id", medicine_id).limit(1).execute().data or []
+    if not result:
+        raise HTTPException(status_code=404, detail="Medicine not found")
+    return {"data": result[0]}
+
+
+def _patient_table_rows(client: Client, table: str, patient_id: str) -> list[dict]:
+    """Read an existing patient-linked table without assuming optional columns."""
+    try:
+        return client.table(table).select("*").eq("patient_id", patient_id).order("created_at", desc=True).limit(100).execute().data or []
+    except Exception:
+        # Some live tables may use a different relationship or have no rows; do not
+        # make the complete record endpoint fail because an optional section is absent.
+        return []
+
+
+@router.get("/patients/me/medical-record")
+def my_medical_record(patient: dict = Depends(get_current_patient)):
+    client = db()
+    patient_id = patient["id"]
+    sections = {
+        "medical_history": _patient_table_rows(client, "medical_history", patient_id),
+        "allergies": _patient_table_rows(client, "allergies", patient_id),
+        "chronic_conditions": _patient_table_rows(client, "chronic_conditions", patient_id),
+        "surgeries": _patient_table_rows(client, "surgeries", patient_id),
+        "vaccinations": _patient_table_rows(client, "vaccinations", patient_id),
+        "family_history": _patient_table_rows(client, "family_history", patient_id),
+        "lifestyle": _patient_table_rows(client, "lifestyle", patient_id),
+        "disabilities": _patient_table_rows(client, "disabilities", patient_id),
+        "vitals": _patient_table_rows(client, "vitals", patient_id),
+        "measurements": _patient_table_rows(client, "patient_measurements", patient_id),
+        "consultations": client.table("consultations").select("*").eq("patient_id", patient_id).order("consultation_date", desc=True).limit(100).execute().data or [],
+        "prescriptions": client.table("prescriptions").select("*").eq("patient_id", patient_id).order("prescription_date", desc=True).limit(100).execute().data or [],
+        "reports": client.table("reports").select("*").eq("patient_id", patient_id).order("report_date", desc=True).limit(100).execute().data or [],
+    }
+    consultation_ids = [row.get("id") for row in sections["consultations"] if row.get("id")]
+    sections["diagnoses"] = _rows(client, "diagnoses", "consultation_id", consultation_ids) if consultation_ids else []
+    return {"data": {"patient": patient, **sections}}
+
+
 @router.post("/consultations/{consultation_id}/prescription", status_code=status.HTTP_201_CREATED)
 def create_prescription(consultation_id: str, payload: PrescriptionCreate, doctor: dict = Depends(get_current_doctor)):
     client = db(); consultation = _owned_consultation(client, consultation_id, doctor["id"])
