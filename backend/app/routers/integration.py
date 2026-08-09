@@ -28,6 +28,41 @@ class ConsultationCreate(BaseModel):
     treatment_plan: str | None = None
     follow_up_date: date | None = None
     consultation_type: str
+    consultation_fee: float | None = Field(default=None, ge=0)
+
+
+class NoteCreate(BaseModel):
+    note_text: str = Field(min_length=1, max_length=10000)
+
+
+class DiagnosisCreate(BaseModel):
+    diagnosis_code: str | None = None
+    diagnosis_name: str = Field(min_length=1, max_length=500)
+    severity: str | None = None
+
+
+class PrescriptionItemCreate(BaseModel):
+    medicine_id: str
+    quantity: int = Field(gt=0)
+    dosage: str | None = None
+    frequency: str | None = None
+    duration_days: int | None = Field(default=None, gt=0)
+    instructions: str | None = None
+
+
+class PrescriptionCreate(BaseModel):
+    expiry_date: date | None = None
+    notes: str | None = None
+    is_digital: bool = True
+    items: list[PrescriptionItemCreate] = Field(min_length=1)
+
+
+class ReportCreate(BaseModel):
+    report_type: str
+    report_date: date
+    report_file_url: str | None = None
+    findings: str | None = None
+    recommendations: str | None = None
 
 
 def db() -> Client:
@@ -176,7 +211,7 @@ def create_consultation(payload: ConsultationCreate, doctor: dict = Depends(get_
     existing = client.table("consultations").select("id").eq("appointment_id", payload.appointment_id).limit(1).execute().data
     if existing:
         raise HTTPException(status_code=409, detail="A consultation already exists for this appointment")
-    created = client.table("consultations").insert({"appointment_id": payload.appointment_id, "patient_id": appointment["patient_id"], "doctor_id": doctor["id"], "symptoms": payload.symptoms, "diagnosis": payload.diagnosis, "treatment_plan": payload.treatment_plan, "follow_up_date": payload.follow_up_date.isoformat() if payload.follow_up_date else None, "consultation_type": payload.consultation_type}).execute().data[0]
+    created = client.table("consultations").insert({"appointment_id": payload.appointment_id, "patient_id": appointment["patient_id"], "doctor_id": doctor["id"], "consultation_date": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), "symptoms": payload.symptoms, "diagnosis": payload.diagnosis, "treatment_plan": payload.treatment_plan, "follow_up_date": payload.follow_up_date.isoformat() if payload.follow_up_date else None, "consultation_type": payload.consultation_type, "consultation_fee": payload.consultation_fee}).execute().data[0]
     return {"data": created}
 
 
@@ -205,3 +240,95 @@ def scoped_consultations(page: int = Query(1, ge=1), page_size: int = Query(25, 
         raise HTTPException(status_code=403, detail="Insufficient role")
     result = query.order("created_at", desc=True).range((page - 1) * page_size, page * page_size - 1).execute()
     return {"data": result.data or [], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
+
+
+def _owned_consultation(client: Client, consultation_id: str, doctor_id: str) -> dict:
+    consultation = client.table("consultations").select("*").eq("id", consultation_id).maybe_single().execute().data
+    if not consultation:
+        raise HTTPException(status_code=404, detail="Consultation not found")
+    if consultation.get("doctor_id") != doctor_id:
+        raise HTTPException(status_code=403, detail="You cannot access this consultation")
+    return consultation
+
+
+@router.post("/consultations/{consultation_id}/notes", status_code=status.HTTP_201_CREATED)
+def add_note(consultation_id: str, payload: NoteCreate, doctor: dict = Depends(get_current_doctor)):
+    row = db().table("consultation_notes").insert({"consultation_id": _owned_consultation(db(), consultation_id, doctor["id"])["id"], "note_text": payload.note_text, "created_by": doctor["id"]}).execute().data[0]
+    return {"data": row}
+
+
+@router.get("/consultations/{consultation_id}/notes")
+def list_notes(consultation_id: str, claims: dict = Depends(current_claims)):
+    client = db(); consultation = client.table("consultations").select("id,doctor_id,patient_id").eq("id", consultation_id).maybe_single().execute().data
+    if not consultation: raise HTTPException(status_code=404, detail="Consultation not found")
+    if claims.get("app_metadata", {}).get("role") == "doctor" and consultation["doctor_id"] != claims["sub"]: raise HTTPException(status_code=403, detail="You cannot access these notes")
+    if claims.get("app_metadata", {}).get("role") == "patient" and consultation["patient_id"] != claims["sub"]: raise HTTPException(status_code=403, detail="You cannot access these notes")
+    return {"data": client.table("consultation_notes").select("*").eq("consultation_id", consultation_id).order("created_at").execute().data or []}
+
+
+@router.post("/consultations/{consultation_id}/diagnoses", status_code=status.HTTP_201_CREATED)
+def add_diagnosis(consultation_id: str, payload: DiagnosisCreate, doctor: dict = Depends(get_current_doctor)):
+    _owned_consultation(db(), consultation_id, doctor["id"])
+    row = db().table("diagnoses").insert({"consultation_id": consultation_id, "diagnosis_code": payload.diagnosis_code, "diagnosis_name": payload.diagnosis_name, "severity": payload.severity}).execute().data[0]
+    return {"data": row}
+
+
+@router.get("/consultations/{consultation_id}/diagnoses")
+def list_diagnoses(consultation_id: str, claims: dict = Depends(current_claims)):
+    client = db(); consultation = client.table("consultations").select("id,doctor_id,patient_id").eq("id", consultation_id).maybe_single().execute().data
+    if not consultation: raise HTTPException(status_code=404, detail="Consultation not found")
+    if claims.get("app_metadata", {}).get("role") == "doctor" and consultation["doctor_id"] != claims["sub"]: raise HTTPException(status_code=403, detail="You cannot access these diagnoses")
+    if claims.get("app_metadata", {}).get("role") == "patient" and consultation["patient_id"] != claims["sub"]: raise HTTPException(status_code=403, detail="You cannot access these diagnoses")
+    return {"data": client.table("diagnoses").select("*").eq("consultation_id", consultation_id).order("created_at").execute().data or []}
+
+
+@router.get("/medicines")
+def medicine_catalog(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, _: dict = Depends(current_claims)):
+    client = db(); query = client.table("medicines").select("*", count="exact")
+    if search: query = query.or_(f"name.ilike.%{search}%,generic_name.ilike.%{search}%")
+    result = query.order("name").range((page - 1) * page_size, page * page_size - 1).execute()
+    return {"data": result.data or [], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
+
+
+@router.post("/consultations/{consultation_id}/prescription", status_code=status.HTTP_201_CREATED)
+def create_prescription(consultation_id: str, payload: PrescriptionCreate, doctor: dict = Depends(get_current_doctor)):
+    client = db(); consultation = _owned_consultation(client, consultation_id, doctor["id"])
+    medicines = client.table("medicines").select("id").in_("id", [item.medicine_id for item in payload.items]).execute().data or []
+    if len(medicines) != len({item.medicine_id for item in payload.items}): raise HTTPException(status_code=422, detail="One or more medicines are invalid")
+    prescription = None
+    try:
+        prescription = client.table("prescriptions").insert({"consultation_id": consultation_id, "patient_id": consultation["patient_id"], "doctor_id": doctor["id"], "prescription_date": date.today().isoformat(), "expiry_date": payload.expiry_date.isoformat() if payload.expiry_date else None, "notes": payload.notes, "is_digital": payload.is_digital}).execute().data[0]
+        rows = [{"prescription_id": prescription["id"], **item.model_dump()} for item in payload.items]
+        items = client.table("prescription_items").insert(rows).execute().data or []
+        return {"data": {"prescription": prescription, "items": items}}
+    except Exception as exc:
+        if prescription:
+            try: client.table("prescription_items").delete().eq("prescription_id", prescription["id"]).execute(); client.table("prescriptions").delete().eq("id", prescription["id"]).execute()
+            except Exception: pass
+        raise HTTPException(status_code=502, detail="Unable to create the prescription") from exc
+
+
+@router.get("/me/prescriptions")
+def my_prescriptions(claims: dict = Depends(current_claims)):
+    client = db(); role = claims.get("app_metadata", {}).get("role")
+    column = "patient_id" if role == "patient" else "doctor_id" if role == "doctor" else None
+    if not column: raise HTTPException(status_code=403, detail="Prescription scope is not available for this role")
+    rows = client.table("prescriptions").select("*").eq(column, claims["sub"]).order("prescription_date", desc=True).execute().data or []
+    return {"data": rows}
+
+
+@router.post("/consultations/{consultation_id}/reports", status_code=status.HTTP_201_CREATED)
+def create_report(consultation_id: str, payload: ReportCreate, doctor: dict = Depends(get_current_doctor)):
+    client = db(); consultation = _owned_consultation(client, consultation_id, doctor["id"])
+    appointment = client.table("appointments").select("hospital_id").eq("id", consultation["appointment_id"]).maybe_single().execute().data
+    if not appointment or not appointment.get("hospital_id"): raise HTTPException(status_code=422, detail="Consultation hospital is unavailable")
+    row = client.table("reports").insert({"patient_id": consultation["patient_id"], "doctor_id": doctor["id"], "hospital_id": appointment["hospital_id"], "report_type": payload.report_type, "report_date": payload.report_date.isoformat(), "report_file_url": payload.report_file_url, "findings": payload.findings, "recommendations": payload.recommendations}).execute().data[0]
+    return {"data": row}
+
+
+@router.get("/me/reports")
+def my_reports(claims: dict = Depends(current_claims)):
+    client = db(); role = claims.get("app_metadata", {}).get("role")
+    column = "patient_id" if role == "patient" else "doctor_id" if role == "doctor" else None
+    if not column: raise HTTPException(status_code=403, detail="Report scope is not available for this role")
+    return {"data": client.table("reports").select("*").eq(column, claims["sub"]).order("report_date", desc=True).execute().data or []}
