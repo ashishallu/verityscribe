@@ -7,6 +7,7 @@ from supabase import Client, create_client
 
 from ..core.config import settings
 from ..core.security import current_claims, get_current_doctor, get_current_patient, get_current_profile, require_roles
+from ..services.ai_service import ai_provider
 
 router = APIRouter(tags=["integration"])
 
@@ -427,6 +428,11 @@ def notification_preferences(claims: dict = Depends(current_claims)):
     return {"data": db().table("notification_preferences").select("*").eq("user_id", claims["sub"]).order("notification_type").execute().data or []}
 
 
+@router.get("/notification-preferences")
+def notification_preferences_alias(claims: dict = Depends(current_claims)):
+    return notification_preferences(claims)
+
+
 @router.get("/me/medication-schedules")
 def medication_schedules(patient: dict = Depends(get_current_patient)):
     client = db(); prescriptions = client.table("prescriptions").select("id").eq("patient_id", patient["id"]).execute().data or []
@@ -450,6 +456,37 @@ def my_voice_records(patient: dict = Depends(get_current_patient)):
     for transcript in transcripts: by_recording.setdefault(transcript.get("voice_recording_id"), []).append(transcript)
     for recording in recordings: recording["transcripts"] = by_recording.get(recording["id"], [])
     return {"data": recordings}
+
+
+class AIProcessRequest(BaseModel):
+    voice_transcript_id: str
+
+
+def _ai_summary(client: Client, consultation_id: str) -> dict | None:
+    return client.table("ai_consultation_summary").select("*").eq("consultation_id", consultation_id).order("created_at", desc=True).limit(1).execute().data[0] if client.table("ai_consultation_summary").select("id").eq("consultation_id", consultation_id).limit(1).execute().data else None
+
+
+@router.get("/consultations/{consultation_id}/ai")
+def consultation_ai(consultation_id: str, doctor: dict = Depends(get_current_doctor)):
+    client = db(); _owned_consultation(client, consultation_id, doctor["id"])
+    summary = _ai_summary(client, consultation_id)
+    if not summary: raise HTTPException(status_code=404, detail="AI draft not found")
+    sid = summary["id"]
+    return {"data": {"summary": summary, "diagnoses": _rows(client, "ai_extracted_diagnosis", "ai_consultation_summary_id", [sid]), "medicines": _rows(client, "ai_extracted_medicines", "ai_consultation_summary_id", [sid]), "notes": _rows(client, "ai_generated_notes", "ai_consultation_summary_id", [sid])}}
+
+
+@router.post("/consultations/{consultation_id}/ai/process", status_code=status.HTTP_201_CREATED)
+def process_consultation_ai(consultation_id: str, payload: AIProcessRequest, doctor: dict = Depends(get_current_doctor)):
+    client = db(); consultation = _owned_consultation(client, consultation_id, doctor["id"])
+    transcript = client.table("voice_transcripts").select("id,voice_recording_id,transcript_text").eq("id", payload.voice_transcript_id).limit(1).execute().data or []
+    if not transcript: raise HTTPException(status_code=404, detail="Voice transcript not found")
+    recording = client.table("voice_recordings").select("id,doctor_id").eq("id", transcript[0]["voice_recording_id"]).limit(1).execute().data or []
+    if not recording or recording[0].get("doctor_id") != doctor["id"]: raise HTTPException(status_code=403, detail="You cannot process this transcript")
+    draft = ai_provider.generate_draft(transcript[0].get("transcript_text") or "")
+    summary = client.table("ai_consultation_summary").insert({"voice_transcript_id": payload.voice_transcript_id, "consultation_id": consultation["id"], "summary_text": draft.summary_text, "key_points": draft.key_points}).execute().data[0]
+    sid = summary["id"]
+    notes = client.table("ai_generated_notes").insert({"ai_consultation_summary_id": sid, "note_text": draft.notes}).execute().data or []
+    return {"data": {"summary": summary, "diagnoses": [], "medicines": [], "notes": notes, "draft": True}}
 
 
 @router.post("/consultations/{consultation_id}/prescription", status_code=status.HTTP_201_CREATED)
