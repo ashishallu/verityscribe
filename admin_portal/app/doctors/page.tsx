@@ -1,16 +1,18 @@
 'use client'
 
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Stethoscope, Plus, Star } from 'lucide-react'
 import { AdvancedTable } from '@/components/advanced-table'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useResource } from '@/lib/api/use-resource'
 import { ProtectedRoute } from '@/components/protected-route'
 
 export default function DoctorsPage() {
   const { data: doctors, total, loading, error, reload, remove } = useResource<any>('doctors')
+  const [isAddDoctorOpen, setIsAddDoctorOpen] = useState(false)
 
   const handleView = (doctor: any) => {
     console.log('[v0] View doctor:', doctor)
@@ -62,7 +64,7 @@ export default function DoctorsPage() {
             </div>
             <p className="text-slate-400">Browse and manage healthcare professionals</p>
           </div>
-          <Button className="gap-2 bg-cyan-600 hover:bg-cyan-700">
+          <Button className="gap-2 bg-cyan-600 hover:bg-cyan-700" onClick={() => setIsAddDoctorOpen(true)}>
             <Plus className="h-4 w-4" />
             Add Doctor
           </Button>
@@ -126,6 +128,22 @@ export default function DoctorsPage() {
             )}
           </CardContent>
         </Card>
+
+        <Dialog open={isAddDoctorOpen} onOpenChange={setIsAddDoctorOpen}>
+          <DialogContent className="border-slate-700 bg-slate-950 text-slate-100">
+            <DialogHeader>
+              <DialogTitle>Add Doctor</DialogTitle>
+              <DialogDescription className="text-slate-400">
+                Doctor registration will be available here.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setIsAddDoctorOpen(false)}>
+                Close
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   </ProtectedRoute>
