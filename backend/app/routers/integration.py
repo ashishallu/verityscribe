@@ -497,7 +497,12 @@ def process_consultation_ai(consultation_id: str, payload: AIProcessRequest, doc
     if not transcript: raise HTTPException(status_code=404, detail="Voice transcript not found")
     recording = client.table("voice_recordings").select("id,doctor_id").eq("id", transcript[0]["voice_recording_id"]).limit(1).execute().data or []
     if not recording or recording[0].get("doctor_id") != doctor["id"]: raise HTTPException(status_code=403, detail="You cannot process this transcript")
-    draft = ai_provider.generate_draft(transcript[0].get("transcript_text") or "")
+    try:
+        draft = ai_provider.generate_draft(transcript[0].get("transcript_text") or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="AI processing is currently unavailable") from exc
     summary = client.table("ai_consultation_summary").insert({"voice_transcript_id": payload.voice_transcript_id, "consultation_id": consultation["id"], "summary_text": draft.summary_text, "key_points": draft.key_points}).execute().data[0]
     sid = summary["id"]
     notes = client.table("ai_generated_notes").insert({"ai_consultation_summary_id": sid, "note_text": draft.notes}).execute().data or []
