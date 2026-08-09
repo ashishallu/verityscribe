@@ -64,5 +64,6 @@ final reportsProvider = FutureProvider<List<Report>>(
     (ref) => ref.read(healthRepositoryProvider).reports());
 final patientProfileProvider = FutureProvider<Patient>((ref) => ref.read(healthRepositoryProvider).patientProfile());
 final hospitalsProvider = FutureProvider<List<Hospital>>((ref) => ref.read(healthRepositoryProvider).hospitals());
+final departmentsProvider = FutureProvider.family<List<Department>, String>((ref, hospitalId) => ref.read(healthRepositoryProvider).departments(hospitalId));
 final doctorsDirectoryProvider = FutureProvider<List<DoctorDirectoryItem>>((ref) => ref.read(healthRepositoryProvider).doctors());
 final appointmentsLiveProvider = FutureProvider<List<LiveAppointment>>((ref) => ref.read(healthRepositoryProvider).appointments());

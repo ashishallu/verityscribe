@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../providers/theme_provider.dart';
+import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ui.dart';
 
@@ -23,9 +24,9 @@ class ProfileScreen extends ConsumerWidget {
                       fontSize: 30,
                       fontWeight: FontWeight.w800)))),
       const SizedBox(height: 11),
-      const Center(
+      Center(
           child: Text(patient.name.isEmpty ? 'Patient' : patient.name,
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800))),
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800))),
       Center(
           child: Text('Verity ID • ${patient.medicalId}',
               style: TextStyle(

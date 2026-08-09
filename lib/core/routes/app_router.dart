@@ -35,6 +35,7 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/register', builder: (_, __) => const RegisterScreen()),
   GoRoute(path: '/doctors', builder: (_, __) => const DoctorsDirectoryScreen()),
   GoRoute(path: '/appointments', builder: (_, __) => const AppointmentsLiveScreen()),
+  GoRoute(path: '/book-appointment', builder: (_, __) => const AppointmentBookingScreen()),
   GoRoute(path: '/otp', builder: (_, __) => const OtpScreen()),
   GoRoute(
       path: '/biometric',
