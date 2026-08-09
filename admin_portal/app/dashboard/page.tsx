@@ -19,7 +19,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useResource } from '@/lib/api/use-resource'
 
 export default function DashboardPage() {
-  const { profile, loading, isAuthenticated, signOut } = useAuth()
+  const { profile, user, loading, isAuthenticated, signOut } = useAuth()
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
   const patients = useResource<{ id: string }>('patients')
   const doctors = useResource<{ id: string }>('doctors')
@@ -38,6 +38,7 @@ export default function DashboardPage() {
   }
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const router = useRouter()
+  const profileDisplayName = [profile?.first_name, profile?.last_name].filter(Boolean).join(' ') || user?.email?.split('@')[0] || 'User'
 
   useEffect(() => {
     if (!loading && !isAuthenticated) {
@@ -167,7 +168,7 @@ export default function DashboardPage() {
 
               <Avatar>
                 <AvatarFallback className="bg-slate-700 text-cyan-500">
-                  {profile?.full_name?.split(' ').map((name) => name[0]).join('').slice(0, 2)}
+                  {profileDisplayName.split(' ').map((name) => name[0]).join('').slice(0, 2)}
                 </AvatarFallback>
               </Avatar>
             </div>

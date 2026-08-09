@@ -7,7 +7,8 @@ import type { Session, User } from '@supabase/supabase-js'
 
 interface UserProfile {
   id: string
-  full_name: string
+  first_name: string | null
+  last_name: string | null
   role: UserRole
 }
 
@@ -65,7 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           // Fetch user profile
           const { data: profileData, error: profileError } = await supabase
             .from('profiles')
-            .select('id, full_name, role')
+            .select('id, first_name, last_name, role')
             .eq('id', currentSession.user.id)
             .maybeSingle()
 
@@ -94,7 +95,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // Fetch profile when session changes
         const { data: profileData } = await supabase
           .from('profiles')
-          .select('id, full_name, role')
+          .select('id, first_name, last_name, role')
           .eq('id', newSession.user.id)
           .maybeSingle()
 
