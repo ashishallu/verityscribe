@@ -63,7 +63,18 @@ def provision_doctor(payload: DoctorProvisionRequest, _: dict = Depends(require_
         raise HTTPException(status_code=422, detail="Hospital not found")
     if not department or department.get("hospital_id") != payload.hospital_id:
         raise HTTPException(status_code=422, detail="Department does not belong to the selected hospital")
-    existing = client.table("profiles").select("id").eq("email", payload.email).maybe_single().execute().data
+    try:
+        duplicate_result = (
+            client.table("profiles")
+            .select("id")
+            .eq("email", payload.email)
+            .limit(1)
+            .execute()
+        )
+        existing = duplicate_result.data[0] if duplicate_result.data else None
+    except Exception as exc:
+        logger.exception("Unable to check for an existing doctor profile")
+        raise HTTPException(status_code=502, detail="Unable to verify whether the doctor email already exists") from exc
     if existing:
         raise HTTPException(status_code=409, detail="A profile already exists for this email")
 
