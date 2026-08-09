@@ -20,7 +20,10 @@ class AIProvider:
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():
             raise ValueError("Transcript is empty")
-        provider_url = os.getenv("AI_LLM_BASE_URL")
+        provider_url = os.getenv("AI_LLM_BASE_URL") or f"https://api-inference.huggingface.co/models/{self.LLM_MODEL}"
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if provider_url.startswith("https://api-inference.huggingface.co") and not token:
+            raise RuntimeError("AI provider is not configured")
         if not provider_url:
             raise RuntimeError("AI provider is not configured")
         prompt = (
@@ -28,7 +31,7 @@ class AIProvider:
             "This is an assistive clinical draft; do not state conclusions as confirmed.\n\n"
             + transcript_text.strip()
         )
-        payload = self._request(provider_url, {"model": self.LLM_MODEL, "prompt": prompt})
+        payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
         try:
             return AIDraft(
                 summary_text=str(payload["summary_text"]),
@@ -40,8 +43,10 @@ class AIProvider:
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("AI provider returned an invalid draft") from exc
 
-    def _request(self, url: str, payload: dict) -> dict:
-        request = Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    def _request(self, url: str, payload: dict, token: str | None = None) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if token: headers["Authorization"] = f"Bearer {token}"
+        request = Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:
             with urlopen(request, timeout=120) as response:
                 body = json.loads(response.read().decode())
