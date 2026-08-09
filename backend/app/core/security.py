@@ -5,6 +5,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from supabase import create_client
 from .config import settings
+from supabase import Client
 
 bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
@@ -70,3 +71,41 @@ def require_roles(*roles: str):
         return claims
 
     return guard
+
+
+def _profile_client() -> Client:
+    config = settings()
+    if not config.supabase_url or not config.supabase_service_role_key:
+        raise HTTPException(status_code=503, detail="Authorization service is unavailable")
+    return create_client(config.supabase_url, config.supabase_service_role_key)
+
+
+def _profile_for_claims(claims: dict) -> dict:
+    profile = _profile_client().table("profiles").select("*").eq("id", claims["sub"]).maybe_single().execute().data
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+
+def get_current_profile(claims: dict = Depends(current_claims)) -> dict:
+    return _profile_for_claims(claims)
+
+
+def get_current_patient(claims: dict = Depends(current_claims)) -> dict:
+    profile = _profile_for_claims(claims)
+    if profile.get("role") != "patient":
+        raise HTTPException(status_code=403, detail="Patient access required")
+    patient = _profile_client().table("patients").select("*").eq("id", claims["sub"]).maybe_single().execute().data
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient record not found")
+    return patient
+
+
+def get_current_doctor(claims: dict = Depends(current_claims)) -> dict:
+    profile = _profile_for_claims(claims)
+    if profile.get("role") != "doctor":
+        raise HTTPException(status_code=403, detail="Doctor access required")
+    doctor = _profile_client().table("doctors").select("*").eq("id", claims["sub"]).maybe_single().execute().data
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor record not found")
+    return doctor

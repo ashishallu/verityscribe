@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
 from .routers.resources import resource_router
 from .routers.doctors import router as doctors_provision_router
+from .routers.integration import router as integration_router
 from .middleware import RequestContextMiddleware
 
 config = settings()
@@ -23,6 +24,7 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict: return {"status": "ok", "environment": config.environment}
 
-for name in ("patients", "doctors", "appointments", "consultations", "prescriptions", "reports", "medicines", "insurance", "notifications", "chat", "analytics", "admin", "voice"):
+for name in ("patients", "doctors", "prescriptions", "reports", "medicines", "insurance", "notifications", "chat", "analytics", "admin", "voice"):
     app.include_router(resource_router(name), prefix=config.api_prefix)
 app.include_router(doctors_provision_router, prefix=config.api_prefix)
+app.include_router(integration_router, prefix=config.api_prefix)
