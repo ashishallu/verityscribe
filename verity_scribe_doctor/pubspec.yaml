@@ -9,6 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  http: ^1.2.2
+  supabase_flutter: ^2.8.3
+  flutter_riverpod: ^2.5.1
 
 dev_dependencies:
   flutter_test:
