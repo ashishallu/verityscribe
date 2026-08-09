@@ -40,6 +40,9 @@ class SupabaseAuthRepository implements AuthRepository {
 }
 
 abstract class HealthRepository {
+  Future<List<Map<String,dynamic>>> clinicalConsultations();
+  Future<List<Map<String,dynamic>>> prescriptionsLive();
+  Future<List<Map<String,dynamic>>> reportsLive();
   Future<Patient> patientProfile();
   Future<List<Hospital>> hospitals();
   Future<List<Department>> departments(String hospitalId);
@@ -63,6 +66,9 @@ class ApiHealthRepository implements HealthRepository {
     final root = _row(value);
     return (root['data'] as List? ?? const []).map(_row).toList();
   }
+  @override Future<List<Map<String,dynamic>>> clinicalConsultations() async => _rows((await _client.get<dynamic>('/me/consultations')).data);
+  @override Future<List<Map<String,dynamic>>> prescriptionsLive() async => _rows((await _client.get<dynamic>('/me/prescriptions')).data);
+  @override Future<List<Map<String,dynamic>>> reportsLive() async => _rows((await _client.get<dynamic>('/me/reports')).data);
   @override Future<Patient> patientProfile() async { final row=_row((await _client.get<dynamic>('/me/patient')).data)['data']; final x=_row(row); return Patient(id:x['id'].toString(),name:'${x['first_name']??''} ${x['last_name']??''}'.trim(),email:(x['email']??'').toString(),medicalId:(x['mrn']??x['id']).toString(),dateOfBirth:DateTime.tryParse((x['date_of_birth']??'2000-01-01').toString())??DateTime(2000)); }
   @override Future<List<Hospital>> hospitals() async => _rows((await _client.get<dynamic>('/hospitals')).data).map(Hospital.fromJson).toList();
   @override Future<List<Department>> departments(String hospitalId) async => _rows((await _client.get<dynamic>('/hospitals/$hospitalId/departments')).data).map(Department.fromJson).toList();

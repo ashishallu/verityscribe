@@ -8,12 +8,12 @@ import '../../features/notifications/notifications_screen.dart';
 import '../../features/profile_screen.dart';
 import '../../features/profile_details.dart';
 import '../../features/medical_history_screen.dart';
-import '../../features/records_screen.dart';
 import '../../features/recording/recording_screens.dart';
 import '../../features/scan/scan_screens.dart';
 import '../../models/entities.dart';
 import '../app_shell.dart';
 import '../../features/live_care_screen.dart';
+import '../../features/live_clinical_screen.dart';
 
 final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/', builder: (_, __) => const SplashScreen()),
@@ -36,6 +36,9 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/doctors', builder: (_, __) => const DoctorsDirectoryScreen()),
   GoRoute(path: '/appointments', builder: (_, __) => const AppointmentsLiveScreen()),
   GoRoute(path: '/book-appointment', builder: (_, __) => const AppointmentBookingScreen()),
+  GoRoute(path: '/consultations-live', builder: (_, __) => const LiveConsultationsScreen()),
+  GoRoute(path: '/prescriptions-live', builder: (_, __) => const LivePrescriptionsScreen()),
+  GoRoute(path: '/reports-live', builder: (_, __) => const LiveReportsScreen()),
   GoRoute(path: '/otp', builder: (_, __) => const OtpScreen()),
   GoRoute(
       path: '/biometric',
@@ -94,7 +97,7 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
     GoRoute(path: '/ai', builder: (_, __) => const AiScreen()),
     GoRoute(path: '/medicines', builder: (_, __) => const MedicinesScreen()),
     GoRoute(path: '/alarms', builder: (_, __) => const AlarmsScreen()),
-    GoRoute(path: '/records', builder: (_, __) => const RecordsScreen()),
+    GoRoute(path: '/records', builder: (_, __) => const LiveConsultationsScreen()),
     GoRoute(path: '/profile', builder: (_, __) => const ProfileScreen())
   ])
 ]);
