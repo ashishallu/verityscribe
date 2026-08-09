@@ -401,6 +401,11 @@ def my_insurance(patient: dict = Depends(get_current_patient)):
     return {"data": {"policies": policies, "claims": claims}}
 
 
+@router.get("/insurance/claims")
+def my_insurance_claims(patient: dict = Depends(get_current_patient)):
+    return {"data": db().table("insurance_claims").select("*").eq("patient_id", patient["id"]).order("claim_date", desc=True).limit(100).execute().data or []}
+
+
 @router.get("/notifications")
 def my_notifications(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), claims: dict = Depends(current_claims)):
     client = db(); user_id = claims["sub"]
@@ -443,9 +448,19 @@ def medication_schedules(patient: dict = Depends(get_current_patient)):
     return {"data": schedules}
 
 
+@router.get("/medication-schedules")
+def medication_schedules_alias(patient: dict = Depends(get_current_patient)):
+    return medication_schedules(patient)
+
+
 @router.get("/me/pharmacy-orders")
 def pharmacy_orders(patient: dict = Depends(get_current_patient)):
     return {"data": db().table("pharmacy_orders").select("*").eq("patient_id", patient["id"]).order("order_date", desc=True).limit(100).execute().data or []}
+
+
+@router.get("/pharmacy-orders")
+def pharmacy_orders_alias(patient: dict = Depends(get_current_patient)):
+    return pharmacy_orders(patient)
 
 
 @router.get("/me/voice")
