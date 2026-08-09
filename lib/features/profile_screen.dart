@@ -10,23 +10,24 @@ class ProfileScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final dark = ref.watch(themeProvider) == ThemeMode.dark;
-    return ListView(padding: const EdgeInsets.only(bottom: 28), children: [
+    final profile = ref.watch(patientProfileProvider);
+    return profile.when(loading: () => const Center(child: CircularProgressIndicator()), error: (error, _) => Center(child: Text('Unable to load profile: $error')), data: (patient) => ListView(padding: const EdgeInsets.only(bottom: 28), children: [
       const SizedBox(height: 22),
       Center(
           child: CircleAvatar(
               radius: 43,
               backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-              child: const Text('A',
+          child: Text(patient.name.isEmpty ? 'P' : patient.name.substring(0, 1).toUpperCase(),
                   style: TextStyle(
                       color: AppTheme.blue,
                       fontSize: 30,
                       fontWeight: FontWeight.w800)))),
       const SizedBox(height: 11),
       const Center(
-          child: Text('Ashish Allu',
+          child: Text(patient.name.isEmpty ? 'Patient' : patient.name,
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800))),
       Center(
-          child: Text('Verity ID • VS-2048-731',
+          child: Text('Verity ID • ${patient.medicalId}',
               style: TextStyle(
                   fontSize: 12,
                   color: Theme.of(context).colorScheme.onSurfaceVariant))),
@@ -73,7 +74,7 @@ class ProfileScreen extends ConsumerWidget {
             _row(context, Icons.lock_outline_rounded, 'Privacy & security',
                 'Control your health data', '/profile'),
           ]))),
-    ]);
+    ]));
   }
 
   Widget _row(BuildContext context, IconData icon, String title,

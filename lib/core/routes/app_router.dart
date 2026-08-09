@@ -13,6 +13,7 @@ import '../../features/recording/recording_screens.dart';
 import '../../features/scan/scan_screens.dart';
 import '../../models/entities.dart';
 import '../app_shell.dart';
+import '../../features/live_care_screen.dart';
 
 final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/', builder: (_, __) => const SplashScreen()),
@@ -32,6 +33,8 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
           next: '/login')),
   GoRoute(path: '/login', builder: (_, __) => const LoginScreen()),
   GoRoute(path: '/register', builder: (_, __) => const RegisterScreen()),
+  GoRoute(path: '/doctors', builder: (_, __) => const DoctorsDirectoryScreen()),
+  GoRoute(path: '/appointments', builder: (_, __) => const AppointmentsLiveScreen()),
   GoRoute(path: '/otp', builder: (_, __) => const OtpScreen()),
   GoRoute(
       path: '/biometric',

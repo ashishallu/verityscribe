@@ -40,6 +40,12 @@ class SupabaseAuthRepository implements AuthRepository {
 }
 
 abstract class HealthRepository {
+  Future<Patient> patientProfile();
+  Future<List<Hospital>> hospitals();
+  Future<List<Department>> departments(String hospitalId);
+  Future<List<DoctorDirectoryItem>> doctors();
+  Future<List<LiveAppointment>> appointments();
+  Future<LiveAppointment> bookAppointment({required String doctorId, required String hospitalId, required String date, required String time, required String consultationType, String? reason, String? notes});
   Future<List<Medicine>> medicines();
   Future<List<Consultation>> consultations();
   Future<Appointment> nextAppointment();
@@ -57,6 +63,12 @@ class ApiHealthRepository implements HealthRepository {
     final root = _row(value);
     return (root['data'] as List? ?? const []).map(_row).toList();
   }
+  @override Future<Patient> patientProfile() async { final row=_row((await _client.get<dynamic>('/me/patient')).data)['data']; final x=_row(row); return Patient(id:x['id'].toString(),name:'${x['first_name']??''} ${x['last_name']??''}'.trim(),email:(x['email']??'').toString(),medicalId:(x['mrn']??x['id']).toString(),dateOfBirth:DateTime.tryParse((x['date_of_birth']??'2000-01-01').toString())??DateTime(2000)); }
+  @override Future<List<Hospital>> hospitals() async => _rows((await _client.get<dynamic>('/hospitals')).data).map(Hospital.fromJson).toList();
+  @override Future<List<Department>> departments(String hospitalId) async => _rows((await _client.get<dynamic>('/hospitals/$hospitalId/departments')).data).map(Department.fromJson).toList();
+  @override Future<List<DoctorDirectoryItem>> doctors() async => _rows((await _client.get<dynamic>('/doctors/directory')).data).map(DoctorDirectoryItem.fromJson).toList();
+  @override Future<List<LiveAppointment>> appointments() async { final root=_row((await _client.get<dynamic>('/me/appointments')).data); return (root['data'] as List? ?? const []).map((x)=>LiveAppointment.fromJson(_row(x))).toList(); }
+  @override Future<LiveAppointment> bookAppointment({required String doctorId,required String hospitalId,required String date,required String time,required String consultationType,String? reason,String? notes}) async { final root=_row((await _client.post<dynamic>('/appointments',{'doctor_id':doctorId,'hospital_id':hospitalId,'appointment_date':date,'appointment_time':time,'consultation_type':consultationType,if(reason?.trim().isNotEmpty==true)'reason_for_visit':reason,if(notes?.trim().isNotEmpty==true)'notes':notes})).data); return LiveAppointment.fromJson(_row(root['data'])); }
 
   @override
   Future<List<Medicine>> medicines() async =>
