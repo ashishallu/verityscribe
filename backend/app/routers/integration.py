@@ -72,6 +72,36 @@ def db() -> Client:
     return create_client(cfg.supabase_url, cfg.supabase_service_role_key)
 
 
+def _admin_context(claims: dict) -> tuple[Client, dict]:
+    role = claims.get("app_metadata", {}).get("role")
+    if role not in {"hospital_admin", "super_admin"}:
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    client = db()
+    profile = get_current_profile(claims)
+    if role == "hospital_admin" and not profile.get("hospital_id"):
+        raise HTTPException(status_code=403, detail="Hospital scope is not configured")
+    return client, profile
+
+
+def _ensure_scope(record: dict | None, profile: dict, *, hospital_key: str = "hospital_id") -> dict:
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    scope = profile.get("hospital_id")
+    if scope and record.get(hospital_key) != scope:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return record
+
+
+def _rows(client: Client, table: str, column: str, values: list[str], select: str = "*") -> list[dict]:
+    if not values:
+        return []
+    return client.table(table).select(select).in_(column, list(dict.fromkeys(values))).execute().data or []
+
+
+def _index(rows: list[dict]) -> dict[str, dict]:
+    return {str(row["id"]): row for row in rows if row.get("id")}
+
+
 def _list(client: Client, table: str, page: int, page_size: int, search: str | None, hospital_id: str | None = None) -> dict[str, Any]:
     query = client.table(table).select("*", count="exact")
     if hospital_id:
@@ -332,3 +362,101 @@ def my_reports(claims: dict = Depends(current_claims)):
     column = "patient_id" if role == "patient" else "doctor_id" if role == "doctor" else None
     if not column: raise HTTPException(status_code=403, detail="Report scope is not available for this role")
     return {"data": client.table("reports").select("*").eq(column, claims["sub"]).order("report_date", desc=True).execute().data or []}
+
+
+def _clinical_relationships(client: Client, rows: list[dict]) -> None:
+    profiles = _index(_rows(client, "profiles", "id", [r.get("patient_id") or r.get("doctor_id") for r in rows if r.get("patient_id") or r.get("doctor_id")], "id,first_name,last_name,email,phone,role"))
+    hospitals = _index(_rows(client, "hospitals", "id", [r.get("hospital_id") for r in rows if r.get("hospital_id")], "id,name"))
+    departments = _index(_rows(client, "departments", "id", [r.get("department_id") for r in rows if r.get("department_id")], "id,name,hospital_id"))
+    for row in rows:
+        if row.get("patient_id") in profiles: row["patient"] = profiles[row["patient_id"]]
+        if row.get("doctor_id") in profiles: row["doctor"] = profiles[row["doctor_id"]]
+        if row.get("hospital_id") in hospitals: row["hospital"] = hospitals[row["hospital_id"]]
+        if row.get("department_id") in departments: row["department"] = departments[row["department_id"]]
+
+
+@router.get("/admin/patients/{patient_id}/overview")
+def admin_patient_overview(patient_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    patient = client.table("patients").select("*").eq("id", patient_id).maybe_single().execute().data
+    _ensure_scope(patient, profile)
+    appointments = client.table("appointments").select("*").eq("patient_id", patient_id).order("appointment_date", desc=True).limit(100).execute().data or []
+    consultations = client.table("consultations").select("*").eq("patient_id", patient_id).order("consultation_date", desc=True).limit(100).execute().data or []
+    prescriptions = client.table("prescriptions").select("*").eq("patient_id", patient_id).order("prescription_date", desc=True).limit(100).execute().data or []
+    reports = client.table("reports").select("*").eq("patient_id", patient_id).order("report_date", desc=True).limit(100).execute().data or []
+    _clinical_relationships(client, appointments + consultations + prescriptions + reports)
+    return {"data": {"patient": patient, "appointments": appointments, "consultations": consultations, "prescriptions": prescriptions, "reports": reports}}
+
+
+@router.get("/admin/doctors/{doctor_id}/overview")
+def admin_doctor_overview(doctor_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    doctor = client.table("doctors").select("*").eq("id", doctor_id).maybe_single().execute().data
+    _ensure_scope(doctor, profile)
+    doctor_profile = client.table("profiles").select("id,first_name,last_name,email,phone,role").eq("id", doctor_id).maybe_single().execute().data
+    appointments = client.table("appointments").select("*").eq("doctor_id", doctor_id).order("appointment_date", desc=True).limit(100).execute().data or []
+    consultations = client.table("consultations").select("*").eq("doctor_id", doctor_id).order("consultation_date", desc=True).limit(100).execute().data or []
+    prescriptions = client.table("prescriptions").select("*").eq("doctor_id", doctor_id).order("prescription_date", desc=True).limit(100).execute().data or []
+    reports = client.table("reports").select("*").eq("doctor_id", doctor_id).order("report_date", desc=True).limit(100).execute().data or []
+    _clinical_relationships(client, appointments + consultations + prescriptions + reports)
+    return {"data": {"doctor": {**doctor, "profile": doctor_profile}, "appointments": appointments, "consultations": consultations, "prescriptions": prescriptions, "reports": reports}}
+
+
+@router.get("/admin/appointments/{appointment_id}/overview")
+def admin_appointment_overview(appointment_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    appointment = client.table("appointments").select("*").eq("id", appointment_id).maybe_single().execute().data
+    _ensure_scope(appointment, profile)
+    _clinical_relationships(client, [appointment])
+    consultation = client.table("consultations").select("*").eq("appointment_id", appointment_id).maybe_single().execute().data
+    return {"data": {"appointment": appointment, "patient": appointment.get("patient"), "doctor": appointment.get("doctor"), "hospital": appointment.get("hospital"), "department": appointment.get("department"), "consultation": consultation}}
+
+
+@router.get("/admin/consultations/{consultation_id}/overview")
+def admin_consultation_overview(consultation_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    consultation = client.table("consultations").select("*").eq("id", consultation_id).maybe_single().execute().data
+    if not consultation: raise HTTPException(status_code=404, detail="Consultation not found")
+    appointment = client.table("appointments").select("*").eq("id", consultation["appointment_id"]).maybe_single().execute().data
+    _ensure_scope(appointment, profile)
+    _clinical_relationships(client, [appointment])
+    notes = client.table("consultation_notes").select("*").eq("consultation_id", consultation_id).order("created_at").limit(100).execute().data or []
+    diagnoses = client.table("diagnoses").select("*").eq("consultation_id", consultation_id).order("created_at").limit(100).execute().data or []
+    prescription = client.table("prescriptions").select("*").eq("consultation_id", consultation_id).maybe_single().execute().data
+    reports = client.table("reports").select("*").eq("patient_id", consultation["patient_id"]).eq("doctor_id", consultation["doctor_id"]).order("report_date", desc=True).limit(100).execute().data or []
+    if prescription:
+        items = client.table("prescription_items").select("*").eq("prescription_id", prescription["id"]).execute().data or []
+        medicines = _index(_rows(client, "medicines", "id", [i.get("medicine_id") for i in items], "id,name,generic_name,medicine_type,strength"))
+        for item in items: item["medicine"] = medicines.get(item.get("medicine_id"))
+        prescription["items"] = items
+    return {"data": {"consultation": consultation, "patient": appointment.get("patient"), "doctor": appointment.get("doctor"), "appointment": appointment, "notes": notes, "diagnoses": diagnoses, "prescription": prescription, "reports": reports}}
+
+
+@router.get("/admin/prescriptions/{prescription_id}/overview")
+def admin_prescription_overview(prescription_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    prescription = client.table("prescriptions").select("*").eq("id", prescription_id).maybe_single().execute().data
+    if not prescription: raise HTTPException(status_code=404, detail="Prescription not found")
+    patient = client.table("patients").select("*").eq("id", prescription["patient_id"]).maybe_single().execute().data
+    _ensure_scope(patient, profile)
+    doctor = client.table("doctors").select("*").eq("id", prescription["doctor_id"]).maybe_single().execute().data
+    consultation = client.table("consultations").select("*").eq("id", prescription["consultation_id"]).maybe_single().execute().data if prescription.get("consultation_id") else None
+    items = client.table("prescription_items").select("*").eq("prescription_id", prescription_id).execute().data or []
+    medicines = _index(_rows(client, "medicines", "id", [i.get("medicine_id") for i in items], "id,name,generic_name,medicine_type,strength"))
+    for item in items: item["medicine"] = medicines.get(item.get("medicine_id"))
+    return {"data": {"prescription": prescription, "patient": patient, "doctor": doctor, "consultation": consultation, "items": items}}
+
+
+@router.get("/admin/reports/{report_id}/overview")
+def admin_report_overview(report_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    report = client.table("reports").select("*").eq("id", report_id).maybe_single().execute().data
+    _ensure_scope(report, profile)
+    patient = client.table("patients").select("*").eq("id", report["patient_id"]).maybe_single().execute().data
+    doctor = client.table("doctors").select("*").eq("id", report["doctor_id"]).maybe_single().execute().data if report.get("doctor_id") else None
+    specialized = {}
+    for table in ("blood_reports", "ct_reports", "mri_reports", "ecg_reports", "xray_reports", "ultrasound_reports", "discharge_reports"):
+        matches = client.table(table).select("*").eq("report_id", report_id).limit(1).execute().data or []
+        row = matches[0] if matches else None
+        if row: specialized[table] = row
+    return {"data": {"report": report, "patient": patient, "doctor": doctor, "hospital": client.table("hospitals").select("id,name").eq("id", report["hospital_id"]).maybe_single().execute().data, "specialized": specialized}}
