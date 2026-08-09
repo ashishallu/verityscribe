@@ -1,6 +1,7 @@
 'use client'
 
 import { FormEvent, useCallback, useMemo, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -35,6 +36,7 @@ const initialPatientForm: PatientForm = {
 }
 
 export default function PatientsPage() {
+  const router = useRouter()
   const { data: patients, total, loading, error, reload, remove } = useResource<any>('patients')
   const { session } = useAuth()
   const apiClient = useMemo(() => new FastApiClient(async () => session), [session])
@@ -44,9 +46,7 @@ export default function PatientsPage() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
 
-  const handleView = (patient: any) => {
-    console.log('[v0] View patient:', patient)
-  }
+  const handleView = (patient: any) => router.push(`/patients/${patient.id}`)
 
   const handleEdit = (patient: any) => {
     console.log('[v0] Edit patient:', patient)

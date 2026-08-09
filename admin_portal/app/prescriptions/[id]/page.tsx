@@ -1,0 +1,2 @@
+import { ResourceDetail } from '@/components/resource-detail'
+export default function PrescriptionDetailPage() { return <ResourceDetail resource="prescriptions" title="Prescription" fields={[{key:'id',label:'Canonical ID'},{key:'consultation_id',label:'Consultation'},{key:'patient_id',label:'Patient'},{key:'doctor_id',label:'Doctor'},{key:'prescription_date',label:'Date'},{key:'expiry_date',label:'Expiry'},{key:'notes',label:'Notes'},{key:'is_digital',label:'Digital'}]} /> }

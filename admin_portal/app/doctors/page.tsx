@@ -1,6 +1,7 @@
 'use client'
 
 import { FormEvent, useCallback, useMemo, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -16,6 +17,7 @@ type DoctorForm = { email: string; first_name: string; last_name: string; phone:
 const initialForm: DoctorForm = { email: '', first_name: '', last_name: '', phone: '', hospital_id: '', department_id: '', license_number: '', specialization: '', experience_years: '0', qualification: '', consultation_fee_inr: '0', is_available: true }
 
 export default function DoctorsPage() {
+  const router = useRouter()
   const { data: doctors, total, loading, error, reload, remove } = useResource<any>('doctors')
   const [isAddDoctorOpen, setIsAddDoctorOpen] = useState(false)
   const { session } = useAuth()
@@ -35,9 +37,7 @@ export default function DoctorsPage() {
     finally { setSubmitting(false) }
   }
 
-  const handleView = (doctor: any) => {
-    console.log('[v0] View doctor:', doctor)
-  }
+  const handleView = (doctor: any) => router.push(`/doctors/${doctor.id}`)
 
   const handleEdit = (doctor: any) => {
     console.log('[v0] Edit doctor:', doctor)

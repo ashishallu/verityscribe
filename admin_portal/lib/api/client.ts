@@ -45,6 +45,10 @@ export class FastApiClient {
     return this.request<ApiPage<T>>(`/${resource}?${params}`)
   }
 
+  get<T>(resource: string, id: string) {
+    return this.request<{ data: T }>(`/${resource}/${id}`)
+  }
+
   create<T>(resource: string, payload: Partial<T>) {
     return this.request<{ data: T }>(`/${resource}`, { method: 'POST', body: JSON.stringify(payload) })
   }

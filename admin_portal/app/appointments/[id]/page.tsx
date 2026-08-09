@@ -1,0 +1,2 @@
+import { ResourceDetail } from '@/components/resource-detail'
+export default function AppointmentDetailPage() { return <ResourceDetail resource="appointments" title="Appointment" fields={[{key:'id',label:'Canonical ID'},{key:'patient_id',label:'Patient'},{key:'doctor_id',label:'Doctor'},{key:'hospital_id',label:'Hospital'},{key:'appointment_date',label:'Date'},{key:'appointment_time',label:'Time'},{key:'consultation_type',label:'Consultation type'},{key:'reason_for_visit',label:'Reason'},{key:'notes',label:'Notes'},{key:'status',label:'Status'}]} /> }
