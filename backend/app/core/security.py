@@ -1,4 +1,5 @@
 import logging
+import asyncio
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -8,7 +9,7 @@ from .config import settings
 bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
-def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
     if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
 
@@ -19,7 +20,10 @@ def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(be
 
     try:
         client = create_client(config.supabase_url, config.supabase_publishable_key)
-        response = client.auth.get_user(credentials.credentials)
+        response = await asyncio.wait_for(
+            asyncio.to_thread(client.auth.get_user, credentials.credentials),
+            timeout=15,
+        )
         user = response.user
         if not user:
             raise ValueError("Supabase returned no authenticated user")
@@ -30,6 +34,9 @@ def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(be
             "app_metadata": user.app_metadata or {},
         }
 
+    except asyncio.TimeoutError:
+        logger.exception("Supabase access-token validation timed out")
+        raise HTTPException(status_code=503, detail="Authentication service timed out")
     except Exception:
         logger.exception("Supabase access-token validation failed")
         raise HTTPException(status_code=401, detail="Invalid access token")
