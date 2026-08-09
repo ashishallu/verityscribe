@@ -14,6 +14,7 @@ import '../../models/entities.dart';
 import '../app_shell.dart';
 import '../../features/live_care_screen.dart';
 import '../../features/live_clinical_screen.dart';
+import '../../features/live_health_record_screen.dart';
 
 final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/', builder: (_, __) => const SplashScreen()),
@@ -39,6 +40,7 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/consultations-live', builder: (_, __) => const LiveConsultationsScreen()),
   GoRoute(path: '/prescriptions-live', builder: (_, __) => const LivePrescriptionsScreen()),
   GoRoute(path: '/reports-live', builder: (_, __) => const LiveReportsScreen()),
+  GoRoute(path: '/live-health-record', builder: (_, __) => const LiveHealthRecordScreen()),
   GoRoute(path: '/otp', builder: (_, __) => const OtpScreen()),
   GoRoute(
       path: '/biometric',
