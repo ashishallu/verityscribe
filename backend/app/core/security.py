@@ -28,15 +28,35 @@ async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depe
         if not user:
             raise ValueError("Supabase returned no authenticated user")
 
+        # Authorization is based on the canonical database profile, not mutable
+        # raw user metadata or stale JWT claims. The service key remains inside
+        # FastAPI and is never returned to the caller.
+        if not config.supabase_service_role_key:
+            logger.error("Supabase service role is not configured for role resolution")
+            raise HTTPException(status_code=503, detail="Authorization service is unavailable")
+        profile_client = create_client(config.supabase_url, config.supabase_service_role_key)
+        profile = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: profile_client.table("profiles").select("role").eq("id", user.id).maybe_single().execute().data
+            ),
+            timeout=15,
+        )
+        if not profile or not profile.get("role"):
+            raise HTTPException(status_code=403, detail="User profile role is not configured")
+
+        app_metadata = dict(user.app_metadata or {})
+        app_metadata["role"] = profile["role"]
         return {
             "sub": user.id,
             "email": user.email,
-            "app_metadata": user.app_metadata or {},
+            "app_metadata": app_metadata,
         }
 
     except asyncio.TimeoutError:
         logger.exception("Supabase access-token validation timed out")
         raise HTTPException(status_code=503, detail="Authentication service timed out")
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Supabase access-token validation failed")
         raise HTTPException(status_code=401, detail="Invalid access token")
