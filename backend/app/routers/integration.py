@@ -362,6 +362,96 @@ def my_medical_record(patient: dict = Depends(get_current_patient)):
     return {"data": {"patient": patient, **sections}}
 
 
+@router.get("/inventory")
+def inventory(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, low_stock: bool = False, expiring: bool = False, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    query = client.table("medicine_inventory").select("*, medicines!inner(id,name,generic_name,manufacturer,strength)", count="exact")
+    if profile.get("hospital_id"): query = query.eq("hospital_id", profile["hospital_id"])
+    if search: query = query.ilike("medicines.name", f"%{search}%")
+    result = query.order("expiry_date").range((page - 1) * page_size, page * page_size - 1).execute()
+    data = []
+    for row in result.data or []:
+        medicine = row.pop("medicines", None)
+        row["medicine"] = medicine
+        row["is_out_of_stock"] = (row.get("quantity") or 0) <= 0
+        row["is_low_stock"] = (row.get("quantity") or 0) <= (row.get("minimum_threshold") or 0)
+        if low_stock and not row["is_low_stock"]: continue
+        if expiring and not row.get("expiry_date"): continue
+        data.append(row)
+    return {"data": data, "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
+
+
+@router.get("/inventory/{inventory_id}")
+def inventory_detail(inventory_id: str, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    query = client.table("medicine_inventory").select("*, medicines!inner(id,name,generic_name,manufacturer,strength)").eq("id", inventory_id)
+    if profile.get("hospital_id"): query = query.eq("hospital_id", profile["hospital_id"])
+    rows = query.limit(1).execute().data or []
+    if not rows: raise HTTPException(status_code=404, detail="Inventory item not found")
+    row = rows[0]; row["medicine"] = row.pop("medicines", None); row["is_out_of_stock"] = (row.get("quantity") or 0) <= 0; row["is_low_stock"] = (row.get("quantity") or 0) <= (row.get("minimum_threshold") or 0)
+    return {"data": row}
+
+
+@router.get("/me/insurance")
+def my_insurance(patient: dict = Depends(get_current_patient)):
+    client = db(); policies = client.table("insurance_policies").select("*, insurance_providers!inner(id,name,registration_number,phone,website)").eq("patient_id", patient["id"]).order("created_at", desc=True).execute().data or []
+    claims = client.table("insurance_claims").select("*").eq("patient_id", patient["id"]).order("claim_date", desc=True).execute().data or []
+    for policy in policies: policy["provider"] = policy.pop("insurance_providers", None)
+    return {"data": {"policies": policies, "claims": claims}}
+
+
+@router.get("/notifications")
+def my_notifications(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), claims: dict = Depends(current_claims)):
+    client = db(); user_id = claims["sub"]
+    query = client.table("notifications").select("*", count="exact").eq("user_id", user_id)
+    result = query.order("created_at", desc=True).range((page - 1) * page_size, page * page_size - 1).execute()
+    unread = client.table("notifications").select("id", count="exact").eq("user_id", user_id).eq("is_read", False).execute().count or 0
+    return {"data": result.data or [], "meta": {"page": page, "page_size": page_size, "total": result.count or 0, "unread": unread}}
+
+
+@router.patch("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: str, claims: dict = Depends(current_claims)):
+    rows = db().table("notifications").update({"is_read": True, "read_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()}).eq("id", notification_id).eq("user_id", claims["sub"]).select("*").execute().data or []
+    if not rows: raise HTTPException(status_code=404, detail="Notification not found")
+    return {"data": rows[0]}
+
+
+@router.post("/notifications/read-all")
+def mark_all_notifications_read(claims: dict = Depends(current_claims)):
+    db().table("notifications").update({"is_read": True, "read_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()}).eq("user_id", claims["sub"]).eq("is_read", False).execute()
+    return {"data": {"updated": True}}
+
+
+@router.get("/me/notification-preferences")
+def notification_preferences(claims: dict = Depends(current_claims)):
+    return {"data": db().table("notification_preferences").select("*").eq("user_id", claims["sub"]).order("notification_type").execute().data or []}
+
+
+@router.get("/me/medication-schedules")
+def medication_schedules(patient: dict = Depends(get_current_patient)):
+    client = db(); prescriptions = client.table("prescriptions").select("id").eq("patient_id", patient["id"]).execute().data or []
+    ids = [p["id"] for p in prescriptions]
+    items = _rows(client, "prescription_items", "prescription_id", ids) if ids else []
+    item_ids = [i["id"] for i in items if i.get("id")]
+    schedules = _rows(client, "medicine_schedule", "prescription_item_id", item_ids) if item_ids else []
+    return {"data": schedules}
+
+
+@router.get("/me/pharmacy-orders")
+def pharmacy_orders(patient: dict = Depends(get_current_patient)):
+    return {"data": db().table("pharmacy_orders").select("*").eq("patient_id", patient["id"]).order("order_date", desc=True).limit(100).execute().data or []}
+
+
+@router.get("/me/voice")
+def my_voice_records(patient: dict = Depends(get_current_patient)):
+    client = db(); recordings = client.table("voice_recordings").select("id,patient_id,doctor_id,duration_seconds,file_size_bytes,created_at,deleted_at").eq("patient_id", patient["id"]).is_("deleted_at", "null").order("created_at", desc=True).limit(100).execute().data or []
+    ids = [r["id"] for r in recordings]; transcripts = _rows(client, "voice_transcripts", "voice_recording_id", ids) if ids else []
+    by_recording = {}
+    for transcript in transcripts: by_recording.setdefault(transcript.get("voice_recording_id"), []).append(transcript)
+    for recording in recordings: recording["transcripts"] = by_recording.get(recording["id"], [])
+    return {"data": recordings}
+
+
 @router.post("/consultations/{consultation_id}/prescription", status_code=status.HTTP_201_CREATED)
 def create_prescription(consultation_id: str, payload: PrescriptionCreate, doctor: dict = Depends(get_current_doctor)):
     client = db(); consultation = _owned_consultation(client, consultation_id, doctor["id"])
