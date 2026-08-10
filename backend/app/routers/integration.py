@@ -374,8 +374,10 @@ def my_consultations(claims: dict = Depends(current_claims)):
     if role not in {"patient", "doctor"}:
         raise HTTPException(status_code=403, detail="Consultation scope is not available for this role")
     column = "patient_id" if role == "patient" else "doctor_id"
-    result = db().table("consultations").select("*").eq(column, claims["sub"]).order("created_at", desc=True).execute()
-    return {"data": result.data or []}
+    client = db()
+    rows = client.table("consultations").select("*").eq(column, claims["sub"]).order("created_at", desc=True).execute().data or []
+    _clinical_relationships(client, rows)
+    return {"data": rows}
 
 
 @router.get("/consultations")
@@ -702,6 +704,11 @@ def my_prescriptions(claims: dict = Depends(current_claims)):
     column = "patient_id" if role == "patient" else "doctor_id" if role == "doctor" else None
     if not column: raise HTTPException(status_code=403, detail="Prescription scope is not available for this role")
     rows = client.table("prescriptions").select("*").eq(column, claims["sub"]).order("prescription_date", desc=True).execute().data or []
+    for row in rows:
+        items = client.table("prescription_items").select("*").eq("prescription_id", row["id"]).execute().data or []
+        medicine_ids = [item.get("medicine_id") for item in items if item.get("medicine_id")]
+        medicines = _index(_rows(client, "medicines", "id", medicine_ids, "*"))
+        row["items"] = [{**item, "medicine": medicines.get(str(item.get("medicine_id")))} for item in items]
     return {"data": rows}
 
 

@@ -77,16 +77,15 @@ class ApiHealthRepository implements HealthRepository {
   @override Future<LiveAppointment> bookAppointment({required String doctorId,required String hospitalId,required String date,required String time,required String consultationType,String? reason,String? notes}) async { final root=_row((await _client.post<dynamic>('/appointments',{'doctor_id':doctorId,'hospital_id':hospitalId,'appointment_date':date,'appointment_time':time,'consultation_type':consultationType,if(reason?.trim().isNotEmpty==true)'reason_for_visit':reason,if(notes?.trim().isNotEmpty==true)'notes':notes})).data); return LiveAppointment.fromJson(_row(root['data'])); }
 
   @override
-  Future<List<Medicine>> medicines() async =>
-      _rows((await _client.get<dynamic>('/medicines')).data)
-          .map((x) => Medicine(
-              id: x['id'] as String,
-              name: (x['name'] ?? 'Medicine') as String,
-              dosage: (x['dosage'] ?? 'As prescribed') as String,
-              purpose: (x['purpose'] ?? 'Treatment') as String,
-              schedule: (x['schedule'] ?? 'Daily') as String,
-              remaining: (x['remaining'] ?? 0) as int))
-          .toList();
+  Future<List<Medicine>> medicines() async {
+    final prescriptions = _rows((await _client.get<dynamic>('/me/prescriptions')).data);
+    return prescriptions.expand((prescription) => (prescription['items'] as List? ?? const []).map((item) {
+      final row = _row(item);
+      final medicine = _row(row['medicine'] ?? const {});
+      final quantity = (row['quantity'] as num? ?? 0).toInt();
+      return Medicine(id: row['medicine_id'].toString(), name: (medicine['name'] ?? '').toString(), dosage: (row['dosage'] ?? '').toString(), purpose: (medicine['description'] ?? '').toString(), schedule: (row['frequency'] ?? '').toString(), remaining: quantity, initialQuantity: quantity, dailyUsage: 1);
+    })).toList();
+  }
   @override
   Future<List<Consultation>> consultations() async =>
       _rows((await _client.get<dynamic>('/consultations')).data)
