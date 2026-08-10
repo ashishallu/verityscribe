@@ -49,6 +49,10 @@ export class FastApiClient {
     return this.request<{ data: T }>(`/${resource}/${id}`)
   }
 
+  getPath<T>(path: string) {
+    return this.request<T>(path.startsWith('/') ? path : `/${path}`)
+  }
+
   create<T>(resource: string, payload: Partial<T>) {
     return this.request<{ data: T }>(`/${resource}`, { method: 'POST', body: JSON.stringify(payload) })
   }

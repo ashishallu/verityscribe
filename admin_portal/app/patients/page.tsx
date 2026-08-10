@@ -48,10 +48,6 @@ export default function PatientsPage() {
 
   const handleView = (patient: any) => router.push(`/patients/${patient.id}`)
 
-  const handleEdit = (patient: any) => {
-    console.log('[v0] Edit patient:', patient)
-  }
-
   const handleDelete = useCallback(async (patient: any) => {
     if (window.confirm('Delete this patient record?')) await remove(patient.id)
   }, [remove])
@@ -191,7 +187,6 @@ export default function PatientsPage() {
                 columns={columns}
                 data={patients}
                 onView={handleView}
-                onEdit={handleEdit}
                 onDelete={handleDelete}
                 title="Patients"
                 searchable={true}

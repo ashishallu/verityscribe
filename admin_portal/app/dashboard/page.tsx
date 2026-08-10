@@ -29,12 +29,9 @@ export default function DashboardPage() {
   const stats = {
     activePatients: patients.total,
     activeDoctors: doctors.total,
-    todayAppointments: appointments.total,
-    emergencyAlerts: notifications.total,
-    bedsOccupancy: 0,
-    surgeries: 0,
+    appointments: appointments.total,
+    notifications: notifications.total,
     consultations: consultations.total,
-    revenue: 0,
   }
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const router = useRouter()
@@ -93,7 +90,7 @@ export default function DashboardPage() {
       await signOut()
       router.push('/auth/login')
     } catch (error) {
-      console.error('[v0] Logout error:', error)
+      console.error('Logout error:', error)
     }
   }
 
@@ -223,8 +220,8 @@ export default function DashboardPage() {
                     {[
                       { title: 'Active Patients', value: stats.activePatients, icon: Users, color: 'cyan' },
                       { title: 'Available Doctors', value: stats.activeDoctors, icon: Stethoscope, color: 'green' },
-                      { title: 'Today Appointments', value: stats.todayAppointments, icon: Calendar, color: 'blue' },
-                      { title: 'Emergency Alerts', value: stats.emergencyAlerts, icon: AlertCircle, color: 'red' },
+                      { title: 'Appointments', value: stats.appointments, icon: Calendar, color: 'blue' },
+                      { title: 'Notifications', value: stats.notifications, icon: Bell, color: 'red' },
                     ].map((stat) => (
                       <div key={stat.title} className="bg-slate-800/30 rounded-lg p-4 border border-slate-700/50 hover:border-slate-600/50 hover:shadow-lg hover:shadow-cyan-500/10 transition-all group cursor-pointer">
                         <div className="flex items-start justify-between mb-2">
@@ -232,7 +229,6 @@ export default function DashboardPage() {
                           <stat.icon className={`h-4 w-4 text-${stat.color}-500 group-hover:scale-110 transition-transform`} />
                         </div>
                         <div className="text-2xl font-bold text-slate-100 group-hover:text-cyan-400 transition-colors">{stat.value}</div>
-                        <div className="text-xs text-slate-500 mt-2">↑ 12% from yesterday</div>
                       </div>
                     ))}
                   </div>
@@ -249,19 +245,7 @@ export default function DashboardPage() {
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-4">
-                    {[
-                      { label: 'Bed Occupancy', value: stats.bedsOccupancy, color: 'cyan' },
-                      { label: 'Emergency Cases', value: 85, color: 'red' },
-                      { label: 'System Health', value: 94, color: 'green' },
-                    ].map((item) => (
-                      <div key={item.label}>
-                        <div className="flex justify-between text-sm mb-1">
-                          <span className="text-slate-400">{item.label}</span>
-                          <span className={`text-${item.color}-400 font-mono`}>{item.value}%</span>
-                        </div>
-                        <Progress value={item.value} className="h-1.5" />
-                      </div>
-                    ))}
+                    <p className="text-sm text-slate-400">Live totals are loaded from the authenticated API. Operational percentages are not shown because no authoritative endpoint currently provides them.</p>
                   </CardContent>
                 </Card>
 
@@ -274,13 +258,13 @@ export default function DashboardPage() {
                   </CardHeader>
                   <CardContent className="space-y-4">
                     <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
-                      <div className="text-xs text-slate-400 font-mono">Today's Revenue</div>
-                      <div className="text-xl font-bold text-green-400 font-mono">₹{(stats.revenue / 100000).toFixed(1)}L</div>
+                      <div className="text-xs text-slate-400 font-mono">Consultations</div>
+                      <div className="text-xl font-bold text-blue-400 font-mono">{stats.consultations}</div>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
                       <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
-                        <div className="text-xs text-slate-400">Surgeries Today</div>
-                        <div className="text-lg font-bold text-cyan-400">{stats.surgeries}</div>
+                        <div className="text-xs text-slate-400">Patients</div>
+                        <div className="text-lg font-bold text-cyan-400">{stats.activePatients}</div>
                       </div>
                       <div className="bg-slate-800/30 rounded-lg p-3 border border-slate-700/50">
                         <div className="text-xs text-slate-400">Consultations</div>

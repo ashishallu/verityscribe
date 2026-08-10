@@ -38,7 +38,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       supabase = createClient()
     }
   } catch (error) {
-    console.error('[v0] Failed to create Supabase client:', error)
+      console.error('Failed to create Supabase client:', error)
   }
 
   // Initialize auth state on mount
@@ -54,7 +54,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const { data: { session: currentSession }, error: sessionError } = await supabase.auth.getSession()
         
         if (sessionError) {
-          console.error('[v0] Session error:', sessionError)
+          console.error('Session error:', sessionError)
           setLoading(false)
           return
         }
@@ -75,7 +75,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         }
       } catch (error) {
-        console.error('[v0] Auth initialization error:', error)
+        console.error('Auth initialization error:', error)
       } finally {
         setLoading(false)
       }
@@ -87,7 +87,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     // Subscribe to auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, newSession) => {
-      console.log('[v0] Auth state changed:', event)
       setSession(newSession)
       setUser(newSession?.user ?? null)
 

@@ -39,10 +39,6 @@ export default function DoctorsPage() {
 
   const handleView = (doctor: any) => router.push(`/doctors/${doctor.id}`)
 
-  const handleEdit = (doctor: any) => {
-    console.log('[v0] Edit doctor:', doctor)
-  }
-
   const handleDelete = useCallback(async (doctor: any) => {
     if (window.confirm('Delete this doctor record?')) await remove(doctor.id)
   }, [remove])
@@ -141,7 +137,6 @@ export default function DoctorsPage() {
                 columns={columns}
                 data={doctors}
                 onView={handleView}
-                onEdit={handleEdit}
                 onDelete={handleDelete}
                 title="Doctors"
                 searchable={true}
