@@ -201,7 +201,20 @@ def admin_patients(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, 
     result = query.order("created_at", desc=True).range((page - 1) * page_size, page * page_size - 1).execute()
     rows = result.data or []
     profiles = _index(_rows(client, "profiles", "id", [row.get("id") for row in rows], "id,email,first_name,last_name,phone"))
-    return {"data": [{**row, "profile": profiles.get(str(row.get("id")))} for row in rows], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
+    patient_ids = [row.get("id") for row in rows]
+    appointments = _rows(client, "appointments", "patient_id", patient_ids, "patient_id,doctor_id,status,appointment_date")
+    doctors = _index(_rows(client, "doctors", "id", [row.get("doctor_id") for row in appointments], "id,department_id"))
+    departments = _index(_rows(client, "departments", "id", [row.get("department_id") for row in doctors.values()], "id,name"))
+    today = date.today().isoformat()
+    data = []
+    for row in rows:
+        related = [item for item in appointments if item.get("patient_id") == row.get("id")]
+        upcoming = [item for item in related if item.get("appointment_date", "") >= today and item.get("status") not in {"cancelled", "completed"}]
+        assigned = doctors.get(str(related[0].get("doctor_id"))) if related else None
+        if assigned:
+            assigned = {**assigned, "department": departments.get(str(assigned.get("department_id")))}
+        data.append({**row, "profile": profiles.get(str(row.get("id"))), "appointments": related, "assigned_doctor": assigned, "has_upcoming_appointment": bool(upcoming), "appointment_statuses": sorted({item.get("status") for item in related if item.get("status")})})
+    return {"data": data, "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
 
 
 @router.get("/departments")

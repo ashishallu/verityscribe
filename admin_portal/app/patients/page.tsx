@@ -42,6 +42,8 @@ const initialPatientForm: PatientForm = {
 export default function PatientsPage() {
   const router = useRouter()
   const { data: patients, total, loading, error, reload, remove } = useResource<any>('patients')
+  const { data: doctors } = useResource<any>('doctors')
+  const [filters, setFilters] = useState({ gender: '', blood_group: '', doctor_id: '', department_id: '', age: '', appointment_status: '' })
   const { session } = useAuth()
   const apiClient = useMemo(() => new FastApiClient(async () => session), [session])
   const [isAddPatientOpen, setIsAddPatientOpen] = useState(false)
@@ -125,6 +127,15 @@ export default function PatientsPage() {
       ),
     },
   ]
+  const filteredPatients = patients.filter((patient) => {
+    const age = patient.date_of_birth ? Math.floor((Date.now() - new Date(patient.date_of_birth).getTime()) / 31557600000) : null
+    const profile = patient.profile ?? {}
+    const doctor = patient.assigned_doctor ?? {}
+    const statuses = patient.appointment_statuses ?? []
+    return (!filters.gender || patient.gender === filters.gender) && (!filters.blood_group || patient.blood_group === filters.blood_group) && (!filters.doctor_id || doctor.id === filters.doctor_id) && (!filters.department_id || doctor.department_id === filters.department_id) && (!filters.age || (age !== null && (filters.age === 'under18' ? age < 18 : filters.age === '18to64' ? age >= 18 && age < 65 : age >= 65))) && (!filters.appointment_status || (filters.appointment_status === 'upcoming' ? patient.has_upcoming_appointment : statuses.includes(filters.appointment_status))) && (!profile.id || profile.id === patient.id)
+  })
+  const clearFilters = () => setFilters({ gender: '', blood_group: '', doctor_id: '', department_id: '', age: '', appointment_status: '' })
+  const departments = Array.from(new Map<string, any>(doctors.map((doctor) => [doctor.department?.id, doctor.department] as [string, any]).filter(([id]) => Boolean(id))).values())
 
   return <ProtectedRoute>
     <div className="min-h-screen bg-gradient-to-br from-black to-slate-900 text-slate-100">
@@ -180,6 +191,15 @@ export default function PatientsPage() {
           <CardHeader>
             <CardTitle>Patient Directory</CardTitle>
             <CardDescription>All patients with search, filter, sort, and export capabilities</CardDescription>
+            <div className="mt-4 grid gap-2 sm:grid-cols-3 lg:grid-cols-6">
+              <select value={filters.gender} onChange={(e) => setFilters({ ...filters, gender: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All genders</option><option value="male">Male</option><option value="female">Female</option><option value="other">Other</option></select>
+              <select value={filters.blood_group} onChange={(e) => setFilters({ ...filters, blood_group: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All blood groups</option>{['A+','A-','B+','B-','AB+','AB-','O+','O-'].map((value) => <option key={value} value={value}>{value}</option>)}</select>
+              <select value={filters.doctor_id} onChange={(e) => setFilters({ ...filters, doctor_id: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All doctors</option>{doctors.map((doctor) => <option key={doctor.id} value={doctor.id}>{[doctor.first_name, doctor.last_name].filter(Boolean).join(' ') || 'Name unavailable'}</option>)}</select>
+              <select value={filters.department_id} onChange={(e) => setFilters({ ...filters, department_id: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All departments</option>{departments.map((department: any) => <option key={department.id} value={department.id}>{department.name}</option>)}</select>
+              <select value={filters.age} onChange={(e) => setFilters({ ...filters, age: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All ages</option><option value="under18">Under 18</option><option value="18to64">18–64</option><option value="65plus">65+</option></select>
+              <select value={filters.appointment_status} onChange={(e) => setFilters({ ...filters, appointment_status: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All appointment status</option><option value="upcoming">Upcoming</option><option value="scheduled">Scheduled</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select>
+              <Button type="button" variant="outline" onClick={clearFilters} className="sm:col-span-3 lg:col-span-1">Clear filters</Button>
+            </div>
           </CardHeader>
           <CardContent>
             {loading ? (
@@ -188,10 +208,12 @@ export default function PatientsPage() {
               <div className="text-center py-8 space-y-3"><p className="text-red-300">{error}</p><Button onClick={() => void reload()}>Retry</Button></div>
             ) : patients.length === 0 ? (
               <div className="text-center py-8 text-slate-400">No patient records are available for this account.</div>
+            ) : filteredPatients.length === 0 ? (
+              <div className="text-center py-8 text-slate-400">No patients match the selected filters.</div>
             ) : (
               <AdvancedTable
                 columns={columns}
-                data={patients}
+                data={filteredPatients}
                 onView={handleView}
                 onDelete={handleDelete}
                 title="Patients"

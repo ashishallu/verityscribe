@@ -25,6 +25,10 @@ export default function DoctorsPage() {
   const [form, setForm] = useState<DoctorForm>(initialForm)
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const experienceValues = doctors.map((doctor) => Number(doctor.experience_years)).filter(Number.isFinite)
+  const ratingValues = doctors.map((doctor) => Number(doctor.rating)).filter((rating) => Number.isFinite(rating) && rating > 0)
+  const averageExperience = experienceValues.length ? experienceValues.reduce((sum, value) => sum + value, 0) / experienceValues.length : null
+  const averageRating = ratingValues.length ? ratingValues.reduce((sum, value) => sum + value, 0) / ratingValues.length : null
 
   const handleProvision = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setFormError(null)
@@ -105,7 +109,7 @@ export default function DoctorsPage() {
           <Card className="bg-slate-900/50 border-slate-700/50 backdrop-blur-sm">
             <CardContent className="pt-6">
               <div className="text-3xl font-bold text-orange-400">
-                {doctors.length ? (doctors.reduce((sum, d) => sum + (d.years_experience ?? 0), 0) / doctors.length).toFixed(0) : '0'}
+                {averageExperience == null ? 'Not available' : averageExperience.toFixed(0)}
               </div>
               <p className="text-slate-400 text-sm">Avg. Experience (yrs)</p>
             </CardContent>
@@ -113,7 +117,7 @@ export default function DoctorsPage() {
           <Card className="bg-slate-900/50 border-slate-700/50 backdrop-blur-sm">
             <CardContent className="pt-6">
               <div className="text-3xl font-bold text-blue-400">
-                {doctors.length ? (doctors.reduce((sum, d) => sum + (Number(d.rating) || 0), 0) / doctors.length).toFixed(1) : '0.0'}
+                {averageRating == null ? 'Not available' : averageRating.toFixed(1)}
               </div>
               <p className="text-slate-400 text-sm">Avg. Rating</p>
             </CardContent>
