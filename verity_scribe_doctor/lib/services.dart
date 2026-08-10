@@ -23,3 +23,17 @@ extension DoctorAiRepository on DoctorRepository {
   Future<Map<String, dynamic>> processAi(String consultationId, String transcriptId) async =>
       Map<String, dynamic>.from(await api.request('/consultations/$consultationId/ai/process', method: 'POST', body: {'voice_transcript_id': transcriptId}));
 }
+
+extension DoctorVoiceRepository on DoctorRepository {
+  Future<dynamic> uploadVoice(String consultationId, String filePath) async {
+    final token = await api.auth.token();
+    if (token == null) throw Exception('SESSION_EXPIRED');
+    final request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/consultations/$consultationId/voice'));
+    request.headers['Authorization'] = 'Bearer $token';
+    request.files.add(await http.MultipartFile.fromPath('audio', filePath));
+    final response = await request.send().timeout(const Duration(seconds: 60));
+    final body = await response.stream.bytesToString();
+    if (response.statusCode < 200 || response.statusCode >= 300) throw Exception('${response.statusCode}:$body');
+    return jsonDecode(body);
+  }
+}

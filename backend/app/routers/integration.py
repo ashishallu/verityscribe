@@ -1,7 +1,8 @@
 from datetime import date
+import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
@@ -471,6 +472,36 @@ def my_voice_records(patient: dict = Depends(get_current_patient)):
     for transcript in transcripts: by_recording.setdefault(transcript.get("voice_recording_id"), []).append(transcript)
     for recording in recordings: recording["transcripts"] = by_recording.get(recording["id"], [])
     return {"data": recordings}
+
+
+@router.post("/consultations/{consultation_id}/voice", status_code=status.HTTP_201_CREATED)
+async def upload_consultation_voice(consultation_id: str, audio: UploadFile = File(...), doctor: dict = Depends(get_current_doctor)):
+    client = db()
+    consultation = _owned_consultation(client, consultation_id, doctor["id"])
+    content = await audio.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Audio file is empty")
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="Audio file exceeds the 50 MB limit")
+    bucket = os.getenv("VOICE_STORAGE_BUCKET", "voice-recordings")
+    recording_id = __import__("uuid").uuid4()
+    path = f"{consultation_id}/{doctor['id']}/{recording_id}-{audio.filename or 'recording.bin'}"
+    try:
+        client.storage.from_(bucket).upload(path, content, {"content-type": audio.content_type or "application/octet-stream", "upsert": "false"})
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Secure voice storage is unavailable") from exc
+    try:
+        recording = client.table("voice_recordings").insert({"id": str(recording_id), "patient_id": consultation["patient_id"], "doctor_id": doctor["id"], "recording_url": path}).execute().data[0]
+    except Exception as exc:
+        try: client.storage.from_(bucket).remove([path])
+        except Exception: pass
+        raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
+    try:
+        transcript_text = ai_provider.transcribe(content, audio.filename or "recording.bin")
+        transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": transcript_text}).execute().data[0]
+        return {"data": {"recording": recording, "transcript": transcript, "status": "transcribed"}}
+    except Exception:
+        return {"data": {"recording": recording, "transcript": None, "status": "transcription_unavailable"}}
 
 
 class AIProcessRequest(BaseModel):
