@@ -15,6 +15,7 @@ router = APIRouter(tags=["integration"])
 
 
 class AppointmentCreate(BaseModel):
+    patient_id: str | None = None
     doctor_id: str
     hospital_id: str
     appointment_date: date
@@ -203,19 +204,37 @@ def _appointment_detail(client: Client, appointment: dict) -> dict[str, Any]:
 
 
 @router.post("/appointments", status_code=status.HTTP_201_CREATED)
-def create_appointment(payload: AppointmentCreate, patient: dict = Depends(get_current_patient)):
+def create_appointment(payload: AppointmentCreate, claims: dict = Depends(current_claims)):
     client = db()
+    role = claims.get("app_metadata", {}).get("role")
+    if role == "patient":
+        patient = get_current_patient(claims)
+        hospital_id = patient.get("hospital_id")
+    elif role in {"hospital_admin", "super_admin"}:
+        profile = get_current_profile(claims)
+        hospital_id = profile.get("hospital_id") if role == "hospital_admin" else payload.hospital_id
+        if role == "hospital_admin" and not hospital_id:
+            raise HTTPException(status_code=403, detail="Your administrator account is not assigned to a hospital")
+        if not payload.patient_id:
+            raise HTTPException(status_code=422, detail="patient_id is required for administrator scheduling")
+        patient = client.table("patients").select("id,hospital_id").eq("id", payload.patient_id).maybe_single().execute().data
+        if not patient or patient.get("hospital_id") != hospital_id:
+            raise HTTPException(status_code=404, detail="Patient is not in the administrator's hospital")
+    else:
+        raise HTTPException(status_code=403, detail="Appointment creation is not available for this role")
+    if not hospital_id:
+        raise HTTPException(status_code=422, detail="Patient hospital is unavailable")
     doctor = client.table("doctors").select("id,hospital_id,department_id,is_available,deleted_at").eq("id", payload.doctor_id).maybe_single().execute().data
     if not doctor or doctor.get("deleted_at") or not doctor.get("is_available"):
         raise HTTPException(status_code=404, detail="Available doctor not found")
-    if doctor.get("hospital_id") != payload.hospital_id:
+    if doctor.get("hospital_id") != hospital_id:
         raise HTTPException(status_code=422, detail="Doctor does not belong to the selected hospital")
     if payload.appointment_date < date.today():
         raise HTTPException(status_code=422, detail="Appointment date cannot be in the past")
     conflict = client.table("appointments").select("id").eq("doctor_id", payload.doctor_id).eq("appointment_date", payload.appointment_date.isoformat()).eq("appointment_time", payload.appointment_time).not_.in_("status", ["cancelled", "no_show"]).limit(1).execute().data
     if conflict:
         raise HTTPException(status_code=409, detail="The selected appointment slot is unavailable")
-    row = {"patient_id": patient["id"], "doctor_id": payload.doctor_id, "hospital_id": payload.hospital_id, "appointment_date": payload.appointment_date.isoformat(), "appointment_time": payload.appointment_time, "consultation_type": payload.consultation_type, "reason_for_visit": payload.reason_for_visit, "notes": payload.notes, "status": "scheduled"}
+    row = {"patient_id": patient["id"], "doctor_id": payload.doctor_id, "hospital_id": hospital_id, "appointment_date": payload.appointment_date.isoformat(), "appointment_time": payload.appointment_time, "consultation_type": payload.consultation_type, "reason_for_visit": payload.reason_for_visit, "notes": payload.notes, "status": "scheduled"}
     created = client.table("appointments").insert(row).execute().data[0]
     return {"data": _appointment_detail(client, created)}
 
