@@ -192,6 +192,17 @@ def _list(client: Client, table: str, page: int, page_size: int, search: str | N
 def hospitals(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, _: dict = Depends(current_claims)):
     return _list(db(), "hospitals", page, page_size, search)
 
+@router.get("/patients")
+def admin_patients(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, claims: dict = Depends(current_claims)):
+    client, profile = _admin_context(claims)
+    query = client.table("patients").select("*", count="exact").is_("deleted_at", "null")
+    if profile.get("hospital_id"):
+        query = query.eq("hospital_id", profile["hospital_id"])
+    result = query.order("created_at", desc=True).range((page - 1) * page_size, page * page_size - 1).execute()
+    rows = result.data or []
+    profiles = _index(_rows(client, "profiles", "id", [row.get("id") for row in rows], "id,email,first_name,last_name,phone"))
+    return {"data": [{**row, "profile": profiles.get(str(row.get("id")))} for row in rows], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
+
 
 @router.get("/departments")
 def departments(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, hospital_id: str | None = None, _: dict = Depends(current_claims)):

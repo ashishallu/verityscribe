@@ -108,6 +108,7 @@ export default function PatientsPage() {
   }
 
   const columns = [
+    { key: 'profile', label: 'Name', sortable: true, render: (_value: unknown, row: any) => [row.profile?.first_name, row.profile?.last_name].filter(Boolean).join(' ') || 'Name unavailable' },
     { key: 'id', label: 'Patient ID', sortable: true, render: (value: string) => value.slice(0, 8) },
     { key: 'mrn', label: 'MRN', sortable: true },
     { key: 'date_of_birth', label: 'Date of Birth', sortable: true },
@@ -152,25 +153,25 @@ export default function PatientsPage() {
           <Card className="bg-slate-900/50 border-slate-700/50 backdrop-blur-sm">
             <CardContent className="pt-6">
               <div className="text-3xl font-bold text-green-400">
-                {patients.filter((p) => p.status === 'active').length}
+                {patients.filter((p) => p.gender === 'male').length}
               </div>
-              <p className="text-slate-400 text-sm">Active Patients</p>
+              <p className="text-slate-400 text-sm">Male Patients</p>
             </CardContent>
           </Card>
           <Card className="bg-slate-900/50 border-slate-700/50 backdrop-blur-sm">
             <CardContent className="pt-6">
               <div className="text-3xl font-bold text-orange-400">
-                {patients.filter((p) => p.status === 'inactive').length}
+                {patients.filter((p) => p.gender === 'female').length}
               </div>
-              <p className="text-slate-400 text-sm">Inactive Patients</p>
+              <p className="text-slate-400 text-sm">Female Patients</p>
             </CardContent>
           </Card>
           <Card className="bg-slate-900/50 border-slate-700/50 backdrop-blur-sm">
             <CardContent className="pt-6">
               <div className="text-3xl font-bold text-blue-400">
-                {patients.filter((p) => p.updated_at).length}
+                {patients.filter((p) => p.gender === 'other').length}
               </div>
-              <p className="text-slate-400 text-sm">Recent Visits</p>
+              <p className="text-slate-400 text-sm">Other / Unspecified</p>
             </CardContent>
           </Card>
         </div>

@@ -48,16 +48,16 @@ export default function DoctorsPage() {
       key: 'id',
       label: 'Name',
       sortable: true,
-      render: (val: string, row: any) => row.full_name ?? `Doctor ${val.slice(0, 8)}`
+      render: (_val: string, row: any) => [row.first_name, row.last_name].filter(Boolean).join(' ') || 'Name unavailable'
     },
     { key: 'specialization', label: 'Specialization', sortable: true },
-    { key: 'years_experience', label: 'Experience', sortable: true },
+    { key: 'experience_years', label: 'Experience', sortable: true, render: (value: number | null) => value == null ? 'Not available' : `${value} yrs` },
     {
-      key: 'consultationFee',
+      key: 'consultation_fee_inr',
       label: 'Fee (₹)',
       sortable: true,
     },
-    { key: 'department_id', label: 'Department', sortable: true },
+    { key: 'department', label: 'Department', sortable: true, render: (_value: unknown, row: any) => row.department?.name ?? 'Not available' },
     {
       key: 'is_available',
       label: 'Status',

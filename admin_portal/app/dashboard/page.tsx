@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/app/auth-context'
 import { Button } from '@/components/ui/button'
@@ -33,7 +33,6 @@ export default function DashboardPage() {
     notifications: notifications.total,
     consultations: consultations.total,
   }
-  const canvasRef = useRef<HTMLCanvasElement>(null)
   const router = useRouter()
   const profileDisplayName = [profile?.first_name, profile?.last_name].filter(Boolean).join(' ') || user?.email?.split('@')[0] || 'User'
 
@@ -42,48 +41,6 @@ export default function DashboardPage() {
       router.push('/auth/login')
     }
   }, [loading, isAuthenticated, router])
-
-  // Particle animation
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-
-    canvas.width = canvas.offsetWidth
-    canvas.height = canvas.offsetHeight
-
-    const particles: any[] = []
-    for (let i = 0; i < 50; i++) {
-      particles.push({
-        x: Math.random() * canvas.width,
-        y: Math.random() * canvas.height,
-        size: Math.random() * 2 + 1,
-        speedX: (Math.random() - 0.5) * 0.3,
-        speedY: (Math.random() - 0.5) * 0.3,
-        color: `rgba(${Math.floor(Math.random() * 100) + 100}, ${Math.floor(Math.random() * 100) + 150}, 255, ${Math.random() * 0.3 + 0.1})`
-      })
-    }
-
-    const animate = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
-      particles.forEach(p => {
-        p.x += p.speedX
-        p.y += p.speedY
-        if (p.x > canvas.width) p.x = 0
-        if (p.x < 0) p.x = canvas.width
-        if (p.y > canvas.height) p.y = 0
-        if (p.y < 0) p.y = canvas.height
-        ctx.fillStyle = p.color
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2)
-        ctx.fill()
-      })
-      requestAnimationFrame(animate)
-    }
-    animate()
-  }, [])
 
   const handleLogout = async () => {
     try {
@@ -110,8 +67,6 @@ export default function DashboardPage() {
 
   return (
     <div className={`${theme} min-h-screen bg-gradient-to-br from-black to-slate-900 text-slate-100 relative overflow-hidden`}>
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full opacity-20" />
-
       <div className="container mx-auto p-4 relative z-10">
         {/* Header */}
         <header className="flex items-center justify-between py-4 border-b border-slate-700/50 mb-6">
@@ -220,7 +175,7 @@ export default function DashboardPage() {
                 <CardContent className="p-6">
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                     {[
-                      { title: 'Active Patients', value: stats.activePatients, icon: Users, color: 'cyan' },
+                      { title: 'Total Patients', value: stats.activePatients, icon: Users, color: 'cyan' },
                       { title: 'Available Doctors', value: stats.activeDoctors, icon: Stethoscope, color: 'green' },
                       { title: 'Appointments', value: stats.appointments, icon: Calendar, color: 'blue' },
                       { title: 'Notifications', value: stats.notifications, icon: Bell, color: 'red' },
