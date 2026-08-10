@@ -67,7 +67,8 @@ def main() -> None:
         email = f"patient{index:03d}@{DEMO_DOMAIN}"
         user_id = invite_or_create(client, email, first, last, "patient", password)
         client.table("profiles").upsert({"id": user_id, "email": email, "first_name": first, "last_name": last, "role": "patient"}).execute()
-        client.table("patients").upsert({"id": user_id, "hospital_id": CARE_HOSPITAL_ID, "medical_id": f"DEMO-CARE-P{index:03d}", "date_of_birth": date(1980, 1, 1) + timedelta(days=index * 120), "blood_group": "O+"}, on_conflict="id").execute()
+        dob = date(1980, 1, 1) + timedelta(days=index * 120)
+        client.table("patients").upsert({"id": user_id, "hospital_id": CARE_HOSPITAL_ID, "medical_id": f"DEMO-CARE-P{index:03d}", "date_of_birth": dob.isoformat(), "blood_group": "O+"}, on_conflict="id").execute()
         patient_ids.append(user_id)
     for index in range(1, 21):
         marker = f"DEMO-CARE-APPT-{index:03d}"
