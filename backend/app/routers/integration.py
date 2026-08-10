@@ -395,6 +395,23 @@ def my_medical_record(patient: dict = Depends(get_current_patient)):
     return {"data": {"patient": patient, **sections}}
 
 
+@router.get("/patients/me/timeline")
+def my_clinical_timeline(patient: dict = Depends(get_current_patient)):
+    client = db(); patient_id = patient["id"]; events: list[dict[str, Any]] = []
+    sources = (("appointment", "appointments", "appointment_date"), ("consultation", "consultations", "consultation_date"), ("prescription", "prescriptions", "prescription_date"), ("report", "reports", "report_date"), ("vital", "vitals", "created_at"))
+    for event_type, table, date_key in sources:
+        try:
+            rows = client.table(table).select("*").eq("patient_id", patient_id).order(date_key, desc=True).limit(100).execute().data or []
+        except Exception:
+            rows = []
+        for row in rows:
+            events.append({"type": event_type, "date": row.get(date_key) or row.get("created_at"), "record": row})
+    diagnoses = _rows(client, "diagnoses", "consultation_id", [r["id"] for r in client.table("consultations").select("id").eq("patient_id", patient_id).execute().data or []])
+    for row in diagnoses: events.append({"type": "diagnosis", "date": row.get("created_at"), "record": row})
+    events.sort(key=lambda item: str(item.get("date") or ""), reverse=True)
+    return {"data": events[:250]}
+
+
 @router.get("/inventory")
 def inventory(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, low_stock: bool = False, expiring: bool = False, claims: dict = Depends(current_claims)):
     client, profile = _admin_context(claims)

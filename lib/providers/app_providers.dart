@@ -75,6 +75,11 @@ final patientMedicalRecordProvider = FutureProvider<Map<String, dynamic>>((ref) 
   final body = Map<String, dynamic>.from(response.data as Map);
   return Map<String, dynamic>.from((body['data'] as Map?) ?? body);
 });
+final patientTimelineProvider = FutureProvider<List<dynamic>>((ref) async {
+  final response = await ref.read(apiClientProvider).get<dynamic>('/patients/me/timeline');
+  final body = Map<String, dynamic>.from(response.data as Map);
+  return List<dynamic>.from((body['data'] as List?) ?? const []);
+});
 final patientInsuranceProvider = FutureProvider<Map<String, dynamic>>((ref) async {
   final response = await ref.read(apiClientProvider).get<dynamic>('/me/insurance');
   final body = Map<String, dynamic>.from(response.data as Map);
