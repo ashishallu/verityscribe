@@ -136,10 +136,12 @@ export default function DashboardPage() {
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button variant="ghost" size="icon" className="relative text-slate-400 hover:text-slate-100">
-                      <Bell className="h-5 w-5" />
-                      <span className="absolute -top-1 -right-1 h-2 w-2 bg-red-500 rounded-full animate-pulse"></span>
-                    </Button>
+                    <Link href="/notifications" aria-label="Notifications">
+                      <Button variant="ghost" size="icon" className="relative text-slate-400 hover:text-slate-100">
+                        <Bell className="h-5 w-5" />
+                        {stats.notifications > 0 && <span className="absolute -top-1 -right-1 h-2 w-2 bg-red-500 rounded-full animate-pulse"></span>}
+                      </Button>
+                    </Link>
                   </TooltipTrigger>
                   <TooltipContent><p>Notifications</p></TooltipContent>
                 </Tooltip>
@@ -285,7 +287,7 @@ export default function DashboardPage() {
                     {[
                       { label: 'New Patient', href: '/patients', icon: Users },
                       { label: 'Book Appointment', href: '/appointments', icon: Calendar },
-                      { label: 'New Prescription', href: '/billing', icon: Pill },
+                      { label: 'View Prescriptions', href: '/prescriptions', icon: Pill },
                       { label: 'Upload Report', href: '/reports', icon: FileText },
                     ].map((action) => (
                       <Link key={action.label} href={action.href}>
