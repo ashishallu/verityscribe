@@ -71,5 +71,14 @@ class AIProvider:
         except Exception as exc:
             raise RuntimeError("ASR provider request failed") from exc
 
+    def answer(self, prompt: str) -> str:
+        provider_url = os.getenv("AI_LLM_BASE_URL") or f"https://api-inference.huggingface.co/models/{self.LLM_MODEL}"
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if provider_url.startswith("https://api-inference.huggingface.co") and not token:
+            raise RuntimeError("AI provider is not configured")
+        payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
+        if isinstance(payload, dict) and isinstance(payload.get("generated_text"), str): return payload["generated_text"]
+        raise RuntimeError("AI provider returned an invalid answer")
+
 
 ai_provider = AIProvider()

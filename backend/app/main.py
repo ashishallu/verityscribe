@@ -25,6 +25,6 @@ app.add_middleware(
 async def health() -> dict: return {"status": "ok", "environment": config.environment}
 
 app.include_router(integration_router, prefix=config.api_prefix)
-for name in ("patients", "doctors", "prescriptions", "reports", "insurance", "chat", "analytics", "admin", "voice"):
+for name in ("patients", "doctors", "prescriptions", "reports", "insurance", "analytics", "admin", "voice"):
     app.include_router(resource_router(name), prefix=config.api_prefix)
 app.include_router(doctors_provision_router, prefix=config.api_prefix)

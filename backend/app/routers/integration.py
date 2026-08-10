@@ -1,4 +1,5 @@
 from datetime import date
+import json
 import os
 from typing import Any
 
@@ -67,11 +68,41 @@ class ReportCreate(BaseModel):
     recommendations: str | None = None
 
 
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    consultation_id: str | None = None
+
+
 def db() -> Client:
     cfg = settings()
     if not cfg.supabase_url or not cfg.supabase_service_role_key:
         raise HTTPException(status_code=503, detail="Integration service is unavailable")
     return create_client(cfg.supabase_url, cfg.supabase_service_role_key)
+
+
+@router.post("/chat")
+def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
+    client = db()
+    role = claims.get("app_metadata", {}).get("role")
+    context: dict[str, Any] = {}
+    if role == "patient":
+        patient = get_current_patient(claims)
+        context = {"patient": {"id": patient["id"], "medical_id": patient.get("medical_id")}, "record": {key: _patient_table_rows(client, key, patient["id"]) for key in ("allergies", "chronic_conditions", "vitals", "consultations", "prescriptions", "reports")}}
+    elif role == "doctor":
+        if payload.consultation_id:
+            consultation = _owned_consultation(client, payload.consultation_id, claims["sub"])
+            context = {"consultation": consultation, "patient": {key: _patient_table_rows(client, key, consultation["patient_id"]) for key in ("allergies", "chronic_conditions", "vitals", "consultations", "prescriptions", "reports")}}
+        else:
+            doctor = get_current_doctor(claims)
+            context = {"doctor": {"id": doctor["id"], "hospital_id": doctor.get("hospital_id"), "department_id": doctor.get("department_id")}}
+    else:
+        raise HTTPException(status_code=403, detail="Chat is not available for this role")
+    prompt = "You are a clinical assistant. Use only the authorized context below. If data is absent, say so. Never reveal other patients. Label clinical interpretations as suggestions.\nContext:\n" + json.dumps(context, default=str) + "\nQuestion:\n" + payload.message
+    try:
+        answer = ai_provider.answer(prompt)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="AI chat is currently unavailable") from exc
+    return {"data": {"answer": answer, "context_locked": role == "patient" or bool(payload.consultation_id)}}
 
 
 def _admin_context(claims: dict) -> tuple[Client, dict]:
