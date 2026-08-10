@@ -26,12 +26,13 @@ export default function DashboardPage() {
   const appointments = useResource<{ id: string }>('appointments')
   const consultations = useResource<{ id: string }>('consultations')
   const notifications = useResource<{ id: string }>('notifications')
+  const statsError = patients.error || doctors.error || appointments.error || consultations.error || notifications.error
   const stats = {
-    activePatients: patients.total,
-    activeDoctors: doctors.total,
-    appointments: appointments.total,
-    notifications: notifications.total,
-    consultations: consultations.total,
+    activePatients: patients.error ? '—' : patients.total,
+    activeDoctors: doctors.error ? '—' : doctors.total,
+    appointments: appointments.error ? '—' : appointments.total,
+    notifications: notifications.error ? '—' : notifications.total,
+    consultations: consultations.error ? '—' : consultations.total,
   }
   const router = useRouter()
   const profileDisplayName = [profile?.first_name, profile?.last_name].filter(Boolean).join(' ') || user?.email?.split('@')[0] || 'User'
@@ -68,6 +69,7 @@ export default function DashboardPage() {
   return (
     <div className={`${theme} min-h-screen bg-gradient-to-br from-black to-slate-900 text-slate-100 relative overflow-hidden`}>
       <div className="container mx-auto p-4 relative z-10">
+        {statsError && <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200" role="alert">Unable to load one or more dashboard metrics: {statsError}</div>}
         {/* Header */}
         <header className="flex items-center justify-between py-4 border-b border-slate-700/50 mb-6">
           <div className="flex items-center space-x-2">
@@ -94,7 +96,7 @@ export default function DashboardPage() {
                     <Link href="/notifications" aria-label="Notifications">
                       <Button variant="ghost" size="icon" className="relative text-slate-400 hover:text-slate-100">
                         <Bell className="h-5 w-5" />
-                        {stats.notifications > 0 && <span className="absolute -top-1 -right-1 h-2 w-2 bg-red-500 rounded-full animate-pulse"></span>}
+                        {typeof stats.notifications === 'number' && stats.notifications > 0 && <span className="absolute -top-1 -right-1 h-2 w-2 bg-red-500 rounded-full animate-pulse"></span>}
                       </Button>
                     </Link>
                   </TooltipTrigger>
