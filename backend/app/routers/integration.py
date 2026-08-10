@@ -1,9 +1,11 @@
 from datetime import date
 import json
 import os
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+import httpx
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
@@ -75,12 +77,50 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     consultation_id: str | None = None
 
+class PatientProvisionRequest(BaseModel):
+    email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+    mrn: str = Field(min_length=1, max_length=100)
+    date_of_birth: date
+    gender: str | None = None
+    blood_group: str | None = None
+
 
 def db() -> Client:
     cfg = settings()
     if not cfg.supabase_url or not cfg.supabase_service_role_key:
         raise HTTPException(status_code=503, detail="Integration service is unavailable")
     return create_client(cfg.supabase_url, cfg.supabase_service_role_key)
+
+@router.post("/patients/provision", status_code=status.HTTP_201_CREATED)
+def provision_patient(payload: PatientProvisionRequest, claims: dict = Depends(current_claims)):
+    role = claims.get("app_metadata", {}).get("role")
+    if role not in {"hospital_admin", "super_admin"}:
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    client, profile = _admin_context(claims)
+    hospital_id = profile.get("hospital_id")
+    if role == "hospital_admin" and not hospital_id:
+        raise HTTPException(status_code=403, detail="Your administrator account is not assigned to a hospital")
+    cfg = settings()
+    try:
+        existing = client.table("profiles").select("id").eq("email", payload.email).limit(1).execute().data or []
+        if existing:
+            raise HTTPException(status_code=409, detail="A profile already exists for this email")
+        response = httpx.post(f"{cfg.supabase_url.rstrip('/')}/auth/v1/invite", headers={"apikey": cfg.supabase_service_role_key, "Authorization": f"Bearer {cfg.supabase_service_role_key}"}, json={"email": payload.email, "data": {"role": "patient", "first_name": payload.first_name, "last_name": payload.last_name}}, timeout=20)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=409, detail="Unable to invite patient")
+        user_id = response.json().get("id")
+        for _ in range(10):
+            if client.table("profiles").select("id").eq("id", user_id).maybe_single().execute().data: break
+            time.sleep(0.5)
+        client.table("profiles").update({"first_name": payload.first_name, "last_name": payload.last_name, "role": "patient"}).eq("id", user_id).execute()
+        patient = client.table("patients").insert({"id": user_id, "medical_id": payload.mrn, "hospital_id": hospital_id, "date_of_birth": payload.date_of_birth.isoformat(), "blood_group": payload.blood_group}).execute().data[0]
+        return {"data": patient}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Unable to provision patient") from exc
 
 
 @router.post("/chat")

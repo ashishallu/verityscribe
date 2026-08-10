@@ -14,6 +14,9 @@ import { useAuth } from '@/app/auth-context'
 import { ApiError, FastApiClient } from '@/lib/api/client'
 
 type PatientForm = {
+  email: string
+  first_name: string
+  last_name: string
   mrn: string
   date_of_birth: string
   gender: 'male' | 'female' | 'other'
@@ -25,6 +28,7 @@ type PatientForm = {
 }
 
 const initialPatientForm: PatientForm = {
+  email: '', first_name: '', last_name: '',
   mrn: '',
   date_of_birth: '',
   gender: 'male',
@@ -62,8 +66,8 @@ export default function PatientsPage() {
     const height = form.height_cm ? Number(form.height_cm) : undefined
     const weight = form.weight_kg ? Number(form.weight_kg) : undefined
 
-    if (!mrn || !form.date_of_birth) {
-      setFormError('MRN and date of birth are required.')
+    if (!mrn || !form.date_of_birth || !form.email.trim() || !form.first_name.trim() || !form.last_name.trim()) {
+      setFormError('Name, email, MRN, and date of birth are required.')
       return
     }
     if (form.date_of_birth > new Date().toISOString().slice(0, 10)) {
@@ -81,7 +85,8 @@ export default function PatientsPage() {
 
     setIsSubmitting(true)
     try {
-      await apiClient.create('patients', {
+      await apiClient.create('patients/provision', {
+        email: form.email.trim(), first_name: form.first_name.trim(), last_name: form.last_name.trim(),
         mrn,
         date_of_birth: form.date_of_birth,
         gender: form.gender,
@@ -211,6 +216,9 @@ export default function PatientsPage() {
             </DialogHeader>
             <form className="space-y-4" onSubmit={handleAddPatient}>
               <div className="grid gap-4 sm:grid-cols-2">
+                <label className="grid gap-1.5 text-sm">First name <input required value={form.first_name} onChange={(event) => setForm({ ...form, first_name: event.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
+                <label className="grid gap-1.5 text-sm">Last name <input required value={form.last_name} onChange={(event) => setForm({ ...form, last_name: event.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
+                <label className="grid gap-1.5 text-sm sm:col-span-2">Email <input required type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
                 <label className="grid gap-1.5 text-sm">MRN <input required value={form.mrn} onChange={(event) => setForm({ ...form, mrn: event.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
                 <label className="grid gap-1.5 text-sm">Date of birth <input required type="date" max={new Date().toISOString().slice(0, 10)} value={form.date_of_birth} onChange={(event) => setForm({ ...form, date_of_birth: event.target.value })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2" /></label>
                 <label className="grid gap-1.5 text-sm">Gender <select value={form.gender} onChange={(event) => setForm({ ...form, gender: event.target.value as PatientForm['gender'] })} className="rounded-md border border-slate-700 bg-slate-900 px-3 py-2"><option value="male">Male</option><option value="female">Female</option><option value="other">Other</option></select></label>
