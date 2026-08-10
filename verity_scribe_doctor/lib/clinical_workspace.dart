@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
 import 'services.dart';
 
 class ClinicalWorkspace extends StatefulWidget {
@@ -12,8 +14,15 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
   final symptoms = TextEditingController(), diagnosis = TextEditingController(), plan = TextEditingController(), note = TextEditingController(), search = TextEditingController(), report = TextEditingController(), transcriptId = TextEditingController();
   String? consultationId, error;
   bool saving = false, aiLoading = false;
+  final recorder = AudioRecorder();
+  String? audioPath, voiceStatus;
+  Duration recordingDuration = Duration.zero;
+  DateTime? recordingStarted;
   List<Map<String, dynamic>> medicines = [];
   Map<String, dynamic>? selected, aiDraft;
+
+  @override
+  void dispose() { recorder.dispose(); super.dispose(); }
 
   Future<void> start() async {
     setState(() { saving = true; error = null; });
@@ -45,6 +54,39 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
     finally { if (mounted) setState(() => aiLoading = false); }
   }
 
+  Future<void> startRecording() async {
+    if (saving || recordingStarted != null) return;
+    try {
+      if (!await recorder.hasPermission()) { setState(() => error = 'Microphone permission is required.'); return; }
+      final dir = await getTemporaryDirectory();
+      audioPath = '${dir.path}/verityscribe_${DateTime.now().millisecondsSinceEpoch}.wav';
+      await recorder.start(const RecordConfig(encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1), path: audioPath!);
+      setState(() { recordingStarted = DateTime.now(); voiceStatus = 'RECORDING'; });
+    } catch (_) { setState(() => error = 'Unable to start recording. Check microphone permission.'); }
+  }
+
+  Future<void> stopRecording() async {
+    if (recordingStarted == null) return;
+    try { await recorder.stop(); setState(() { recordingDuration = DateTime.now().difference(recordingStarted!); recordingStarted = null; voiceStatus = 'TRANSCRIBED'; }); }
+    catch (_) { setState(() => error = 'Recording failed. Please try again.'); }
+  }
+
+  Future<void> cancelRecording() async { await recorder.cancel(); setState(() { recordingStarted = null; audioPath = null; recordingDuration = Duration.zero; voiceStatus = 'IDLE'; }); }
+
+  Future<void> uploadRecording() async {
+    if (audioPath == null || consultationId == null || saving) return;
+    setState(() { saving = true; voiceStatus = 'UPLOADING'; error = null; });
+    try {
+      final result = await widget.repo.uploadVoice(consultationId!, audioPath!);
+      final data = Map<String, dynamic>.from((result['data'] as Map?) ?? result);
+      final transcript = data['transcript'];
+      if (transcript is Map) { transcriptId.text = transcript['id'].toString(); voiceStatus = 'TRANSCRIBED'; }
+      else { voiceStatus = 'ERROR'; error = 'Transcription is temporarily unavailable. You can retry or continue manually.'; }
+      setState(() {});
+    } catch (_) { setState(() { voiceStatus = 'ERROR'; error = 'Upload failed. You can retry or record again.'; }); }
+    finally { if (mounted) setState(() => saving = false); }
+  }
+
   Widget draftValue(String label, dynamic value) => Padding(padding: const EdgeInsets.only(top: 6), child: Text('$label: ${value ?? 'No data'}'));
 
   @override Widget build(BuildContext context) => Scaffold(
@@ -58,6 +100,7 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
       if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
       FilledButton(onPressed: saving || consultationId != null ? null : start, child: Text(consultationId == null ? 'Start consultation' : 'Consultation created')),
       if (consultationId != null) ...[
+        Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Voice consultation', style: TextStyle(fontWeight: FontWeight.w800)), Text(voiceStatus ?? 'IDLE'), if (recordingStarted != null) Text('Recording…'), if (recordingStarted == null && audioPath == null) FilledButton(onPressed: startRecording, child: const Text('Start recording')), if (recordingStarted != null) Wrap(spacing: 8, children: [FilledButton(onPressed: stopRecording, child: const Text('Stop')), OutlinedButton(onPressed: cancelRecording, child: const Text('Cancel'))]), if (audioPath != null && recordingStarted == null) Wrap(spacing: 8, children: [Text('Duration: ${recordingDuration.inSeconds}s'), FilledButton(onPressed: saving ? null : uploadRecording, child: const Text('Upload')), OutlinedButton(onPressed: () async { await cancelRecording(); await startRecording(); }, child: const Text('Record again'))])]))),
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('AI-GENERATED DRAFT — REQUIRES DOCTOR REVIEW', style: TextStyle(fontWeight: FontWeight.w800, color: Colors.deepPurple)),
           TextField(controller: transcriptId, decoration: const InputDecoration(labelText: 'Verified transcript ID')),
