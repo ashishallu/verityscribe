@@ -25,10 +25,20 @@ export default function DoctorsPage() {
   const [form, setForm] = useState<DoctorForm>(initialForm)
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [filters, setFilters] = useState({ specialization: '', department_id: '', availability: '', minExperience: '', maxExperience: '', minRating: '', maxFee: '' })
   const experienceValues = doctors.map((doctor) => Number(doctor.experience_years)).filter(Number.isFinite)
   const ratingValues = doctors.map((doctor) => Number(doctor.rating)).filter((rating) => Number.isFinite(rating) && rating > 0)
   const averageExperience = experienceValues.length ? experienceValues.reduce((sum, value) => sum + value, 0) / experienceValues.length : null
   const averageRating = ratingValues.length ? ratingValues.reduce((sum, value) => sum + value, 0) / ratingValues.length : null
+  const specializations = Array.from(new Set(doctors.map((doctor) => doctor.specialization).filter(Boolean)))
+  const departments = Array.from(new Map<string, any>(doctors.map((doctor) => [doctor.department?.id, doctor.department] as [string, any]).filter(([id]) => Boolean(id))).values())
+  const filteredDoctors = doctors.filter((doctor) => {
+    const experience = Number(doctor.experience_years)
+    const rating = Number(doctor.rating)
+    const fee = Number(doctor.consultation_fee_inr)
+    return (!filters.specialization || doctor.specialization === filters.specialization) && (!filters.department_id || doctor.department?.id === filters.department_id) && (!filters.availability || (filters.availability === 'available' ? doctor.is_available : !doctor.is_available)) && (!filters.minExperience || experience >= Number(filters.minExperience)) && (!filters.maxExperience || experience <= Number(filters.maxExperience)) && (!filters.minRating || (Number.isFinite(rating) && rating >= Number(filters.minRating))) && (!filters.maxFee || (Number.isFinite(fee) && fee <= Number(filters.maxFee)))
+  })
+  const clearFilters = () => setFilters({ specialization: '', department_id: '', availability: '', minExperience: '', maxExperience: '', minRating: '', maxFee: '' })
 
   const handleProvision = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setFormError(null)
@@ -128,6 +138,16 @@ export default function DoctorsPage() {
           <CardHeader>
             <CardTitle>Doctor Directory</CardTitle>
             <CardDescription>All doctors with search, filter, sort, and export capabilities</CardDescription>
+            <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <select value={filters.specialization} onChange={(e) => setFilters({ ...filters, specialization: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All specializations</option>{specializations.map((value) => <option key={value} value={value}>{value}</option>)}</select>
+              <select value={filters.department_id} onChange={(e) => setFilters({ ...filters, department_id: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All departments</option>{departments.map((department: any) => <option key={department.id} value={department.id}>{department.name}</option>)}</select>
+              <select value={filters.availability} onChange={(e) => setFilters({ ...filters, availability: e.target.value })} className="rounded border bg-slate-900 px-2 py-1"><option value="">All availability</option><option value="available">Available</option><option value="unavailable">Unavailable</option></select>
+              <input type="number" min="0" placeholder="Min experience" value={filters.minExperience} onChange={(e) => setFilters({ ...filters, minExperience: e.target.value })} className="rounded border bg-slate-900 px-2 py-1" />
+              <input type="number" min="0" placeholder="Max experience" value={filters.maxExperience} onChange={(e) => setFilters({ ...filters, maxExperience: e.target.value })} className="rounded border bg-slate-900 px-2 py-1" />
+              <input type="number" min="0" max="5" step="0.1" placeholder="Min rating" value={filters.minRating} onChange={(e) => setFilters({ ...filters, minRating: e.target.value })} className="rounded border bg-slate-900 px-2 py-1" />
+              <input type="number" min="0" placeholder="Max fee" value={filters.maxFee} onChange={(e) => setFilters({ ...filters, maxFee: e.target.value })} className="rounded border bg-slate-900 px-2 py-1" />
+              <Button type="button" variant="outline" onClick={clearFilters}>Clear filters</Button>
+            </div>
           </CardHeader>
           <CardContent>
             {loading ? (
@@ -136,10 +156,12 @@ export default function DoctorsPage() {
               <div className="text-center py-8 space-y-3"><p className="text-red-300">{error}</p><Button onClick={() => void reload()}>Retry</Button></div>
             ) : doctors.length === 0 ? (
               <div className="text-center py-8 text-slate-400">No doctor records are available for this account.</div>
+            ) : filteredDoctors.length === 0 ? (
+              <div className="text-center py-8 text-slate-400">No doctors match the selected filters.</div>
             ) : (
               <AdvancedTable
                 columns={columns}
-                data={doctors}
+                data={filteredDoctors}
                 onView={handleView}
                 onDelete={handleDelete}
                 title="Doctors"

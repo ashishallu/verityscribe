@@ -733,6 +733,7 @@ def _clinical_relationships(client: Client, rows: list[dict]) -> None:
         if row.get("department_id") in departments: row["department"] = departments[row["department_id"]]
 
 
+@router.get("/admin/patients/{patient_id}")
 @router.get("/admin/patients/{patient_id}/overview")
 def admin_patient_overview(patient_id: str, claims: dict = Depends(current_claims)):
     client, profile = _admin_context(claims)
@@ -743,7 +744,9 @@ def admin_patient_overview(patient_id: str, claims: dict = Depends(current_claim
     prescriptions = client.table("prescriptions").select("*").eq("patient_id", patient_id).order("prescription_date", desc=True).limit(100).execute().data or []
     reports = client.table("reports").select("*").eq("patient_id", patient_id).order("report_date", desc=True).limit(100).execute().data or []
     _clinical_relationships(client, appointments + consultations + prescriptions + reports)
-    return {"data": {"patient": patient, "appointments": appointments, "consultations": consultations, "prescriptions": prescriptions, "reports": reports}}
+    profile = client.table("profiles").select("id,email,phone,first_name,last_name,date_of_birth,gender").eq("id", patient_id).maybe_single().execute().data
+    sections = {table: _patient_table_rows(client, table, patient_id) for table in ("medical_history", "allergies", "chronic_conditions", "surgeries", "vaccinations", "family_history", "lifestyle", "disabilities", "vitals", "patient_measurements")}
+    return {"data": {**patient, "profile": profile, "appointments": appointments, "consultations": consultations, "prescriptions": prescriptions, "reports": reports, **sections}}
 
 
 @router.get("/admin/doctors/{doctor_id}/overview")
