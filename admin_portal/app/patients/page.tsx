@@ -4,7 +4,6 @@ import { FormEvent, useCallback, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import { Users, Plus } from 'lucide-react'
 import { AdvancedTable } from '@/components/advanced-table'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -116,23 +115,13 @@ export default function PatientsPage() {
     { key: 'date_of_birth', label: 'Date of Birth', sortable: true },
     { key: 'gender', label: 'Gender', sortable: true },
     { key: 'blood_group', label: 'Blood Group', sortable: true },
-    {
-      key: 'status',
-      label: 'Status',
-      sortable: true,
-      render: (status: string) => (
-        <Badge variant={status === 'active' ? 'default' : 'secondary'}>
-          {status}
-        </Badge>
-      ),
-    },
   ]
   const filteredPatients = patients.filter((patient) => {
     const age = patient.date_of_birth ? Math.floor((Date.now() - new Date(patient.date_of_birth).getTime()) / 31557600000) : null
     const profile = patient.profile ?? {}
     const doctor = patient.assigned_doctor ?? {}
     const statuses = patient.appointment_statuses ?? []
-    return (!filters.gender || patient.gender === filters.gender) && (!filters.blood_group || patient.blood_group === filters.blood_group) && (!filters.doctor_id || doctor.id === filters.doctor_id) && (!filters.department_id || doctor.department_id === filters.department_id) && (!filters.age || (age !== null && (filters.age === 'under18' ? age < 18 : filters.age === '18to64' ? age >= 18 && age < 65 : age >= 65))) && (!filters.appointment_status || (filters.appointment_status === 'upcoming' ? patient.has_upcoming_appointment : statuses.includes(filters.appointment_status))) && (!profile.id || profile.id === patient.id)
+    return (!filters.gender || patient.gender === filters.gender) && (!filters.blood_group || patient.blood_group === filters.blood_group) && (!filters.doctor_id || doctor.id === filters.doctor_id) && (!filters.department_id || doctor.department_id === filters.department_id) && (!filters.age || (age !== null && (filters.age === 'under18' ? age < 18 : filters.age === '18to64' ? age >= 18 && age < 65 : age >= 65))) && (!filters.appointment_status || (filters.appointment_status === 'upcoming' ? patient.has_upcoming_appointment : statuses.includes(filters.appointment_status)))
   })
   const clearFilters = () => setFilters({ gender: '', blood_group: '', doctor_id: '', department_id: '', age: '', appointment_status: '' })
   const departments = Array.from(new Map<string, any>(doctors.map((doctor) => [doctor.department?.id, doctor.department] as [string, any]).filter(([id]) => Boolean(id))).values())

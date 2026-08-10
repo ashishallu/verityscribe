@@ -271,7 +271,7 @@ def me_doctor(doctor: dict = Depends(get_current_doctor)):
 def _appointment_detail(client: Client, appointment: dict) -> dict[str, Any]:
     patient = client.table("profiles").select("id,first_name,last_name,email,phone").eq("id", appointment["patient_id"]).maybe_single().execute().data
     doctor = client.table("doctors").select("*,profiles!inner(id,first_name,last_name,specialization),hospitals!inner(id,name),departments!inner(id,name)").eq("id", appointment["doctor_id"]).maybe_single().execute().data
-    return {"appointment": appointment, "patient": patient, "doctor": doctor}
+    return {**appointment, "patient": patient, "doctor": doctor}
 
 
 @router.post("/appointments", status_code=status.HTTP_201_CREATED)
