@@ -37,3 +37,13 @@ extension DoctorVoiceRepository on DoctorRepository {
     return jsonDecode(body);
   }
 }
+
+extension DoctorChatRepository on DoctorRepository {
+  Future<String> chat(String message, {String? consultationId}) async {
+    final body = <String, dynamic>{'message': message, if (consultationId != null) 'consultation_id': consultationId};
+    final result = await api.request('/chat', method: 'POST', body: body);
+    final map = Map<String, dynamic>.from(result as Map);
+    final data = Map<String, dynamic>.from((map['data'] as Map?) ?? map);
+    return (data['answer'] ?? '').toString();
+  }
+}

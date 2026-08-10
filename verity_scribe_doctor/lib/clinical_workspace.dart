@@ -20,9 +20,12 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
   DateTime? recordingStarted;
   List<Map<String, dynamic>> medicines = [];
   Map<String, dynamic>? selected, aiDraft;
+  final chatQuestion = TextEditingController();
+  String? chatAnswer;
+  bool chatLoading = false;
 
   @override
-  void dispose() { recorder.dispose(); super.dispose(); }
+  void dispose() { recorder.dispose(); chatQuestion.dispose(); super.dispose(); }
 
   Future<void> start() async {
     setState(() { saving = true; error = null; });
@@ -52,6 +55,14 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
     try { aiDraft = await widget.repo.processAi(consultationId!, transcriptId.text.trim()); setState(() {}); }
     catch (_) { setState(() => error = 'AI draft unavailable. You can continue manually.'); }
     finally { if (mounted) setState(() => aiLoading = false); }
+  }
+
+  Future<void> askAi() async {
+    if (consultationId == null || chatQuestion.text.trim().isEmpty || chatLoading) return;
+    setState(() { chatLoading = true; error = null; });
+    try { chatAnswer = await widget.repo.chat(chatQuestion.text.trim(), consultationId: consultationId); setState(() {}); }
+    catch (_) { setState(() => error = 'AI assistant unavailable. Continue manually.'); }
+    finally { if (mounted) setState(() => chatLoading = false); }
   }
 
   Future<void> startRecording() async {
@@ -100,6 +111,7 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
       if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
       FilledButton(onPressed: saving || consultationId != null ? null : start, child: Text(consultationId == null ? 'Start consultation' : 'Consultation created')),
       if (consultationId != null) ...[
+        Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('AI Assistant — Patient Context Active', style: TextStyle(fontWeight: FontWeight.w800)), TextField(controller: chatQuestion, decoration: const InputDecoration(labelText: 'Ask about this patient')), FilledButton(onPressed: chatLoading ? null : askAi, child: Text(chatLoading ? 'Thinking…' : 'Ask AI')), if (chatAnswer != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(chatAnswer!))]))),
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Voice consultation', style: TextStyle(fontWeight: FontWeight.w800)), Text(voiceStatus ?? 'IDLE'), if (recordingStarted != null) Text('Recording…'), if (recordingStarted == null && audioPath == null) FilledButton(onPressed: startRecording, child: const Text('Start recording')), if (recordingStarted != null) Wrap(spacing: 8, children: [FilledButton(onPressed: stopRecording, child: const Text('Stop')), OutlinedButton(onPressed: cancelRecording, child: const Text('Cancel'))]), if (audioPath != null && recordingStarted == null) Wrap(spacing: 8, children: [Text('Duration: ${recordingDuration.inSeconds}s'), FilledButton(onPressed: saving ? null : uploadRecording, child: const Text('Upload')), OutlinedButton(onPressed: () async { await cancelRecording(); await startRecording(); }, child: const Text('Record again'))])]))),
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('AI-GENERATED DRAFT — REQUIRES DOCTOR REVIEW', style: TextStyle(fontWeight: FontWeight.w800, color: Colors.deepPurple)),
