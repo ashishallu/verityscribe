@@ -17,12 +17,14 @@ router = APIRouter(tags=["integration"])
 class AppointmentCreate(BaseModel):
     patient_id: str | None = None
     doctor_id: str
-    hospital_id: str
+    hospital_id: str | None = None
     appointment_date: date
     appointment_time: str = Field(min_length=1, max_length=20)
     consultation_type: str
     reason_for_visit: str | None = None
     notes: str | None = None
+    duration_minutes: int = Field(default=30, ge=5, le=480)
+    appointment_fee: float | None = Field(default=None, ge=0)
 
 
 class ConsultationCreate(BaseModel):
@@ -234,7 +236,7 @@ def create_appointment(payload: AppointmentCreate, claims: dict = Depends(curren
     conflict = client.table("appointments").select("id").eq("doctor_id", payload.doctor_id).eq("appointment_date", payload.appointment_date.isoformat()).eq("appointment_time", payload.appointment_time).not_.in_("status", ["cancelled", "no_show"]).limit(1).execute().data
     if conflict:
         raise HTTPException(status_code=409, detail="The selected appointment slot is unavailable")
-    row = {"patient_id": patient["id"], "doctor_id": payload.doctor_id, "hospital_id": hospital_id, "appointment_date": payload.appointment_date.isoformat(), "appointment_time": payload.appointment_time, "consultation_type": payload.consultation_type, "reason_for_visit": payload.reason_for_visit, "notes": payload.notes, "status": "scheduled"}
+    row = {"patient_id": patient["id"], "doctor_id": payload.doctor_id, "hospital_id": hospital_id, "appointment_date": payload.appointment_date.isoformat(), "appointment_time": payload.appointment_time, "consultation_type": payload.consultation_type, "reason_for_visit": payload.reason_for_visit, "notes": payload.notes, "duration_minutes": payload.duration_minutes, "appointment_fee": payload.appointment_fee, "status": "scheduled"}
     created = client.table("appointments").insert(row).execute().data[0]
     return {"data": _appointment_detail(client, created)}
 
