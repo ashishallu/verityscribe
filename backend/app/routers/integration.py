@@ -217,9 +217,14 @@ def hospital_departments(hospital_id: str, page: int = Query(1, ge=1), page_size
     return _list(db(), "departments", page, page_size, search, hospital_id)
 
 
-@router.get("/doctors/directory")
-def doctor_directory(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), hospital_id: str | None = None, department_id: str | None = None, _: dict = Depends(current_claims)):
+@router.get("/doctors")
+def doctor_directory(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), hospital_id: str | None = None, department_id: str | None = None, claims: dict = Depends(current_claims)):
     client = db()
+    role = claims.get("app_metadata", {}).get("role")
+    if role == "hospital_admin":
+        hospital_id = get_current_profile(claims).get("hospital_id")
+        if not hospital_id:
+            raise HTTPException(status_code=403, detail="Your administrator account is not assigned to a hospital")
     query = client.table("doctors").select("*, profiles!inner(id,first_name,last_name,email,phone), hospitals!inner(id,name), departments!inner(id,name,hospital_id)", count="exact").is_("deleted_at", "null").eq("is_available", True)
     if hospital_id:
         query = query.eq("hospital_id", hospital_id)
