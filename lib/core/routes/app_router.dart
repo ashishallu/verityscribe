@@ -65,8 +65,7 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
       path: '/notifications', builder: (_, __) => const NotificationsScreen()),
   GoRoute(
       path: '/insurance',
-      builder: (_, __) => const DetailsPage(
-          title: 'Insurance dashboard', items: insuranceDetails)),
+      builder: (_, __) => const LiveInsuranceScreen()),
   GoRoute(
       path: '/medical-history',
       builder: (_, __) => const MedicalHistoryScreen()),
