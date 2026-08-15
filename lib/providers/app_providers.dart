@@ -63,6 +63,12 @@ final prescriptionsProvider = FutureProvider<List<Prescription>>(
 final reportsProvider = FutureProvider<List<Report>>(
     (ref) => ref.read(healthRepositoryProvider).reports());
 final patientProfileProvider = FutureProvider<Patient>((ref) => ref.read(healthRepositoryProvider).patientProfile());
+final patientProfileDataProvider = FutureProvider<Map<String, dynamic>>((ref) async {
+  final client = ref.read(apiClientProvider);
+  final profileBody = Map<String, dynamic>.from((await client.get<dynamic>('/me')).data as Map);
+  final patientBody = Map<String, dynamic>.from((await client.get<dynamic>('/me/patient')).data as Map);
+  return {'profile': Map<String, dynamic>.from(profileBody['data'] as Map), 'patient': Map<String, dynamic>.from(patientBody['data'] as Map)};
+});
 final hospitalsProvider = FutureProvider<List<Hospital>>((ref) => ref.read(healthRepositoryProvider).hospitals());
 final departmentsProvider = FutureProvider.family<List<Department>, String>((ref, hospitalId) => ref.read(healthRepositoryProvider).departments(hospitalId));
 final doctorsDirectoryProvider = FutureProvider<List<DoctorDirectoryItem>>((ref) => ref.read(healthRepositoryProvider).doctors());

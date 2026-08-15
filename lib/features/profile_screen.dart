@@ -12,6 +12,7 @@ class ProfileScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final dark = ref.watch(themeProvider) == ThemeMode.dark;
     final profile = ref.watch(patientProfileProvider);
+    final live = ref.watch(patientProfileDataProvider);
     return profile.when(loading: () => const Center(child: CircularProgressIndicator()), error: (error, _) => Center(child: Text('Unable to load profile: $error')), data: (patient) => ListView(padding: const EdgeInsets.only(bottom: 28), children: [
       const SizedBox(height: 22),
       Center(
@@ -32,6 +33,7 @@ class ProfileScreen extends ConsumerWidget {
               style: TextStyle(
                   fontSize: 12,
                   color: Theme.of(context).colorScheme.onSurfaceVariant))),
+      live.when(data: (data) => _liveDetails(context, data), loading: () => const Padding(padding: EdgeInsets.all(20), child: LinearProgressIndicator()), error: (_, __) => const SizedBox.shrink()),
       const SectionTitle('Your care network'),
       Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -76,6 +78,13 @@ class ProfileScreen extends ConsumerWidget {
                 'Control your health data', '/profile'),
           ]))),
     ]));
+  }
+
+  Widget _liveDetails(BuildContext context, Map<String, dynamic> data) {
+    final p = Map<String, dynamic>.from(data['profile'] as Map? ?? const {});
+    final patient = Map<String, dynamic>.from(data['patient'] as Map? ?? const {});
+    final values = <String, dynamic>{'Email': p['email'], 'Phone': p['phone'], 'Date of birth': patient['date_of_birth'] ?? p['date_of_birth'], 'Gender': patient['gender'] ?? p['gender'], 'Blood group': patient['blood_group'], 'Height (cm)': patient['height_cm'], 'Weight (kg)': patient['weight_kg'], 'Occupation': patient['occupation'], 'Marital status': patient['marital_status']};
+    return Padding(padding: const EdgeInsets.symmetric(horizontal: 20), child: SoftCard(child: Column(children: values.entries.where((entry) => entry.value != null && entry.value.toString().isNotEmpty).map((entry) => ListTile(dense: true, title: Text(entry.key), trailing: Text(entry.value.toString())).toList())));
   }
 
   Widget _row(BuildContext context, IconData icon, String title,

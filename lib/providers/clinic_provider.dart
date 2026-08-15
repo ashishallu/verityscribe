@@ -122,19 +122,6 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
   }
 
   void clearChat() => state = state.copyWith(messages: []);
-  void addConsultation() {
-    final consultation = Consultation(
-        id: 'con_${DateTime.now().millisecondsSinceEpoch}',
-        doctorName: 'Dr. Ananya Rao',
-        hospital: 'NovaCare Hospital',
-        diagnosis: 'Type 2 diabetes - stable',
-        summary:
-            'Continue Metformin twice daily, maintain hydration and return in two weeks.',
-        status: 'Completed',
-        date: DateTime.now());
-    state =
-        state.copyWith(consultations: [consultation, ...state.consultations]);
-  }
 }
 
 final clinicProvider = StateNotifierProvider<ClinicNotifier, ClinicState>(

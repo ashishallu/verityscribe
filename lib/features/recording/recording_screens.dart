@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import '../../providers/clinic_provider.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/ui.dart';
 
@@ -33,5 +31,5 @@ class _RecordingScreenState extends State<RecordingScreen> with SingleTickerProv
     ),
   );
 }
-class _Transcript extends StatelessWidget { const _Transcript(); @override Widget build(BuildContext context)=>ListView(children:const [Text('Live transcription',style:TextStyle(fontWeight:FontWeight.w800)),SizedBox(height:16),Text('Doctor',style:TextStyle(color:AppTheme.blue,fontWeight:FontWeight.w800)),Text('Continue Metformin twice daily after meals.'),SizedBox(height:14),Text('Patient',style:TextStyle(color:AppTheme.emerald,fontWeight:FontWeight.w800)),Text('Okay doctor, I will continue it.'),SizedBox(height:14),Text('Doctor',style:TextStyle(color:AppTheme.blue,fontWeight:FontWeight.w800)),Text('Come back after two weeks for a review.')]); }
-class SessionReviewScreen extends ConsumerWidget { const SessionReviewScreen({super.key}); @override Widget build(BuildContext context,WidgetRef ref)=>Scaffold(appBar:AppBar(title:const Text('AI session review')),body:ListView(padding:const EdgeInsets.all(20),children:[SoftCard(color:Theme.of(context).colorScheme.primaryContainer,child:const Text('Clinical summary generated from your secure recording.',style:TextStyle(fontWeight:FontWeight.w700))),const SectionTitle('Medicines'),const SoftCard(child:ListTile(title:Text('Metformin 500 mg',style:TextStyle(fontWeight:FontWeight.w800)),subtitle:Text('Morning and evening • After food • 14 days'),trailing:Icon(Icons.edit_rounded))),const SectionTitle('Session summary'),const SoftCard(child:Text('Diagnosis: Type 2 diabetes - stable\n\nRecommendations: Continue medication, balanced meals and review in two weeks.')),const SizedBox(height:24),FilledButton(onPressed:(){ref.read(clinicProvider.notifier).addConsultation();context.go('/records');},style:FilledButton.styleFrom(minimumSize:const Size.fromHeight(54)),child:const Text('Confirm and save session'))])); }
+class _Transcript extends StatelessWidget { const _Transcript(); @override Widget build(BuildContext context)=>const Center(child:Text('Transcription is unavailable until a doctor consultation is active.',textAlign:TextAlign.center)); }
+class SessionReviewScreen extends StatelessWidget { const SessionReviewScreen({super.key}); @override Widget build(BuildContext context)=>Scaffold(appBar:AppBar(title:const Text('AI session review')),body:const Center(child:Padding(padding:EdgeInsets.all(24),child:Text('AI review is available from the Doctor App after an authenticated consultation. No transcript or clinical draft was generated.',textAlign:TextAlign.center))); }
