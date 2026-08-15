@@ -1,4 +1,20 @@
 import 'package:flutter/material.dart';
-import '../../theme/app_theme.dart';
-import '../../widgets/ui.dart';
-class NotificationsScreen extends StatelessWidget {const NotificationsScreen({super.key});@override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Notifications')),body:ListView(padding:const EdgeInsets.all(20),children:[const Text('Today',style:TextStyle(fontWeight:FontWeight.w800,color:AppTheme.muted)),const SizedBox(height:12),SoftCard(child:ListTile(leading:const Icon(Icons.calendar_today_rounded,color:AppTheme.blue),title:const Text('Appointment reminder',style:TextStyle(fontWeight:FontWeight.w800)),subtitle:const Text('Dr. Meera Kapoor at 10:30 AM'),trailing:const Icon(Icons.chevron_right_rounded))),const SizedBox(height:12),SoftCard(child:ListTile(leading:const Icon(Icons.medication_rounded,color:AppTheme.emerald),title:const Text('Medicine due',style:TextStyle(fontWeight:FontWeight.w800)),subtitle:const Text('Atorvastatin is scheduled for tonight.')))]));}
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../providers/app_providers.dart';
+
+class NotificationsScreen extends ConsumerWidget {
+  const NotificationsScreen({super.key});
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch(patientNotificationsProvider);
+    return Scaffold(appBar: AppBar(title: const Text('Notifications')), body: state.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (_, __) => Center(child: TextButton(onPressed: () => ref.invalidate(patientNotificationsProvider), child: const Text('Unable to load notifications. Retry'))),
+      data: (data) {
+        final items = data['data'] is List ? List<dynamic>.from(data['data']) : const <dynamic>[];
+        if (items.isEmpty) return const Center(child: Text('No notifications available.'));
+        return ListView(padding: const EdgeInsets.all(16), children: items.map((item) { final row = item is Map ? item : const {}; return Card(child: ListTile(title: Text('${row['title'] ?? row['type'] ?? 'Notification'}'), subtitle: Text('${row['body'] ?? row['message'] ?? ''}'))); }).toList();
+      },
+    ));
+  }
+}

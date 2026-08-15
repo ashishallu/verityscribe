@@ -1,7 +1,13 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-import '../../theme/app_theme.dart';
-import '../../widgets/ui.dart';
-class ScanScreen extends StatefulWidget { const ScanScreen({super.key}); @override State<ScanScreen> createState()=>_ScanScreenState(); }
-class _ScanScreenState extends State<ScanScreen> { bool scanning=false; @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Scan medicine')),body:Padding(padding:const EdgeInsets.all(20),child:Column(children:[Expanded(child:Container(decoration:BoxDecoration(color:Theme.of(c).colorScheme.surfaceContainerHighest,borderRadius:BorderRadius.circular(28)),child:Center(child:AnimatedContainer(duration:const Duration(milliseconds:500),width:scanning?220:190,height:scanning?220:190,decoration:BoxDecoration(border:Border.all(color:AppTheme.cyan,width:scanning?5:2),borderRadius:BorderRadius.circular(24)),child:Icon(scanning?Icons.auto_awesome_rounded:Icons.camera_alt_rounded,size:68,color:AppTheme.blue))))),const SizedBox(height:22),Text(scanning?'Identifying your medicine securely...':'Position the medicine label inside the frame.',style:const TextStyle(color:AppTheme.muted)),const SizedBox(height:18),FilledButton.icon(onPressed:scanning?null:(){setState(()=>scanning=true);Future.delayed(const Duration(seconds:2),(){if(!mounted)return;context.go('/medicine-result');});},style:FilledButton.styleFrom(minimumSize:const Size.fromHeight(54)),icon:const Icon(Icons.camera_alt_rounded),label:Text(scanning?'Scanning...':'Capture medicine'))]))); }
-class MedicineResultScreen extends StatelessWidget { const MedicineResultScreen({super.key}); @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:const Text('Medicine identified')),body:Padding(padding:const EdgeInsets.all(20),child:Column(children:[const SizedBox(height:20),Container(width:115,height:115,decoration:BoxDecoration(color:Theme.of(c).colorScheme.primaryContainer,borderRadius:BorderRadius.circular(28)),child:const Icon(Icons.medication_rounded,size:55,color:AppTheme.blue)),const SizedBox(height:20),Text('Metformin 500 mg',style:Theme.of(c).textTheme.titleLarge?.copyWith(fontWeight:FontWeight.w800)),const SizedBox(height:6),const StatusPill('MATCH CONFIDENT',AppTheme.emerald),const SizedBox(height:24),const SoftCard(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text('Medicine details',style:TextStyle(fontWeight:FontWeight.w800)),SizedBox(height:10),Text('Purpose: Diabetes management'),Text('Take after breakfast with water.'),SizedBox(height:8),Text('Front and back label captured securely.',style:TextStyle(color:AppTheme.muted,fontSize:12))])),const Spacer(),FilledButton(onPressed:()=>c.go('/medicines'),style:FilledButton.styleFrom(minimumSize:const Size.fromHeight(54)),child:const Text('Confirm medicine'))]))); }
+
+class ScanScreen extends StatelessWidget {
+  const ScanScreen({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text('Document scan')), body: const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('Document scanning is unavailable until a secure backend upload is configured.', textAlign: TextAlign.center))));
+}
+
+class MedicineResultScreen extends StatelessWidget {
+  const MedicineResultScreen({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text('Medicine scan')), body: const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('Medicine recognition is unavailable. No clinical result was generated.', textAlign: TextAlign.center))));
+}

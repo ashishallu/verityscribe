@@ -1,8 +1,17 @@
 import 'package:flutter/material.dart';
-import '../theme/app_theme.dart';
-import '../widgets/ui.dart';
-class DetailsPage extends StatelessWidget { final String title; final List<MapEntry<String,String>> items; const DetailsPage({required this.title,required this.items,super.key}); @override Widget build(BuildContext c)=>Scaffold(appBar:AppBar(title:Text(title)),body:ListView(padding:const EdgeInsets.all(20),children:[SoftCard(color:Theme.of(c).colorScheme.primaryContainer,child:Row(children:[const Icon(Icons.verified_user_rounded,color:AppTheme.blue),const SizedBox(width:10),Expanded(child:Text('$title securely managed in VerityScribe.',style:const TextStyle(fontWeight:FontWeight.w700)))])),const SizedBox(height:18),...items.map((entry)=>Padding(padding:const EdgeInsets.only(bottom:12),child:SoftCard(child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(entry.key,style:const TextStyle(fontWeight:FontWeight.w800)),const SizedBox(height:4),Text(entry.value,style:const TextStyle(color:AppTheme.muted))]))))]));}
-const insuranceDetails=[MapEntry('Aster Health Platinum','Policy no. AHP-49-209184 • Member ID VS-2048-731'),MapEntry('Coverage','₹10,00,000 annual cover • ₹7,85,000 available'),MapEntry('Renewal','Premium ₹18,500 due 15 December 2026'),MapEntry('Support','Agent Priya Shah • +91 98765 43210 • Cashless eligible')];
-const emergencyDetails=[MapEntry('Primary contact','Ravi Allu • Brother • +91 98765 12345'),MapEntry('Secondary contact','Sushma Allu • Mother • +91 98450 67890'),MapEntry('Care contact','Dr. Meera Kapoor • NovaCare Hospital • Cardiology'),MapEntry('Emergency notes','Blood group O+ • No known drug allergies')];
-const hospitalDetails=[MapEntry('NovaCare Hospital','Dr. Meera Kapoor • Cardiology • 2.4 km • Appointment confirmed'),MapEntry('Aster Medcity','Dr. Ananya Rao • Endocrinology • 4.8 km • Navigate / Call'),MapEntry('City Imaging Centre','Diagnostics • 6.1 km • Report sharing enabled')];
-const deviceDetails=[MapEntry('Apple Watch Series 9','Connected • 84% battery • synced 8 min ago'),MapEntry('Omron BP Monitor','Connected • 71% battery • synced yesterday'),MapEntry('Accu-Chek Glucometer','Connected • 92% battery • synced 2 days ago'),MapEntry('Pulse Oximeter','Ready to connect • 100% battery')];
+
+class DetailsPage extends StatelessWidget {
+  final String title;
+  final List<MapEntry<String, String>> items;
+  const DetailsPage({required this.title, required this.items, super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text(title)),
+        body: Center(child: Text(items.isEmpty ? 'No live $title records available.' : 'Live $title data is unavailable in this view.')),
+      );
+}
+
+const insuranceDetails = <MapEntry<String, String>>[];
+const emergencyDetails = <MapEntry<String, String>>[];
+const hospitalDetails = <MapEntry<String, String>>[];
+const deviceDetails = <MapEntry<String, String>>[];
