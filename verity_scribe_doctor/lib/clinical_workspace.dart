@@ -11,7 +11,7 @@ class ClinicalWorkspace extends StatefulWidget {
 }
 
 class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
-  final symptoms = TextEditingController(), diagnosis = TextEditingController(), plan = TextEditingController(), note = TextEditingController(), search = TextEditingController(), report = TextEditingController(), transcriptId = TextEditingController();
+  final symptoms = TextEditingController(), diagnosis = TextEditingController(), plan = TextEditingController(), note = TextEditingController(), search = TextEditingController(), report = TextEditingController(), transcriptId = TextEditingController(), dosage = TextEditingController(), frequency = TextEditingController(), quantity = TextEditingController();
   String? consultationId, error;
   bool saving = false, aiLoading = false;
   final recorder = AudioRecorder();
@@ -25,7 +25,7 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
   bool chatLoading = false;
 
   @override
-  void dispose() { recorder.dispose(); chatQuestion.dispose(); super.dispose(); }
+  void dispose() { recorder.dispose(); chatQuestion.dispose(); symptoms.dispose(); diagnosis.dispose(); plan.dispose(); note.dispose(); search.dispose(); report.dispose(); transcriptId.dispose(); dosage.dispose(); frequency.dispose(); quantity.dispose(); super.dispose(); }
 
   Future<void> start() async {
     setState(() { saving = true; error = null; });
@@ -112,7 +112,7 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
       FilledButton(onPressed: saving || consultationId != null ? null : start, child: Text(consultationId == null ? 'Start consultation' : 'Consultation created')),
       if (consultationId != null) ...[
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('AI Assistant — Patient Context Active', style: TextStyle(fontWeight: FontWeight.w800)), TextField(controller: chatQuestion, decoration: const InputDecoration(labelText: 'Ask about this patient')), FilledButton(onPressed: chatLoading ? null : askAi, child: Text(chatLoading ? 'Thinking…' : 'Ask AI')), if (chatAnswer != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(chatAnswer!))]))),
-        Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Voice consultation', style: TextStyle(fontWeight: FontWeight.w800)), Text(voiceStatus ?? 'IDLE'), if (recordingStarted != null) Text('Recording…'), if (recordingStarted == null && audioPath == null) FilledButton(onPressed: startRecording, child: const Text('Start recording')), if (recordingStarted != null) Wrap(spacing: 8, children: [FilledButton(onPressed: stopRecording, child: const Text('Stop')), OutlinedButton(onPressed: cancelRecording, child: const Text('Cancel'))]), if (audioPath != null && recordingStarted == null) Wrap(spacing: 8, children: [Text('Duration: ${recordingDuration.inSeconds}s'), FilledButton(onPressed: saving ? null : uploadRecording, child: const Text('Upload')), OutlinedButton(onPressed: () async { await cancelRecording(); await startRecording(); }, child: const Text('Record again'))])]))),
+        Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Voice consultation', style: TextStyle(fontWeight: FontWeight.w800)), Text(voiceStatus ?? 'IDLE'), if (recordingStarted != null) const Text('Recording…'), if (recordingStarted == null && audioPath == null) FilledButton(onPressed: startRecording, child: const Text('Start recording')), if (recordingStarted != null) Wrap(spacing: 8, children: [FilledButton(onPressed: stopRecording, child: const Text('Stop')), OutlinedButton(onPressed: cancelRecording, child: const Text('Cancel'))]), if (audioPath != null && recordingStarted == null) Wrap(spacing: 8, children: [Text('Duration: ${recordingDuration.inSeconds}s'), FilledButton(onPressed: saving ? null : uploadRecording, child: const Text('Upload')), OutlinedButton(onPressed: () async { await cancelRecording(); await startRecording(); }, child: const Text('Record again'))])]))),
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('AI-GENERATED DRAFT — REQUIRES DOCTOR REVIEW', style: TextStyle(fontWeight: FontWeight.w800, color: Colors.deepPurple)),
           TextField(controller: transcriptId, decoration: const InputDecoration(labelText: 'Verified transcript ID')),
@@ -125,7 +125,10 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
         TextField(controller: search, decoration: const InputDecoration(labelText: 'Search medicine')),
         OutlinedButton(onPressed: () => run(() async { medicines = await widget.repo.medicines(search.text); }), child: const Text('Search catalog')),
         if (medicines.isNotEmpty) DropdownButton<Map<String, dynamic>>(value: selected, items: medicines.map((m) => DropdownMenuItem(value: m, child: Text('${m['name'] ?? ''} ${m['strength'] ?? ''}'))).toList(), onChanged: (m) => setState(() => selected = m)),
-        OutlinedButton(onPressed: selected == null ? null : () => run(() => widget.repo.prescription(consultationId!, selected!['id'].toString())), child: const Text('Create prescription')),
+        TextField(controller: dosage, decoration: const InputDecoration(labelText: 'Dosage')),
+        TextField(controller: frequency, decoration: const InputDecoration(labelText: 'Frequency')),
+        TextField(controller: quantity, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Quantity')),
+        OutlinedButton(onPressed: selected == null ? null : () { final amount = int.tryParse(quantity.text.trim()); if (dosage.text.trim().isEmpty || frequency.text.trim().isEmpty || amount == null || amount <= 0) { setState(() => error = 'Enter dosage, frequency and a positive quantity.'); return; } run(() => widget.repo.prescription(consultationId!, selected!['id'].toString(), dosage: dosage.text.trim(), frequency: frequency.text.trim(), quantity: amount)); }, child: const Text('Create prescription')),
         TextField(controller: report, decoration: const InputDecoration(labelText: 'Report findings')),
         OutlinedButton(onPressed: () => run(() => widget.repo.report(consultationId!, report.text)), child: const Text('Create report')),
       ],

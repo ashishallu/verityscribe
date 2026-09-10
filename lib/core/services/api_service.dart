@@ -40,8 +40,9 @@ class HttpApiClient implements ApiClient {
       Future<http.Response> Function() call) async {
     try {
       final response = await call().timeout(const Duration(seconds: 12));
-      if (response.statusCode < 200 || response.statusCode >= 300)
+      if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(response.body, statusCode: response.statusCode);
+      }
       return ApiResponse<T>(jsonDecode(response.body) as T,
           statusCode: response.statusCode);
     } on TimeoutException {
@@ -59,20 +60,6 @@ class HttpApiClient implements ApiClient {
           String path, Map<String, dynamic> body) async =>
       _request<T>(() async => _client.post(_uri(path),
           headers: await _headers(), body: jsonEncode(body)));
-}
-
-class MockApiClient implements ApiClient {
-  @override
-  Future<ApiResponse<T>> get<T>(String path) async {
-    await Future.delayed(const Duration(milliseconds: 650));
-    throw const ApiException('Mock client requires a repository response.');
-  }
-
-  @override
-  Future<ApiResponse<T>> post<T>(String path, Map<String, dynamic> body) async {
-    await Future.delayed(const Duration(milliseconds: 650));
-    throw const ApiException('Mock client requires a repository response.');
-  }
 }
 
 class ApiService {

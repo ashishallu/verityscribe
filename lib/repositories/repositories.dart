@@ -30,8 +30,9 @@ class SupabaseAuthRepository implements AuthRepository {
   Future<UserModel> register(String name, String email, String password) async {
     final result = await _auth
         .signUp(email: email, password: password, data: {'full_name': name});
-    if (result.user == null)
+    if (result.user == null) {
       throw const ApiException('Unable to create account.');
+    }
     return _model(result.user!);
   }
 
@@ -69,7 +70,7 @@ class ApiHealthRepository implements HealthRepository {
   @override Future<List<Map<String,dynamic>>> clinicalConsultations() async => _rows((await _client.get<dynamic>('/me/consultations')).data);
   @override Future<List<Map<String,dynamic>>> prescriptionsLive() async => _rows((await _client.get<dynamic>('/me/prescriptions')).data);
   @override Future<List<Map<String,dynamic>>> reportsLive() async => _rows((await _client.get<dynamic>('/me/reports')).data);
-  @override Future<Patient> patientProfile() async { final profile=_row((await _client.get<dynamic>('/me')).data)['data']; final x=_row((await _client.get<dynamic>('/me/patient')).data)['data']; return Patient(id:x['id'].toString(),name:'${profile['first_name']??''} ${profile['last_name']??''}'.trim(),email:(profile['email']??'').toString(),medicalId:(x['mrn']??x['id']).toString(),dateOfBirth:DateTime.tryParse((x['date_of_birth']??profile['date_of_birth']??'2000-01-01').toString())??DateTime(2000)); }
+  @override Future<Patient> patientProfile() async { final profile=_row((await _client.get<dynamic>('/me')).data)['data']; final x=_row((await _client.get<dynamic>('/me/patient')).data)['data']; final date=DateTime.tryParse((x['date_of_birth']??profile['date_of_birth']??'').toString()); if(date==null) throw const ApiException('Patient date of birth is unavailable.'); return Patient(id:x['id'].toString(),name:'${profile['first_name']??''} ${profile['last_name']??''}'.trim(),email:(profile['email']??'').toString(),medicalId:(x['mrn']??x['id']).toString(),dateOfBirth:date); }
   @override Future<List<Hospital>> hospitals() async => _rows((await _client.get<dynamic>('/hospitals')).data).map(Hospital.fromJson).toList();
   @override Future<List<Department>> departments(String hospitalId) async => _rows((await _client.get<dynamic>('/hospitals/$hospitalId/departments')).data).map(Department.fromJson).toList();
   @override Future<List<DoctorDirectoryItem>> doctors() async => _rows((await _client.get<dynamic>('/doctors')).data).map(DoctorDirectoryItem.fromJson).toList();
@@ -83,40 +84,38 @@ class ApiHealthRepository implements HealthRepository {
       final row = _row(item);
       final medicine = _row(row['medicine'] ?? const {});
       final quantity = (row['quantity'] as num? ?? 0).toInt();
-      return Medicine(id: row['medicine_id'].toString(), name: (medicine['name'] ?? '').toString(), dosage: (row['dosage'] ?? '').toString(), purpose: (medicine['description'] ?? '').toString(), schedule: (row['frequency'] ?? '').toString(), remaining: quantity, initialQuantity: quantity, dailyUsage: 1);
+      return Medicine(id: row['medicine_id'].toString(), name: (medicine['name'] ?? '').toString(), dosage: (row['dosage'] ?? '').toString(), purpose: (medicine['description'] ?? '').toString(), schedule: (row['frequency'] ?? '').toString(), remaining: quantity, initialQuantity: quantity, dailyUsage: 0);
     })).toList();
   }
   @override
   Future<List<Consultation>> consultations() async =>
       _rows((await _client.get<dynamic>('/consultations')).data)
-          .map((x) => Consultation(
-              id: x['id'] as String,
-              doctorName: (x['doctor_name'] ?? 'Care team') as String,
-              summary:
-                  (x['treatment_plan'] ?? 'No summary available.') as String,
-              diagnosis: (x['diagnosis'] ?? 'Pending review') as String,
-              date: DateTime.tryParse(
-                      (x['consultation_date'] ?? x['created_at'] ?? '')
-                          .toString()) ??
-                  DateTime.now()))
+          .map((x) {
+            final date = DateTime.tryParse((x['consultation_date'] ?? x['created_at'] ?? '').toString());
+            if (date == null) return null;
+            return Consultation(id: x['id'] as String, doctorName: (x['doctor_name'] ?? 'Not available') as String, summary: (x['treatment_plan'] ?? 'Not available') as String, diagnosis: (x['diagnosis'] ?? 'Not available') as String, date: date);
+          })
+          .whereType<Consultation>()
           .toList();
   @override
   Future<Appointment> nextAppointment() async {
     final rows = _rows((await _client.get<dynamic>(
             '/appointments?sort=scheduled_at&descending=false&page_size=1'))
         .data);
-    if (rows.isEmpty)
+    if (rows.isEmpty) {
       throw const ApiException('No upcoming appointments found.');
+    }
     final x = rows.first;
+    final scheduledAt = DateTime.tryParse((x['scheduled_at'] ?? '').toString());
+    if (scheduledAt == null) throw const ApiException('Appointment date is unavailable.');
     return Appointment(
         id: x['id'] as String,
         doctor: Doctor(
             id: (x['doctor_id'] ?? '') as String,
-            name: (x['doctor_name'] ?? 'Care team') as String,
-            specialty: (x['specialty'] ?? 'General medicine') as String,
-            hospital: (x['hospital_name'] ?? 'Hospital') as String),
-        scheduledAt: DateTime.tryParse((x['scheduled_at'] ?? '').toString()) ??
-            DateTime.now(),
+            name: (x['doctor_name'] ?? 'Not available') as String,
+            specialty: (x['specialty'] ?? 'Not available') as String,
+            hospital: (x['hospital_name'] ?? 'Not available') as String),
+        scheduledAt: scheduledAt,
         status: (x['status'] ?? 'scheduled') as String);
   }
 
@@ -131,6 +130,11 @@ class ApiHealthRepository implements HealthRepository {
   @override
   Future<List<Report>> reports() async =>
       _rows((await _client.get<dynamic>('/reports')).data)
-          .map((row) => Report(id: row['id'] as String, title: (row['title'] ?? row['report_type'] ?? 'Medical report').toString(), category: (row['category'] ?? 'Clinical').toString(), url: (row['file_url'] ?? '').toString(), date: DateTime.tryParse((row['report_date'] ?? row['created_at'] ?? '').toString()) ?? DateTime.now()))
+          .map((row) {
+            final date = DateTime.tryParse((row['report_date'] ?? row['created_at'] ?? '').toString());
+            if (date == null) return null;
+            return Report(id: row['id'] as String, title: (row['title'] ?? row['report_type'] ?? 'Not available').toString(), category: (row['category'] ?? 'Not available').toString(), url: (row['file_url'] ?? '').toString(), date: date);
+          })
+          .whereType<Report>()
           .toList();
 }

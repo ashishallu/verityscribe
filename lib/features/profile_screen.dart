@@ -43,17 +43,17 @@ class ProfileScreen extends ConsumerWidget {
                 context,
                 Icons.medical_information_outlined,
                 'Medical history',
-                'Conditions, allergies, documents and emergency details',
+                'Open to view live records',
                 '/medical-history'),
             const Divider(),
             _row(context, Icons.contact_phone_rounded, 'Emergency contacts',
-                '2 trusted contacts', '/emergency-contacts'),
+                'Open to view live contacts', '/emergency-contacts'),
             const Divider(),
             _row(context, Icons.shield_outlined, 'Insurance',
-                'Aster Health Platinum', '/insurance'),
+                'Open to view live coverage', '/insurance'),
             const Divider(),
             _row(context, Icons.local_hospital_rounded, 'Linked hospitals',
-                'NovaCare and 2 more', '/hospitals'),
+                'Open to view live hospitals', '/hospitals'),
           ]))),
       const SectionTitle('Preferences'),
       Padding(
@@ -84,7 +84,7 @@ class ProfileScreen extends ConsumerWidget {
     final p = Map<String, dynamic>.from(data['profile'] as Map? ?? const {});
     final patient = Map<String, dynamic>.from(data['patient'] as Map? ?? const {});
     final values = <String, dynamic>{'Email': p['email'], 'Phone': p['phone'], 'Date of birth': patient['date_of_birth'] ?? p['date_of_birth'], 'Gender': patient['gender'] ?? p['gender'], 'Blood group': patient['blood_group'], 'Height (cm)': patient['height_cm'], 'Weight (kg)': patient['weight_kg'], 'Occupation': patient['occupation'], 'Marital status': patient['marital_status']};
-    return Padding(padding: const EdgeInsets.symmetric(horizontal: 20), child: SoftCard(child: Column(children: values.entries.where((entry) => entry.value != null && entry.value.toString().isNotEmpty).map((entry) => ListTile(dense: true, title: Text(entry.key), trailing: Text(entry.value.toString())).toList())));
+    return Padding(padding: const EdgeInsets.symmetric(horizontal: 20), child: SoftCard(child: Column(children: values.entries.where((entry) => entry.value != null && entry.value.toString().isNotEmpty).map((entry) => ListTile(dense: true, title: Text(entry.key), trailing: Text(entry.value.toString()))).toList())));
   }
 
   Widget _row(BuildContext context, IconData icon, String title,

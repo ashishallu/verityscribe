@@ -110,8 +110,9 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           ? Map<String, dynamic>.from(body['data'] as Map)
           : body;
       final answer = (data['answer'] ?? data['message'] ?? '').toString();
-      if (answer.isEmpty)
+      if (answer.isEmpty) {
         throw const ApiException('The care assistant returned no response.');
+      }
       state = state.copyWith(messages: [
         ...updated,
         ChatMessage(text: answer, isUser: false, sentAt: DateTime.now())

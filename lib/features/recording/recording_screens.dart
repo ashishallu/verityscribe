@@ -32,4 +32,16 @@ class _RecordingScreenState extends State<RecordingScreen> with SingleTickerProv
   );
 }
 class _Transcript extends StatelessWidget { const _Transcript(); @override Widget build(BuildContext context)=>const Center(child:Text('Transcription is unavailable until a doctor consultation is active.',textAlign:TextAlign.center)); }
-class SessionReviewScreen extends StatelessWidget { const SessionReviewScreen({super.key}); @override Widget build(BuildContext context)=>Scaffold(appBar:AppBar(title:const Text('AI session review')),body:const Center(child:Padding(padding:EdgeInsets.all(24),child:Text('AI review is available from the Doctor App after an authenticated consultation. No transcript or clinical draft was generated.',textAlign:TextAlign.center))); }
+class SessionReviewScreen extends StatelessWidget {
+  const SessionReviewScreen({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('AI session review')),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text('AI review is available from the Doctor App after an authenticated consultation. No transcript or clinical draft was generated.', textAlign: TextAlign.center),
+          ),
+        ),
+      );
+}

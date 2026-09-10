@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../providers/app_providers.dart';
+import '../../providers/app_providers.dart';
 
 class NotificationsScreen extends ConsumerWidget {
   const NotificationsScreen({super.key});
@@ -13,7 +13,7 @@ class NotificationsScreen extends ConsumerWidget {
       data: (data) {
         final items = data['data'] is List ? List<dynamic>.from(data['data']) : const <dynamic>[];
         if (items.isEmpty) return const Center(child: Text('No notifications available.'));
-        return ListView(padding: const EdgeInsets.all(16), children: items.map((item) { final row = item is Map ? item : const {}; return Card(child: ListTile(title: Text('${row['title'] ?? row['type'] ?? 'Notification'}'), subtitle: Text('${row['body'] ?? row['message'] ?? ''}'))); }).toList();
+        return ListView(padding: const EdgeInsets.all(16), children: items.map((item) { final row = item is Map ? item : const {}; return Card(child: ListTile(title: Text('${row['title'] ?? row['type'] ?? 'Notification'}'), subtitle: Text('${row['body'] ?? row['message'] ?? ''}'))); }).toList());
       },
     ));
   }
