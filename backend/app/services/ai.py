@@ -21,4 +21,4 @@ class VerificationService:
 
 class RagService:
     async def answer(self, patient_id: str, question: str) -> dict:
-        return {"patient_id": patient_id, "answer": "RAG provider not configured", "citations": [], "grounded": False}
+        raise RuntimeError("RAG provider is not configured")
