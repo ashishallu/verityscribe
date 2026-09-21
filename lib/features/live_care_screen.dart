@@ -17,13 +17,14 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
   DateTime? date;
   TimeOfDay? time;
   String type = 'in_person';
-  final reason = TextEditingController(), notes = TextEditingController();
+  final reason = TextEditingController(), notes = TextEditingController(), timeText = TextEditingController();
   bool submitting = false, showPayment = false;
   String? error;
   @override
   void dispose() {
     reason.dispose();
     notes.dispose();
+    timeText.dispose();
     super.dispose();
   }
 
@@ -116,9 +117,15 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                 child: const Text('Back'))
           ]));
     return Scaffold(
-        appBar: AppBar(title: const Text('Book an appointment')),
-        body: ListView(padding: const EdgeInsets.all(20), children: [
-          const Text('Hospital', style: TextStyle(fontWeight: FontWeight.w700)),
+        backgroundColor: const Color(0xFFF5F7FC),
+        appBar: AppBar(title: const Text('Book an appointment'), backgroundColor: Colors.transparent),
+        body: ListView(padding: const EdgeInsets.fromLTRB(20, 8, 20, 32), children: [
+          const Text('Find your care team', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          const Text('Choose a hospital, specialist and convenient time.', style: TextStyle(color: Color(0xFF667085))),
+          const SizedBox(height: 20),
+          _BookingCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const _FieldTitle('Hospital'),
           hospitals.when(
               loading: () => const LinearProgressIndicator(),
               error: (e, _) => const Text('Unable to load hospitals'),
@@ -133,11 +140,9 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                         department = null;
                         doctor = null;
                       }),
-                  decoration:
-                      const InputDecoration(hintText: 'Select hospital'))),
-          const SizedBox(height: 14),
-          const Text('Department',
-              style: TextStyle(fontWeight: FontWeight.w700)),
+                  decoration: const InputDecoration(hintText: 'Select hospital', prefixIcon: Icon(Icons.local_hospital_outlined)))) ,
+          const SizedBox(height: 18),
+          const _FieldTitle('Department'),
           departments.when(
               loading: () => const LinearProgressIndicator(),
               error: (e, _) => const Text('Unable to load departments'),
@@ -153,10 +158,9 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                             department = x;
                             doctor = null;
                           }),
-                  decoration:
-                      const InputDecoration(hintText: 'Select department'))),
-          const SizedBox(height: 14),
-          const Text('Doctor', style: TextStyle(fontWeight: FontWeight.w700)),
+                  decoration: const InputDecoration(hintText: 'Select department', prefixIcon: Icon(Icons.category_outlined)))) ,
+          const SizedBox(height: 18),
+          const _FieldTitle('Doctor'),
           DropdownButtonFormField<DoctorDirectoryItem>(
               initialValue: doctor,
               items: filtered
@@ -164,11 +168,14 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                       value: x, child: Text('${x.name} • ${x.specialization}')))
                   .toList(),
               onChanged: (x) => setState(() => doctor = x),
-              decoration:
-                  const InputDecoration(hintText: 'Select available doctor')),
+              decoration: const InputDecoration(hintText: 'Select available doctor', prefixIcon: Icon(Icons.person_outline))),
           if (doctor != null)
             Text(
                 '${doctor!.hospital} • ${doctor!.department} • ₹${doctor!.fee}'),
+          ])),
+          const SizedBox(height: 14),
+          _BookingCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const _FieldTitle('When would you like to visit?'),
           OutlinedButton.icon(
               onPressed: () => showDatePicker(
                           context: context,
@@ -183,17 +190,12 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
               label: Text(date == null
                   ? 'Select date'
                   : 'Date: ${date!.toLocal().toString().split(' ').first}')),
-          OutlinedButton.icon(
-              onPressed: () => showTimePicker(
-                          context: context,
-                          initialTime: time ?? TimeOfDay.now())
-                      .then((x) {
-                    if (x != null) setState(() => time = x);
-                  }),
-              icon: const Icon(Icons.schedule),
-              label: Text(time == null
-                  ? 'Select time'
-                  : 'Time: ${time!.format(context)}')),
+          TextField(controller: timeText, keyboardType: TextInputType.datetime,
+              onChanged: (value) { final match = RegExp(r'^(\d{1,2}):(\d{2})\s*([apAP][mM])?$').firstMatch(value.trim()); if (match != null) { var hour = int.parse(match.group(1)!); final minute = int.parse(match.group(2)!); final period = match.group(3)?.toLowerCase(); if (period == 'pm' && hour < 12) hour += 12; if (period == 'am' && hour == 12) hour = 0; if (hour < 24 && minute < 60) setState(() => time = TimeOfDay(hour: hour, minute: minute)); } },
+              decoration: const InputDecoration(labelText: 'Time *', hintText: '09:30 AM', prefixIcon: Icon(Icons.schedule_outlined))),
+          ])),
+          const SizedBox(height: 14),
+          _BookingCard(child: Column(children: [
           DropdownButtonFormField<String>(
               initialValue: type,
               items: const [
@@ -203,24 +205,27 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                 DropdownMenuItem(value: 'chat', child: Text('Chat'))
               ],
               onChanged: (x) => setState(() => type = x ?? 'in_person'),
-              decoration:
-                  const InputDecoration(labelText: 'Consultation type')),
+              decoration: const InputDecoration(labelText: 'Consultation type', prefixIcon: Icon(Icons.video_call_outlined))),
           TextField(
               controller: reason,
               maxLength: 300,
-              decoration: const InputDecoration(labelText: 'Reason for visit')),
+              decoration: const InputDecoration(labelText: 'Reason for visit *', hintText: 'Tell us what you need help with', prefixIcon: Icon(Icons.edit_note_outlined))),
           TextField(
               controller: notes,
               maxLength: 500,
-              decoration: const InputDecoration(labelText: 'Notes')),
+              decoration: const InputDecoration(labelText: 'Notes', hintText: 'Anything else the doctor should know?', prefixIcon: Icon(Icons.notes_outlined))),
           if (error != null)
             Text(error!, style: const TextStyle(color: Colors.red)),
           FilledButton(
               onPressed: submitting ? null : reviewBooking,
               child: const Text('Review and continue to payment'))
+        ])),
         ]));
   }
 }
+
+class _FieldTitle extends StatelessWidget { const _FieldTitle(this.text); final String text; @override Widget build(BuildContext context) => Padding(padding: const EdgeInsets.only(bottom: 8), child: Text(text, style: const TextStyle(fontWeight: FontWeight.w700, color: Color(0xFF24324A)))); }
+class _BookingCard extends StatelessWidget { const _BookingCard({required this.child}); final Widget child; @override Widget build(BuildContext context) => Container(padding: const EdgeInsets.all(18), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(22), boxShadow: const [BoxShadow(color: Color(0x120D1B3E), blurRadius: 18, offset: Offset(0, 8))]), child: child); }
 
 class DoctorsDirectoryScreen extends ConsumerWidget {
   const DoctorsDirectoryScreen({super.key});
