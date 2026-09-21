@@ -54,6 +54,25 @@ class VoiceDraftService {
         Map<String, dynamic>.from(jsonDecode(text) as Map));
   }
 
+  Future<VoiceDraftResult> uploadBytes(
+      {required String appointmentId, required List<int> bytes}) async {
+    final token = await _auth.accessToken();
+    if (token == null)
+      throw const VoiceDraftException(
+          'Your session has expired. Sign in again.');
+    final request = http.MultipartRequest(
+        'POST', Uri.parse('$apiBaseUrl/appointments/$appointmentId/voice'));
+    request.headers['Authorization'] = 'Bearer $token';
+    request.files.add(http.MultipartFile.fromBytes('audio', bytes,
+        filename: 'voice_consultation.wav'));
+    final response = await request.send().timeout(const Duration(seconds: 180));
+    final text = await response.stream.bytesToString();
+    if (response.statusCode < 200 || response.statusCode >= 300)
+      throw VoiceDraftException(_message(text, response.statusCode));
+    return VoiceDraftResult.fromJson(
+        Map<String, dynamic>.from(jsonDecode(text) as Map));
+  }
+
   Future<void> saveCorrection({
     required String transcriptId,
     required String transcriptText,

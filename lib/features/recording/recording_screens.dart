@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:path_provider/path_provider.dart';
@@ -19,6 +21,8 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
     with SingleTickerProviderStateMixin {
   final recorder = AudioRecorder();
   Timer? timer;
+  StreamSubscription<Uint8List>? webAudio;
+  final webBytes = <int>[];
   late final AnimationController pulse;
   String? audioPath, selectedAppointment, error;
   Duration elapsed = Duration.zero;
@@ -34,6 +38,7 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
   @override
   void dispose() {
     timer?.cancel();
+    webAudio?.cancel();
     recorder.dispose();
     pulse.dispose();
     super.dispose();
@@ -50,13 +55,17 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
             'Microphone permission is required to record a voice draft.');
         return;
       }
-      final directory = await getTemporaryDirectory();
-      audioPath =
-          '${directory.path}/verityscribe_${DateTime.now().millisecondsSinceEpoch}.wav';
-      await recorder.start(
-          const RecordConfig(
-              encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1),
-          path: audioPath!);
+      const config = RecordConfig(
+          encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1);
+      if (kIsWeb) {
+        webBytes.clear();
+        webAudio = (await recorder.startStream(config)).listen(webBytes.addAll);
+      } else {
+        final directory = await getTemporaryDirectory();
+        audioPath =
+            '${directory.path}/verityscribe_${DateTime.now().millisecondsSinceEpoch}.wav';
+        await recorder.start(config, path: audioPath!);
+      }
       setState(() {
         error = null;
         recording = true;
@@ -74,7 +83,9 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
   }
 
   Future<void> stopAndProcess() async {
-    if (!recording || audioPath == null || selectedAppointment == null) return;
+    if (!recording ||
+        (!kIsWeb && audioPath == null) ||
+        selectedAppointment == null) return;
     timer?.cancel();
     setState(() {
       recording = false;
@@ -83,8 +94,13 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
     });
     try {
       await recorder.stop();
-      final result = await VoiceDraftService(ref.read(supabaseAuthProvider))
-          .upload(appointmentId: selectedAppointment!, filePath: audioPath!);
+      await webAudio?.cancel();
+      final service = VoiceDraftService(ref.read(supabaseAuthProvider));
+      final result = kIsWeb
+          ? await service.uploadBytes(
+              appointmentId: selectedAppointment!, bytes: webBytes)
+          : await service.upload(
+              appointmentId: selectedAppointment!, filePath: audioPath!);
       if (!mounted) return;
       context.go('/session-review', extra: result);
     } on VoiceDraftException catch (exception) {
@@ -134,10 +150,16 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
                   child: Text(
                       'Appointments are unavailable. Return to Home and retry.')),
               data: (items) {
-                final eligible = items
-                    .where((item) => !{'cancelled', 'no_show'}
-                        .contains(item.status.toLowerCase()))
-                    .toList();
+                final eligible = items.where((item) {
+                  final status = item.status.toLowerCase();
+                  final scheduled =
+                      DateTime.tryParse('${item.date} ${item.time}');
+                  return !{'cancelled', 'completed', 'no_show'}
+                          .contains(status) &&
+                      scheduled != null &&
+                      scheduled.isAfter(
+                          DateTime.now().subtract(const Duration(minutes: 10)));
+                }).toList();
                 if (eligible.isEmpty)
                   return const SoftCard(
                       child: Text(
