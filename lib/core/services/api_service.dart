@@ -39,7 +39,10 @@ class HttpApiClient implements ApiClient {
   Future<ApiResponse<T>> _request<T>(
       Future<http.Response> Function() call) async {
     try {
-      final response = await call().timeout(const Duration(seconds: 12));
+      // A cold free-tier backend can take longer than a normal interactive
+      // request to wake. The server now batches appointment relationships,
+      // while this avoids misrepresenting a still-running request as empty.
+      final response = await call().timeout(const Duration(seconds: 30));
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(response.body, statusCode: response.statusCode);
       }

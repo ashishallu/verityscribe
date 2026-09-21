@@ -279,6 +279,37 @@ def _appointment_detail(client: Client, appointment: dict) -> dict[str, Any]:
     return {**appointment, "patient": patient, "doctor": doctor}
 
 
+def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[str, Any]]:
+    """Resolve appointment relationships in batches for list endpoints.
+
+    Calling ``_appointment_detail`` for every row performs two remote
+    PostgREST calls per appointment. That made a patient's Home request slow
+    enough to exceed the Flutter HTTP timeout as their appointment history
+    grew. Fetch each relation once and preserve the original sort order.
+    """
+    if not appointments:
+        return []
+    patient_ids = list({row["patient_id"] for row in appointments})
+    doctor_ids = list({row["doctor_id"] for row in appointments})
+    patients = client.table("profiles").select(
+        "id,first_name,last_name,email,phone"
+    ).in_("id", patient_ids).execute().data or []
+    doctors = client.table("doctors").select(
+        "*,profiles!inner(id,first_name,last_name,email,phone),"
+        "hospitals!inner(id,name),departments!inner(id,name)"
+    ).in_("id", doctor_ids).execute().data or []
+    patients_by_id = {row["id"]: row for row in patients}
+    doctors_by_id = {row["id"]: row for row in doctors}
+    return [
+        {
+            **appointment,
+            "patient": patients_by_id.get(appointment["patient_id"]),
+            "doctor": doctors_by_id.get(appointment["doctor_id"]),
+        }
+        for appointment in appointments
+    ]
+
+
 @router.post("/appointments", status_code=status.HTTP_201_CREATED)
 def create_appointment(payload: AppointmentCreate, claims: dict = Depends(current_claims)):
     client = db()
@@ -323,7 +354,7 @@ def my_appointments(claims: dict = Depends(current_claims)):
     if not column:
         raise HTTPException(status_code=403, detail="Appointment scope is not available for this role")
     result = client.table("appointments").select("*").eq(column, claims["sub"]).order("appointment_date").order("appointment_time").execute()
-    return {"data": [_appointment_detail(client, row) for row in (result.data or [])]}
+    return {"data": _appointment_details(client, result.data or [])}
 
 
 @router.get("/appointments")
@@ -339,7 +370,7 @@ def scoped_appointments(page: int = Query(1, ge=1), page_size: int = Query(25, g
     elif role != "super_admin":
         raise HTTPException(status_code=403, detail="Insufficient role")
     result = query.order("appointment_date", desc=True).range((page - 1) * page_size, page * page_size - 1).execute()
-    return {"data": [_appointment_detail(client, row) for row in (result.data or [])], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
+    return {"data": _appointment_details(client, result.data or []), "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
 
 
 @router.get("/appointments/{appointment_id}")
