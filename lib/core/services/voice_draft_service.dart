@@ -45,7 +45,7 @@ class VoiceDraftService {
         'POST', Uri.parse('$apiBaseUrl/appointments/$appointmentId/voice'));
     request.headers['Authorization'] = 'Bearer $token';
     request.files.add(await http.MultipartFile.fromPath('audio', filePath));
-    final response = await request.send().timeout(const Duration(seconds: 180));
+    final response = await request.send().timeout(const Duration(seconds: 300));
     final text = await response.stream.bytesToString();
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw VoiceDraftException(_message(text, response.statusCode));
@@ -65,7 +65,7 @@ class VoiceDraftService {
     request.headers['Authorization'] = 'Bearer $token';
     request.files.add(http.MultipartFile.fromBytes('audio', bytes,
         filename: 'voice_consultation.wav'));
-    final response = await request.send().timeout(const Duration(seconds: 180));
+    final response = await request.send().timeout(const Duration(seconds: 300));
     final text = await response.stream.bytesToString();
     if (response.statusCode < 200 || response.statusCode >= 300)
       throw VoiceDraftException(_message(text, response.statusCode));

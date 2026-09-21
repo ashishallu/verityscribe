@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from urllib.request import Request, urlopen
@@ -23,7 +24,11 @@ class TranscriptConsensus:
 
 class AIProvider:
     ASR_MODEL = "openai/whisper-large-v3-turbo"
-    SECONDARY_ASR_MODEL = "ai4bharat/indic-conformer-600m-multilingual"
+    # Both models are served by Hugging Face Inference Providers. The former
+    # Indic Conformer choice requires a separately deployed endpoint, so it
+    # remains usable through AI_ASR_SECONDARY_BASE_URL but cannot be used as
+    # the hosted default.
+    SECONDARY_ASR_MODEL = "openai/whisper-large-v3"
     LLM_MODEL = "Qwen/Qwen3-8B"
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
@@ -82,13 +87,57 @@ class AIProvider:
         except Exception as exc:
             raise RuntimeError("ASR provider request failed") from exc
 
+    def _hf_asr_url(self, model: str) -> str:
+        return f"https://router.huggingface.co/hf-inference/models/{model}"
+
+    def _hf_chat(self, prompt: str, token: str) -> str:
+        """Call Hugging Face's OpenAI-compatible chat endpoint server-side."""
+        payload = {
+            "model": self.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "stream": False,
+        }
+        request = Request(
+            "https://router.huggingface.co/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=120) as response:
+                body = json.loads(response.read().decode())
+            content = body["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("empty completion")
+            return content.strip()
+        except Exception as exc:
+            raise RuntimeError("Transcript reconciler request failed") from exc
+
     def transcribe_consensus(self, audio: bytes, filename: str = "recording.wav") -> TranscriptConsensus:
-        primary_url = os.getenv("AI_ASR_PRIMARY_BASE_URL") or os.getenv("AI_ASR_BASE_URL")
-        secondary_url = os.getenv("AI_ASR_SECONDARY_BASE_URL")
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        primary_url = (os.getenv("AI_ASR_PRIMARY_BASE_URL") or
+                       os.getenv("AI_ASR_BASE_URL") or
+                       (self._hf_asr_url(self.ASR_MODEL) if token else ""))
+        secondary_url = (os.getenv("AI_ASR_SECONDARY_BASE_URL") or
+                         (self._hf_asr_url(self.SECONDARY_ASR_MODEL) if token else ""))
         if not primary_url or not secondary_url:
             raise RuntimeError("Two ASR providers are not configured")
-        primary = self._transcribe_with(audio, filename, primary_url, self.ASR_MODEL)
-        secondary = self._transcribe_with(audio, filename, secondary_url, self.SECONDARY_ASR_MODEL)
+        # Run the independent transcription agents concurrently. This keeps
+        # recording review responsive while preserving separate model outputs.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            primary_future = pool.submit(
+                self._transcribe_with, audio, filename, primary_url, self.ASR_MODEL
+            )
+            secondary_future = pool.submit(
+                self._transcribe_with, audio, filename, secondary_url,
+                self.SECONDARY_ASR_MODEL
+            )
+            primary = primary_future.result()
+            secondary = secondary_future.result()
         final_text, conflicts = self.reconcile_transcripts(primary, secondary)
         return TranscriptConsensus(primary=primary, secondary=secondary, final_text=final_text, conflicts=conflicts)
 
@@ -96,17 +145,20 @@ class AIProvider:
         if primary.strip() == secondary.strip():
             return primary.strip(), []
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        provider_url = os.getenv("AI_TRANSCRIPT_RECONCILER_BASE_URL") or os.getenv("AI_LLM_BASE_URL") or f"https://api-inference.huggingface.co/models/{self.LLM_MODEL}"
-        if provider_url.startswith("https://api-inference.huggingface.co") and not token:
+        provider_url = os.getenv("AI_TRANSCRIPT_RECONCILER_BASE_URL") or os.getenv("AI_LLM_BASE_URL")
+        if not provider_url and not token:
             raise RuntimeError("Transcript reconciler is not configured")
         prompt = ("Compare two automatic speech-recognition transcripts from the same clinical conversation. "
                   "Return only JSON: {\"final_transcript\": string, \"conflicts\": [string]}. "
                   "Do not invent clinical facts. Retain uncertainty where audio is unclear.\n\n"
                   f"TRANSCRIPT A:\n{primary}\n\nTRANSCRIPT B:\n{secondary}")
-        payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
-        generated = payload.get("generated_text") if isinstance(payload, dict) else None
-        if not isinstance(generated, str):
-            raise RuntimeError("Transcript reconciler returned an invalid response")
+        if provider_url:
+            payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
+            generated = payload.get("generated_text") if isinstance(payload, dict) else None
+            if not isinstance(generated, str):
+                raise RuntimeError("Transcript reconciler returned an invalid response")
+        else:
+            generated = self._hf_chat(prompt, token)
         try:
             result = json.loads(generated.strip().removeprefix("```json").removesuffix("```"))
             final_text = str(result["final_transcript"]).strip()
