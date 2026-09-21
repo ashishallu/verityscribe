@@ -58,14 +58,14 @@ class HomeScreen extends ConsumerWidget {
                 label: 'Appointments are temporarily unavailable.',
                 onRetry: () => ref.invalidate(appointmentsLiveProvider),
               ),
-              data: (items) => items.isEmpty
+              data: (items) => _upcoming(items).isEmpty
                   ? _EmptyCard(
                       icon: Icons.calendar_today_outlined,
                       title: 'No upcoming appointments',
                       action: 'Book',
                       onTap: () => context.go('/book-appointment'),
                     )
-                  : _AppointmentCard(item: items.first),
+                  : _AppointmentCard(item: _upcoming(items).first),
             ),
           ),
           const SectionTitle("Today's medicines", action: 'View all'),
@@ -150,14 +150,16 @@ class HomeScreen extends ConsumerWidget {
                           final diagnosis =
                               (row['diagnosis'] ?? 'Consultation').toString();
                           final date = (row['consultation_date'] ??
-                                  row['created_at'] ?? '')
+                                  row['created_at'] ??
+                                  '')
                               .toString();
                           return ListTile(
                             contentPadding: EdgeInsets.zero,
                             leading: const Icon(Icons.description_outlined,
                                 color: AppTheme.blue),
                             title: Text(diagnosis),
-                            subtitle: Text(date.isEmpty ? 'Date unavailable' : date),
+                            subtitle:
+                                Text(date.isEmpty ? 'Date unavailable' : date),
                             onTap: () => context.go('/consultations-live'),
                           );
                         }).toList(),
@@ -169,6 +171,17 @@ class HomeScreen extends ConsumerWidget {
       ),
     );
   }
+}
+
+List<dynamic> _upcoming(List<dynamic> items) {
+  final result = items.where((item) {
+    final status = item.status.toString().toLowerCase();
+    return status != 'completed' &&
+        status != 'cancelled' &&
+        status != 'no_show';
+  }).toList();
+  result.sort((a, b) => '${a.date} ${a.time}'.compareTo('${b.date} ${b.time}'));
+  return result;
 }
 
 class _Header extends StatelessWidget {
@@ -210,22 +223,31 @@ class _Header extends StatelessWidget {
 }
 
 class _CareSummary extends StatelessWidget {
-  const _CareSummary({required this.appointments, required this.medicines, required this.reports});
+  const _CareSummary(
+      {required this.appointments,
+      required this.medicines,
+      required this.reports});
   final AsyncValue<dynamic> appointments, medicines, reports;
   @override
   Widget build(BuildContext context) {
     String count(AsyncValue<dynamic> value) => value.when(
         data: (items) => items is List ? '${items.length}' : '0',
-        loading: () => '…', error: (_, __) => '—');
+        loading: () => '…',
+        error: (_, __) => '—');
     return SoftCard(
       color: const Color(0xFFEAF2FF),
       child: Row(children: [
         const Icon(Icons.auto_awesome_rounded, color: AppTheme.blue),
         const SizedBox(width: 12),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Your care summary', style: TextStyle(fontWeight: FontWeight.w800)),
+        Expanded(
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Your care summary',
+              style: TextStyle(fontWeight: FontWeight.w800)),
           const SizedBox(height: 5),
-          Text('${count(appointments)} appointments • ${count(medicines)} medicines • ${count(reports)} reports', style: const TextStyle(color: AppTheme.muted, fontSize: 12)),
+          Text(
+              '${count(appointments)} appointments • ${count(medicines)} medicines • ${count(reports)} reports',
+              style: const TextStyle(color: AppTheme.muted, fontSize: 12)),
         ])),
       ]),
     );
@@ -248,18 +270,45 @@ class _VoiceConsultationCard extends StatelessWidget {
                 end: Alignment.bottomRight,
                 colors: [AppTheme.blue, Color(0xFF477BF0), AppTheme.cyan]),
             borderRadius: BorderRadius.circular(26),
-            boxShadow: const [BoxShadow(color: Color(0x402459E0), blurRadius: 24, offset: Offset(0, 10))],
+            boxShadow: const [
+              BoxShadow(
+                  color: Color(0x402459E0),
+                  blurRadius: 24,
+                  offset: Offset(0, 10))
+            ],
           ),
           child: Stack(children: [
-            Positioned(right: -16, bottom: -25, child: Icon(Icons.graphic_eq_rounded, size: 165, color: Colors.white.withValues(alpha: .15))),
+            Positioned(
+                right: -16,
+                bottom: -25,
+                child: Icon(Icons.graphic_eq_rounded,
+                    size: 165, color: Colors.white.withValues(alpha: .15))),
             Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               const StatusPill('SECURE VOICE CARE', Colors.white),
               const Spacer(),
-              const Text('Start a new voice\nconsultation', style: TextStyle(color: Colors.white, fontSize: 25, fontWeight: FontWeight.w800, height: 1.15)),
+              const Text('Start a new voice\nconsultation',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 25,
+                      fontWeight: FontWeight.w800,
+                      height: 1.15)),
               const SizedBox(height: 8),
-              const Text('Secure clinical recording • doctor review required', style: TextStyle(color: Colors.white70, fontSize: 12)),
+              const Text('Secure clinical recording • doctor review required',
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
               const SizedBox(height: 12),
-              Row(children: [Container(width: 48, height: 48, decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)), child: const Icon(Icons.mic_rounded, color: AppTheme.blue)), const SizedBox(width: 12), const Text('Record securely', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700))]),
+              Row(children: [
+                Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(16)),
+                    child: const Icon(Icons.mic_rounded, color: AppTheme.blue)),
+                const SizedBox(width: 12),
+                const Text('Record securely',
+                    style: TextStyle(
+                        color: Colors.white, fontWeight: FontWeight.w700))
+              ]),
             ]),
           ]),
         ),
@@ -270,14 +319,99 @@ class _AppointmentCard extends StatelessWidget {
   const _AppointmentCard({required this.item});
   final dynamic item;
   @override
-  Widget build(BuildContext context) => SoftCard(child: InkWell(onTap: () => context.go('/record'), borderRadius: BorderRadius.circular(18), child: Row(children: [
-        Container(width: 46, height: 46, decoration: BoxDecoration(color: const Color(0xFFEAF9F5), borderRadius: BorderRadius.circular(15)), child: const Icon(Icons.calendar_month_rounded, color: AppTheme.emerald)),
-        const SizedBox(width: 13),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(item.doctorName.toString().isEmpty ? 'Doctor details unavailable' : item.doctorName, style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800)), Text([item.department, item.hospital].where((x) => x.toString().trim().isNotEmpty).join(' • '), style: const TextStyle(fontSize: 12, color: AppTheme.muted))])),
-        Column(crossAxisAlignment: CrossAxisAlignment.end, children: [Text('${item.date} ${item.time}', style: const TextStyle(fontWeight: FontWeight.w800, color: AppTheme.blue)), Text(item.status.toString(), style: const TextStyle(fontSize: 12, color: AppTheme.blue))]),
-      ])));
+  Widget build(BuildContext context) => SoftCard(
+      child: InkWell(
+          onTap: () => context.go('/record'),
+          borderRadius: BorderRadius.circular(18),
+          child: Row(children: [
+            Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                    color: const Color(0xFFEAF9F5),
+                    borderRadius: BorderRadius.circular(15)),
+                child: const Icon(Icons.calendar_month_rounded,
+                    color: AppTheme.emerald)),
+            const SizedBox(width: 13),
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Text(
+                      item.doctorName.toString().isEmpty
+                          ? 'Doctor details unavailable'
+                          : item.doctorName,
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleSmall
+                          ?.copyWith(fontWeight: FontWeight.w800)),
+                  Text(
+                      [item.department, item.hospital]
+                          .where((x) => x.toString().trim().isNotEmpty)
+                          .join(' • '),
+                      style:
+                          const TextStyle(fontSize: 12, color: AppTheme.muted))
+                ])),
+            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Text('${item.date} ${item.time}',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w800, color: AppTheme.blue)),
+              Text(item.status.toString(),
+                  style: const TextStyle(fontSize: 12, color: AppTheme.blue))
+            ]),
+          ])));
 }
 
-class _MedicineRow extends StatelessWidget { const _MedicineRow({required this.name, required this.detail}); final String name, detail; @override Widget build(BuildContext context) => Row(children: [const CircleAvatar(backgroundColor: Color(0xFFEAF9F5), child: Icon(Icons.medication_rounded, color: AppTheme.emerald)), const SizedBox(width: 12), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(name, style: const TextStyle(fontWeight: FontWeight.w800)), Text(detail.isEmpty ? 'Schedule not available' : detail, style: const TextStyle(fontSize: 12, color: AppTheme.muted))]))]); }
-class _EmptyCard extends StatelessWidget { const _EmptyCard({required this.icon, required this.title, required this.action, required this.onTap}); final IconData icon; final String title, action; final VoidCallback onTap; @override Widget build(BuildContext context) => SoftCard(child: Row(children: [Icon(icon, color: AppTheme.blue), const SizedBox(width: 12), Expanded(child: Text(title, style: const TextStyle(fontWeight: FontWeight.w700))), TextButton(onPressed: onTap, child: Text(action))])); }
-class _UnavailableCard extends StatelessWidget { const _UnavailableCard({required this.label, required this.onRetry}); final String label; final VoidCallback onRetry; @override Widget build(BuildContext context) => SoftCard(child: Row(children: [const Icon(Icons.cloud_off_outlined, color: AppTheme.muted), const SizedBox(width: 12), Expanded(child: Text(label)), TextButton(onPressed: onRetry, child: const Text('Retry'))])); }
+class _MedicineRow extends StatelessWidget {
+  const _MedicineRow({required this.name, required this.detail});
+  final String name, detail;
+  @override
+  Widget build(BuildContext context) => Row(children: [
+        const CircleAvatar(
+            backgroundColor: Color(0xFFEAF9F5),
+            child: Icon(Icons.medication_rounded, color: AppTheme.emerald)),
+        const SizedBox(width: 12),
+        Expanded(
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(name, style: const TextStyle(fontWeight: FontWeight.w800)),
+          Text(detail.isEmpty ? 'Schedule not available' : detail,
+              style: const TextStyle(fontSize: 12, color: AppTheme.muted))
+        ]))
+      ]);
+}
+
+class _EmptyCard extends StatelessWidget {
+  const _EmptyCard(
+      {required this.icon,
+      required this.title,
+      required this.action,
+      required this.onTap});
+  final IconData icon;
+  final String title, action;
+  final VoidCallback onTap;
+  @override
+  Widget build(BuildContext context) => SoftCard(
+          child: Row(children: [
+        Icon(icon, color: AppTheme.blue),
+        const SizedBox(width: 12),
+        Expanded(
+            child: Text(title,
+                style: const TextStyle(fontWeight: FontWeight.w700))),
+        TextButton(onPressed: onTap, child: Text(action))
+      ]));
+}
+
+class _UnavailableCard extends StatelessWidget {
+  const _UnavailableCard({required this.label, required this.onRetry});
+  final String label;
+  final VoidCallback onRetry;
+  @override
+  Widget build(BuildContext context) => SoftCard(
+          child: Row(children: [
+        const Icon(Icons.cloud_off_outlined, color: AppTheme.muted),
+        const SizedBox(width: 12),
+        Expanded(child: Text(label)),
+        TextButton(onPressed: onRetry, child: const Text('Retry'))
+      ]));
+}
