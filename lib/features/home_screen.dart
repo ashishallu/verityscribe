@@ -176,9 +176,11 @@ class HomeScreen extends ConsumerWidget {
 List<dynamic> _upcoming(List<dynamic> items) {
   final result = items.where((item) {
     final status = item.status.toString().toLowerCase();
-    return status != 'completed' &&
-        status != 'cancelled' &&
-        status != 'no_show';
+    if (status == 'completed' || status == 'cancelled' || status == 'no_show')
+      return false;
+    final scheduled = DateTime.tryParse('${item.date} ${item.time}');
+    return scheduled != null &&
+        scheduled.isAfter(DateTime.now().subtract(const Duration(minutes: 10)));
   }).toList();
   result.sort((a, b) => '${a.date} ${a.time}'.compareTo('${b.date} ${b.time}'));
   return result;
