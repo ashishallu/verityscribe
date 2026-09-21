@@ -98,7 +98,7 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
     GoRoute(path: '/ai', builder: (_, __) => const AiScreen()),
     GoRoute(path: '/medicines', builder: (_, __) => const MedicinesScreen()),
     GoRoute(path: '/alarms', builder: (_, __) => const AlarmsScreen()),
-    GoRoute(path: '/records', builder: (_, __) => const LiveHealthRecordScreen()),
+    GoRoute(path: '/records', builder: (_, __) => const RecordsScreen()),
     GoRoute(path: '/profile', builder: (_, __) => const ProfileScreen())
   ])
 ]);

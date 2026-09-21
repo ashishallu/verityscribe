@@ -61,7 +61,7 @@ class ProfileScreen extends ConsumerWidget {
           child: SoftCard(
               child: Column(children: [
             _row(context, Icons.watch_rounded, 'Connected devices',
-                'Apple Watch • Synced', '/devices'),
+                'View connected device settings', '/devices'),
             const Divider(),
             Row(children: [
               const Icon(Icons.dark_mode_outlined, color: AppTheme.blue),
