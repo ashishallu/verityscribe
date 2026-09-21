@@ -270,12 +270,12 @@ class _AppointmentCard extends StatelessWidget {
   const _AppointmentCard({required this.item});
   final dynamic item;
   @override
-  Widget build(BuildContext context) => SoftCard(child: Row(children: [
+  Widget build(BuildContext context) => SoftCard(child: InkWell(onTap: () => context.go('/record'), borderRadius: BorderRadius.circular(18), child: Row(children: [
         Container(width: 46, height: 46, decoration: BoxDecoration(color: const Color(0xFFEAF9F5), borderRadius: BorderRadius.circular(15)), child: const Icon(Icons.calendar_month_rounded, color: AppTheme.emerald)),
         const SizedBox(width: 13),
         Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(item.doctorName.toString().isEmpty ? 'Doctor details unavailable' : item.doctorName, style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800)), Text([item.department, item.hospital].where((x) => x.toString().trim().isNotEmpty).join(' • '), style: const TextStyle(fontSize: 12, color: AppTheme.muted))])),
         Column(crossAxisAlignment: CrossAxisAlignment.end, children: [Text('${item.date} ${item.time}', style: const TextStyle(fontWeight: FontWeight.w800, color: AppTheme.blue)), Text(item.status.toString(), style: const TextStyle(fontSize: 12, color: AppTheme.blue))]),
-      ]));
+      ])));
 }
 
 class _MedicineRow extends StatelessWidget { const _MedicineRow({required this.name, required this.detail}); final String name, detail; @override Widget build(BuildContext context) => Row(children: [const CircleAvatar(backgroundColor: Color(0xFFEAF9F5), child: Icon(Icons.medication_rounded, color: AppTheme.emerald)), const SizedBox(width: 12), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(name, style: const TextStyle(fontWeight: FontWeight.w800)), Text(detail.isEmpty ? 'Schedule not available' : detail, style: const TextStyle(fontSize: 12, color: AppTheme.muted))]))]); }
