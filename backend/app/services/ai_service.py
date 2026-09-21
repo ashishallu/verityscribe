@@ -90,7 +90,12 @@ class AIProvider:
                 raise RuntimeError("Hugging Face token is not configured")
             try:
                 response = InferenceClient(
-                    provider="hf-inference", api_key=token
+                    provider="hf-inference",
+                    api_key=token,
+                    # The SDK receives bytes rather than a filesystem path,
+                    # so it cannot infer their type. HF rejects a missing
+                    # content type even for a valid WAV container.
+                    headers={"Content-Type": "audio/wav"},
                 ).automatic_speech_recognition(audio, model=model)
                 text = getattr(response, "text", None)
                 if not isinstance(text, str) or not text.strip():
