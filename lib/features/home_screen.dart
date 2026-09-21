@@ -41,6 +41,14 @@ class HomeScreen extends ConsumerWidget {
             padding: const EdgeInsets.fromLTRB(20, 22, 20, 0),
             child: _VoiceConsultationCard(onTap: () => context.go('/record')),
           ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+            child: FilledButton.icon(
+              onPressed: () => context.go('/book-appointment'),
+              icon: const Icon(Icons.calendar_month_rounded),
+              label: const Text('Book an appointment'),
+            ),
+          ),
           const SectionTitle('Today at a glance'),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20),

@@ -190,7 +190,12 @@ def _list(client: Client, table: str, page: int, page_size: int, search: str | N
 
 @router.get("/hospitals")
 def hospitals(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, _: dict = Depends(current_claims)):
-    return _list(db(), "hospitals", page, page_size, search)
+    # Keep this directory query limited to columns guaranteed by the live schema.
+    query = db().table("hospitals").select("id,name", count="exact")
+    if search:
+        query = query.ilike("name", f"%{search}%")
+    result = query.range((page - 1) * page_size, page * page_size - 1).execute()
+    return {"data": result.data or [], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
 
 @router.get("/patients")
 def admin_patients(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, claims: dict = Depends(current_claims)):
