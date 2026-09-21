@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/entities.dart';
 import '../repositories/repositories.dart';
@@ -6,6 +7,7 @@ import '../core/services/api_service.dart';
 import '../core/services/supabase_auth_service.dart';
 import '../core/constants/endpoints.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 class ChatMessage {
   final String text;
@@ -142,17 +144,38 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       final request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/chat/reports'))
         ..headers['Authorization'] = 'Bearer $token'
         ..fields['report_type'] = reportType
-        ..files.add(http.MultipartFile.fromBytes('document', bytes, filename: filename));
+        ..files.add(http.MultipartFile.fromBytes('document', bytes,
+            filename: filename, contentType: _reportMimeType(filename)));
       final response = await request.send().timeout(const Duration(seconds: 90));
       final text = await response.stream.bytesToString();
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ApiException(text, statusCode: response.statusCode);
+        throw ApiException(_uploadError(text), statusCode: response.statusCode);
       }
       state = state.copyWith(messages: [...updated, ChatMessage(
         text: 'Your report was saved privately. Ask me a question about its readable content.',
         isUser: false, sentAt: DateTime.now())], chatLoading: false);
     } catch (error) {
       state = state.copyWith(chatLoading: false, chatError: error);
+    }
+  }
+
+  MediaType _reportMimeType(String filename) {
+    final extension = filename.split('.').last.toLowerCase();
+    return switch (extension) {
+      'pdf' => MediaType('application', 'pdf'),
+      'png' => MediaType('image', 'png'),
+      'jpg' || 'jpeg' => MediaType('image', 'jpeg'),
+      'webp' => MediaType('image', 'webp'),
+      _ => MediaType('application', 'octet-stream'),
+    };
+  }
+
+  String _uploadError(String response) {
+    try {
+      final decoded = Map<String, dynamic>.from(jsonDecode(response) as Map);
+      return (decoded['detail'] ?? 'Unable to upload this report.').toString();
+    } catch (_) {
+      return 'Unable to upload this report.';
     }
   }
 

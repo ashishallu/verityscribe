@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
 import '../providers/clinic_provider.dart';
+import '../core/services/api_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ui.dart';
 
@@ -40,8 +41,11 @@ class _AiScreenState extends ConsumerState<AiScreen> {
       bytes: selected.files.single.bytes!,
     );
     if (mounted && ref.read(clinicProvider).chatError != null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('The report could not be uploaded. Please try a PDF or image under 10 MB.')));
+      final error = ref.read(clinicProvider).chatError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(error is ApiException
+              ? error.message
+              : 'The report could not be uploaded. Please try again.')));
     }
   }
 

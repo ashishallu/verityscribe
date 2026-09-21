@@ -175,6 +175,14 @@ def _chat_document_bucket(client: Client) -> str:
             )
         except Exception:
             client.storage.get_bucket(bucket)
+    # A bucket may already exist from a prior deploy with a different MIME
+    # allowlist. Keep it private while accepting the same safe types as the
+    # patient upload endpoint.
+    client.storage.update_bucket(
+        bucket,
+        options={"public": False, "file_size_limit": 10 * 1024 * 1024,
+                 "allowed_mime_types": sorted(CHAT_UPLOAD_TYPES)},
+    )
     return bucket
 
 
@@ -205,12 +213,54 @@ def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
             "uploaded_report_text": extracted}
 
 
+def _personal_evidence(question: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only evidence explicitly relevant to a personal health question.
+
+    This intentionally fails closed: unrelated appointments or prescriptions
+    never authorize an answer about a measurement, blood result, or condition.
+    """
+    lowered = question.lower()
+    records = context.get("records", {})
+
+    def matches(rows: list[dict], words: tuple[str, ...]) -> list[dict]:
+        return [row for row in rows if any(word in json.dumps(row, default=str).lower() for word in words)]
+
+    if any(word in lowered for word in ("temperature", "body temp", "fever")):
+        return matches(records.get("vitals", []), ("temperature", "body_temp", "temp"))
+    if any(word in lowered for word in ("blood count", "cbc", "hemoglobin", "haemoglobin", "platelet", "white blood")):
+        words = ("cbc", "hemoglobin", "haemoglobin", "platelet", "white blood", "rbc", "wbc")
+        return (matches(context.get("reports", []), words) +
+                matches(context.get("uploaded_report_text", []), words))
+    if "asthma" in lowered:
+        return (matches(records.get("chronic_conditions", []), ("asthma",)) +
+                matches(records.get("consultations", []), ("asthma",)))
+    # For an unrecognised personal-data question, do not let a general model
+    # guess which record could answer it.
+    return []
+
+
 def _extract_pdf_text(content: bytes) -> str:
     try:
         reader = PdfReader(BytesIO(content))
         return "\n".join((page.extract_text() or "") for page in reader.pages)[:30000].strip()
     except Exception:
         return ""
+
+
+def _report_content_type(document: UploadFile, content: bytes) -> str | None:
+    """Normalise browser uploads which often arrive as octet-stream."""
+    claimed = (document.content_type or "").lower().split(";", 1)[0]
+    if claimed in CHAT_UPLOAD_TYPES:
+        return claimed
+    if content.startswith(b"%PDF-"):
+        return "application/pdf"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _storage_error_detail(exc: Exception) -> str:
@@ -265,12 +315,16 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
     context: dict[str, Any] = {}
     if personal:
         context = _chat_context(client, patient["id"])
-        if not any(context.values()):
+        evidence = _personal_evidence(payload.message, context)
+        if not evidence:
             return {"data": {
                 "answer": "I do not have relevant information in your VerityScribe record for that question. Please upload the report or ask your clinician.",
                 "uses_personal_health_data": True,
                 "context_locked": True,
             }}
+        # Never send unrelated personal records to the model. Evidence is
+        # narrowed by question type before it is used for a response.
+        context = {"matching_record_evidence": evidence}
     instructions = (
         "You are Verity, a health-information assistant. Do not diagnose, prescribe, or present an AI answer as medical advice. "
         "For personal-record questions, use ONLY the supplied patient record. If a fact is missing, state that it is not available; never infer it. "
@@ -296,14 +350,14 @@ async def upload_patient_chat_report(
     normalized_type = report_type.strip().lower().replace(" ", "_")
     if normalized_type not in CHAT_REPORT_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported report type")
-    content_type = (document.content_type or "").lower()
-    if content_type not in CHAT_UPLOAD_TYPES:
-        raise HTTPException(status_code=422, detail="Upload a PDF, PNG, JPEG, or WEBP report")
     content = await document.read()
     if not content:
         raise HTTPException(status_code=422, detail="Report file is empty")
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=422, detail="Report exceeds the 10 MB limit")
+    content_type = _report_content_type(document, content)
+    if not content_type:
+        raise HTTPException(status_code=422, detail="Upload a valid PDF, PNG, JPEG, or WEBP report")
     extracted = _extract_pdf_text(content) if content_type == "application/pdf" else ""
     if content_type == "application/pdf" and not extracted:
         raise HTTPException(status_code=422, detail="This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report.")
