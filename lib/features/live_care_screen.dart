@@ -190,7 +190,39 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
           const SizedBox(height: 14),
           _BookingCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const _FieldTitle('When would you like to visit?'),
-          Row(children: [Expanded(child: OutlinedButton.icon(onPressed: () async { final picked = await showDatePicker(context: context, firstDate: DateTime.now(), lastDate: DateTime.now().add(const Duration(days: 365)), initialDate: date ?? DateTime.now()); if (picked != null) setState(() => date = picked); }, icon: const Icon(Icons.calendar_today), label: Text(date == null ? 'Select date' : date!.toLocal().toString().split(' ').first))), const SizedBox(width: 12), Expanded(child: InkWell(onTap: () async { var selected = time ?? TimeOfDay.now(); final picked = await showCupertinoModalPopup<TimeOfDay>(context: context, builder: (context) => SizedBox(height: 310, child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, use24hFormat: false, initialDateTime: DateTime(2020, 1, 1, selected.hour, selected.minute), onDateTimeChanged: (value) => selected = TimeOfDay.fromDateTime(value))); if (picked != null) setState(() { time = picked; timeText.text = picked.format(context); }); }, child: InputDecorator(decoration: const InputDecoration(labelText: 'Time *', prefixIcon: Icon(Icons.schedule_outlined)), child: Text(time == null ? 'Select time' : time!.format(context)))))]),
+          Row(children: [
+            Expanded(child: OutlinedButton.icon(
+              onPressed: () async {
+                final picked = await showDatePicker(context: context, firstDate: DateTime.now(), lastDate: DateTime.now().add(const Duration(days: 365)), initialDate: date ?? DateTime.now());
+                if (picked != null) setState(() => date = picked);
+              },
+              icon: const Icon(Icons.calendar_today),
+              label: Text(date == null ? 'Select date' : date!.toLocal().toString().split(' ').first),
+            )),
+            const SizedBox(width: 12),
+            Expanded(child: InkWell(
+              onTap: () async {
+                var selected = time ?? TimeOfDay.now();
+                final picked = await showCupertinoModalPopup<TimeOfDay>(
+                  context: context,
+                  builder: (context) => SizedBox(
+                    height: 310,
+                    child: CupertinoDatePicker(
+                      mode: CupertinoDatePickerMode.time,
+                      use24hFormat: false,
+                      initialDateTime: DateTime(2020, 1, 1, selected.hour, selected.minute),
+                      onDateTimeChanged: (value) => selected = TimeOfDay.fromDateTime(value),
+                    ),
+                  ),
+                );
+                if (picked != null) setState(() { time = picked; timeText.text = picked.format(context); });
+              },
+              child: InputDecorator(
+                decoration: const InputDecoration(labelText: 'Time *', prefixIcon: Icon(Icons.schedule_outlined)),
+                child: Text(time == null ? 'Select time' : time!.format(context)),
+              ),
+            )),
+          ]),
           ])),
           const SizedBox(height: 14),
           _BookingCard(child: Column(children: [
