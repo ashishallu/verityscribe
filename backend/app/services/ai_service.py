@@ -7,6 +7,8 @@ import os
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from huggingface_hub import InferenceClient
+
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,24 @@ class AIProvider:
         if not provider_url:
             raise RuntimeError("ASR provider is not configured")
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        # Use the official client for Hugging Face's routed endpoint. It owns
+        # the provider-specific ASR serialization and avoids fragile manual
+        # HTTP payload construction.
+        if provider_url.startswith("https://router.huggingface.co/hf-inference/"):
+            if not token:
+                raise RuntimeError("Hugging Face token is not configured")
+            try:
+                response = InferenceClient(
+                    provider="hf-inference", api_key=token
+                ).automatic_speech_recognition(audio, model=model)
+                text = getattr(response, "text", None)
+                if not isinstance(text, str) or not text.strip():
+                    raise RuntimeError("ASR provider returned no transcript")
+                return text.strip()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Hugging Face ASR request failed ({type(exc).__name__})"
+                ) from exc
         # Hugging Face's Inference Providers ASR API accepts an explicit JSON
         # `inputs` base64 payload.  The previous raw-byte request was rejected
         # by the router with HTTP 400 even though the stored WAV itself was
