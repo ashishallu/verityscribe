@@ -9,6 +9,8 @@ import '../../features/profile_screen.dart';
 import '../../features/profile_details.dart';
 import '../../features/medical_history_screen.dart';
 import '../../features/recording/recording_screens.dart';
+import '../../core/services/voice_draft_service.dart';
+import '../../features/records_screen.dart';
 import '../../features/scan/scan_screens.dart';
 import '../../models/entities.dart';
 import '../app_shell.dart';
@@ -35,12 +37,22 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/login', builder: (_, __) => const LoginScreen()),
   GoRoute(path: '/register', builder: (_, __) => const RegisterScreen()),
   GoRoute(path: '/doctors', builder: (_, __) => const DoctorsDirectoryScreen()),
-  GoRoute(path: '/appointments', builder: (_, __) => const AppointmentsLiveScreen()),
-  GoRoute(path: '/book-appointment', builder: (_, __) => const AppointmentBookingScreen()),
-  GoRoute(path: '/consultations-live', builder: (_, __) => const LiveConsultationsScreen()),
-  GoRoute(path: '/prescriptions-live', builder: (_, __) => const LivePrescriptionsScreen()),
+  GoRoute(
+      path: '/appointments',
+      builder: (_, __) => const AppointmentsLiveScreen()),
+  GoRoute(
+      path: '/book-appointment',
+      builder: (_, __) => const AppointmentBookingScreen()),
+  GoRoute(
+      path: '/consultations-live',
+      builder: (_, __) => const LiveConsultationsScreen()),
+  GoRoute(
+      path: '/prescriptions-live',
+      builder: (_, __) => const LivePrescriptionsScreen()),
   GoRoute(path: '/reports-live', builder: (_, __) => const LiveReportsScreen()),
-  GoRoute(path: '/live-health-record', builder: (_, __) => const LiveHealthRecordScreen()),
+  GoRoute(
+      path: '/live-health-record',
+      builder: (_, __) => const LiveHealthRecordScreen()),
   GoRoute(path: '/otp', builder: (_, __) => const OtpScreen()),
   GoRoute(
       path: '/biometric',
@@ -63,9 +75,7 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
           next: '/home')),
   GoRoute(
       path: '/notifications', builder: (_, __) => const NotificationsScreen()),
-  GoRoute(
-      path: '/insurance',
-      builder: (_, __) => const LiveInsuranceScreen()),
+  GoRoute(path: '/insurance', builder: (_, __) => const LiveInsuranceScreen()),
   GoRoute(
       path: '/medical-history',
       builder: (_, __) => const MedicalHistoryScreen()),
@@ -83,7 +93,9 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
           const DetailsPage(title: 'Connected devices', items: deviceDetails)),
   GoRoute(path: '/record', builder: (_, __) => const RecordingScreen()),
   GoRoute(
-      path: '/session-review', builder: (_, __) => const SessionReviewScreen()),
+      path: '/session-review',
+      builder: (_, state) =>
+          SessionReviewScreen(result: state.extra as VoiceDraftResult?)),
   GoRoute(path: '/scan', builder: (_, __) => const ScanScreen()),
   GoRoute(
       path: '/medicine-result',

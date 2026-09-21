@@ -637,15 +637,77 @@ async def upload_consultation_voice(consultation_id: str, audio: UploadFile = Fi
         except Exception: pass
         raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
     try:
-        transcript_text = ai_provider.transcribe(content, audio.filename or "recording.bin")
-        transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": transcript_text}).execute().data[0]
-        return {"data": {"recording": recording, "transcript": transcript, "status": "transcribed"}}
+        consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
+        transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
+        return {"data": {"recording": recording, "transcript": transcript, "asr": {"primary_model": ai_provider.ASR_MODEL, "secondary_model": ai_provider.SECONDARY_ASR_MODEL, "primary_transcript": consensus.primary, "secondary_transcript": consensus.secondary, "conflicts": consensus.conflicts}, "status": "transcribed"}}
     except Exception:
         return {"data": {"recording": recording, "transcript": None, "status": "transcription_unavailable"}}
 
 
+@router.post("/appointments/{appointment_id}/voice", status_code=status.HTTP_201_CREATED)
+async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = File(...), patient: dict = Depends(get_current_patient)):
+    """Create an appointment-scoped transcript draft; it never creates clinical records."""
+    client = db()
+    appointment = client.table("appointments").select("id,patient_id,doctor_id,status").eq("id", appointment_id).maybe_single().execute().data
+    if not appointment or appointment.get("patient_id") != patient["id"]:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if appointment.get("status") in {"cancelled", "no_show"}:
+        raise HTTPException(status_code=422, detail="Voice drafts are unavailable for this appointment")
+    content = await audio.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Audio file is empty")
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="Audio file exceeds the 50 MB limit")
+    bucket = os.getenv("VOICE_STORAGE_BUCKET", "voice-recordings")
+    recording_id = __import__("uuid").uuid4()
+    path = f"appointments/{appointment_id}/{patient['id']}/{recording_id}-{audio.filename or 'recording.bin'}"
+    try:
+        client.storage.from_(bucket).upload(path, content, {"content-type": audio.content_type or "application/octet-stream", "upsert": "false"})
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Secure voice storage is unavailable") from exc
+    try:
+        recording = client.table("voice_recordings").insert({"id": str(recording_id), "patient_id": patient["id"], "doctor_id": appointment["doctor_id"], "recording_url": path}).execute().data[0]
+    except Exception as exc:
+        try:
+            client.storage.from_(bucket).remove([path])
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
+    try:
+        consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
+        transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="Voice transcription is currently unavailable") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Unable to persist voice transcript") from exc
+    return {"data": {"recording": recording, "transcript": transcript, "asr": {"primary_model": ai_provider.ASR_MODEL, "secondary_model": ai_provider.SECONDARY_ASR_MODEL, "primary_transcript": consensus.primary, "secondary_transcript": consensus.secondary, "conflicts": consensus.conflicts}, "requires_doctor_review": True}}
+
+
 class AIProcessRequest(BaseModel):
     voice_transcript_id: str
+
+
+class TranscriptCorrectionRequest(BaseModel):
+    transcript_text: str = Field(min_length=1, max_length=100000)
+
+
+@router.post("/voice-transcripts/{transcript_id}/correction")
+def save_patient_transcript_correction(transcript_id: str, payload: TranscriptCorrectionRequest, patient: dict = Depends(get_current_patient)):
+    """Patients may correct a draft transcript, but cannot create clinical records."""
+    client = db()
+    rows = client.table("voice_transcripts").select("id,voice_recording_id").eq("id", transcript_id).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Voice transcript not found")
+    recording = client.table("voice_recordings").select("id,patient_id").eq("id", rows[0]["voice_recording_id"]).limit(1).execute().data or []
+    if not recording or recording[0].get("patient_id") != patient["id"]:
+        raise HTTPException(status_code=403, detail="You cannot edit this voice transcript")
+    try:
+        updated = client.table("voice_transcripts").update({"transcript_text": payload.transcript_text.strip()}).eq("id", transcript_id).execute().data or []
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Unable to save transcript correction") from exc
+    if not updated:
+        raise HTTPException(status_code=502, detail="Unable to save transcript correction")
+    return {"data": updated[0], "requires_doctor_review": True}
 
 
 def _ai_summary(client: Client, consultation_id: str) -> dict | None:

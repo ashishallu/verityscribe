@@ -13,8 +13,17 @@ class AIDraft:
     notes: str
 
 
+@dataclass(frozen=True)
+class TranscriptConsensus:
+    primary: str
+    secondary: str
+    final_text: str
+    conflicts: list[str]
+
+
 class AIProvider:
     ASR_MODEL = "openai/whisper-large-v3-turbo"
+    SECONDARY_ASR_MODEL = "ai4bharat/indic-conformer-600m-multilingual"
     LLM_MODEL = "Qwen/Qwen3-8B"
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
@@ -56,12 +65,14 @@ class AIProvider:
             raise RuntimeError("AI provider returned a non-object response")
         return body
 
-    def transcribe(self, audio: bytes, filename: str = "recording.wav") -> str:
-        """Call the internal Whisper service; audio storage remains separate."""
-        provider_url = os.getenv("AI_ASR_BASE_URL")
+    def _transcribe_with(self, audio: bytes, filename: str, provider_url: str, model: str) -> str:
         if not provider_url:
             raise RuntimeError("ASR provider is not configured")
-        request = Request(provider_url, data=audio, headers={"Content-Type": "application/octet-stream", "X-Filename": filename, "X-Model": self.ASR_MODEL}, method="POST")
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        headers = {"Content-Type": "application/octet-stream", "X-Filename": filename, "X-Model": model}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = Request(provider_url, data=audio, headers=headers, method="POST")
         try:
             with urlopen(request, timeout=120) as response:
                 body = json.loads(response.read().decode())
@@ -70,6 +81,45 @@ class AIProvider:
             return str(text)
         except Exception as exc:
             raise RuntimeError("ASR provider request failed") from exc
+
+    def transcribe_consensus(self, audio: bytes, filename: str = "recording.wav") -> TranscriptConsensus:
+        primary_url = os.getenv("AI_ASR_PRIMARY_BASE_URL") or os.getenv("AI_ASR_BASE_URL")
+        secondary_url = os.getenv("AI_ASR_SECONDARY_BASE_URL")
+        if not primary_url or not secondary_url:
+            raise RuntimeError("Two ASR providers are not configured")
+        primary = self._transcribe_with(audio, filename, primary_url, self.ASR_MODEL)
+        secondary = self._transcribe_with(audio, filename, secondary_url, self.SECONDARY_ASR_MODEL)
+        final_text, conflicts = self.reconcile_transcripts(primary, secondary)
+        return TranscriptConsensus(primary=primary, secondary=secondary, final_text=final_text, conflicts=conflicts)
+
+    def reconcile_transcripts(self, primary: str, secondary: str) -> tuple[str, list[str]]:
+        if primary.strip() == secondary.strip():
+            return primary.strip(), []
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        provider_url = os.getenv("AI_TRANSCRIPT_RECONCILER_BASE_URL") or os.getenv("AI_LLM_BASE_URL") or f"https://api-inference.huggingface.co/models/{self.LLM_MODEL}"
+        if provider_url.startswith("https://api-inference.huggingface.co") and not token:
+            raise RuntimeError("Transcript reconciler is not configured")
+        prompt = ("Compare two automatic speech-recognition transcripts from the same clinical conversation. "
+                  "Return only JSON: {\"final_transcript\": string, \"conflicts\": [string]}. "
+                  "Do not invent clinical facts. Retain uncertainty where audio is unclear.\n\n"
+                  f"TRANSCRIPT A:\n{primary}\n\nTRANSCRIPT B:\n{secondary}")
+        payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
+        generated = payload.get("generated_text") if isinstance(payload, dict) else None
+        if not isinstance(generated, str):
+            raise RuntimeError("Transcript reconciler returned an invalid response")
+        try:
+            result = json.loads(generated.strip().removeprefix("```json").removesuffix("```"))
+            final_text = str(result["final_transcript"]).strip()
+            conflicts = [str(item) for item in result.get("conflicts", [])]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Transcript reconciler returned invalid JSON") from exc
+        if not final_text:
+            raise RuntimeError("Transcript reconciler returned no transcript")
+        return final_text, conflicts
+
+    def transcribe(self, audio: bytes, filename: str = "recording.wav") -> str:
+        """Backward-compatible single-result access for existing callers."""
+        return self.transcribe_consensus(audio, filename).final_text
 
     def answer(self, prompt: str) -> str:
         provider_url = os.getenv("AI_LLM_BASE_URL") or f"https://api-inference.huggingface.co/models/{self.LLM_MODEL}"
