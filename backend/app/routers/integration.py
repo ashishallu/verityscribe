@@ -278,6 +278,20 @@ def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
 
     lowered = question.lower()
     records = context.get("records", {})
+
+    def report_snippets(keywords: tuple[str, ...]) -> list[str]:
+        """Return verbatim, bounded PDF text rather than an AI interpretation."""
+        snippets: list[str] = []
+        for document in context.get("uploaded_report_text", []):
+            content = str(document.get("content", ""))
+            for line in content.replace("\r", "\n").split("\n"):
+                clean = " ".join(line.split())
+                if (clean and any(keyword in clean.lower() for keyword in keywords)
+                        and clean not in snippets):
+                    snippets.append(clean[:360])
+                    if len(snippets) == 3:
+                        return snippets
+        return snippets
     if any(word in lowered for word in ("temperature", "body temp", "fever")):
         for vital in records.get("vitals", []):
             fields = {str(key).lower(): value for key, value in vital.items()}
@@ -295,9 +309,13 @@ def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
     if any(word in lowered for word in (
         "blood count", "cbc", "hemoglobin", "haemoglobin", "platelet", "white blood"
     )):
-        # Uploaded documents are not treated as structured lab results.  This
-        # prevents a report title, stale demo row, or model inference from being
-        # presented as a patient's CBC value.
+        snippets = report_snippets(("hemoglobin", "haemoglobin", "platelet", "wbc", "rbc"))
+        snippets = [snippet for snippet in snippets if any(char.isdigit() for char in snippet)]
+        if snippets:
+            return ("I found this exact text in your uploaded report (not an AI interpretation):\n• " +
+                    "\n• ".join(snippets))
+        # A generic report title or model inference must never be presented as
+        # a patient's CBC value.
         return "I do not have a structured blood-count result in your VerityScribe record."
 
     if "asthma" in lowered:
