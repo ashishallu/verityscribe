@@ -55,12 +55,17 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
             'Microphone permission is required to record a voice draft.');
         return;
       }
-      const config = RecordConfig(
-          encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1);
       if (kIsWeb) {
+        // Chrome's MediaRecorder implementation does not provide a WAV
+        // encoder for startStream. Opus is the browser-native codec and the
+        // backend accepts the resulting WebM/Opus multipart payload.
+        const config = RecordConfig(
+            encoder: AudioEncoder.opus, sampleRate: 48000, numChannels: 1);
         webBytes.clear();
         webAudio = (await recorder.startStream(config)).listen(webBytes.addAll);
       } else {
+        const config = RecordConfig(
+            encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1);
         final directory = await getTemporaryDirectory();
         audioPath =
             '${directory.path}/verityscribe_${DateTime.now().millisecondsSinceEpoch}.wav';
