@@ -97,7 +97,7 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
             const SizedBox(height: 10),
             Text('Your appointment with ${doctor?.name ?? 'your doctor'} is confirmed for ${date!.toLocal().toString().split(' ').first} at ${time!.format(context)}.', textAlign: TextAlign.center, style: const TextStyle(color: Color(0xFF667085), height: 1.5)),
             const SizedBox(height: 28),
-            SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: () => context.go('/home'), icon: const Icon(Icons.home_outlined), label: const Text('Return to home'))),
+            SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: () { ref.invalidate(appointmentsLiveProvider); context.go('/home'); }, icon: const Icon(Icons.home_outlined), label: const Text('Return to home'))),
           ]))));
     if (showPayment)
       return Scaffold(
@@ -190,7 +190,7 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
           const SizedBox(height: 14),
           _BookingCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const _FieldTitle('When would you like to visit?'),
-          OutlinedButton.icon(
+          Row(children: [Expanded(child: OutlinedButton.icon(
               onPressed: () => showDatePicker(
                           context: context,
                           firstDate: DateTime.now(),
@@ -203,8 +203,7 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
               icon: const Icon(Icons.calendar_today),
               label: Text(date == null
                   ? 'Select date'
-                  : 'Date: ${date!.toLocal().toString().split(' ').first}')),
-          InkWell(onTap: () async { var selected = time ?? TimeOfDay.now(); final picked = await showCupertinoModalPopup<TimeOfDay>(context: context, builder: (context) => Container(height: 310, color: Colors.white, child: Column(children: [Padding(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10), child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [const Text('Choose time', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)), TextButton(onPressed: () => Navigator.pop(context, selected), child: const Text('Done'))])), Expanded(child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, use24hFormat: false, initialDateTime: DateTime(2020, 1, 1, selected.hour, selected.minute), onDateTimeChanged: (value) => selected = TimeOfDay.fromDateTime(value)))]))); if (picked != null) setState(() { time = picked; timeText.text = picked.format(context); }); }, child: InputDecorator(decoration: const InputDecoration(labelText: 'Time *', prefixIcon: Icon(Icons.schedule_outlined)), child: Text(time == null ? 'Select a time' : time!.format(context)))),
+                  : '${date!.toLocal().toString().split(' ').first}')))), const SizedBox(width: 12), Expanded(child: InkWell(onTap: () async { var selected = time ?? TimeOfDay.now(); final picked = await showCupertinoModalPopup<TimeOfDay>(context: context, builder: (context) => Container(height: 310, color: Colors.white, child: Column(children: [Padding(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10), child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [const Text('Choose time', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)), TextButton(onPressed: () => Navigator.pop(context, selected), child: const Text('Done'))])), Expanded(child: CupertinoDatePicker(mode: CupertinoDatePickerMode.time, use24hFormat: false, initialDateTime: DateTime(2020, 1, 1, selected.hour, selected.minute), onDateTimeChanged: (value) => selected = TimeOfDay.fromDateTime(value)))]))); if (picked != null) setState(() { time = picked; timeText.text = picked.format(context); }); }, child: InputDecorator(decoration: const InputDecoration(labelText: 'Time *', prefixIcon: Icon(Icons.schedule_outlined)), child: Text(time == null ? 'Select time' : time!.format(context)))))]),
           ])),
           const SizedBox(height: 14),
           _BookingCard(child: Column(children: [
