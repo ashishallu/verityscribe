@@ -75,10 +75,12 @@ class _AiScreenState extends ConsumerState<AiScreen> {
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: Colors.transparent,
-      builder: (_) => Container(
+      builder: (sheetContext) {
+        final scheme = Theme.of(sheetContext).colorScheme;
+        return Container(
         margin: const EdgeInsets.all(12),
         padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
-        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(28), boxShadow: const [BoxShadow(color: Color(0x330B1E49), blurRadius: 30)]),
+        decoration: BoxDecoration(color: scheme.surface, borderRadius: BorderRadius.circular(28), boxShadow: const [BoxShadow(color: Color(0x330B1E49), blurRadius: 30)]),
         child: SafeArea(top: false, child: Column(mainAxisSize: MainAxisSize.min, children: [
           Container(width: 40, height: 4, margin: const EdgeInsets.only(bottom: 12), decoration: BoxDecoration(color: const Color(0xFFD8E1F3), borderRadius: BorderRadius.circular(4))),
           const ListTile(
@@ -91,19 +93,21 @@ class _AiScreenState extends ConsumerState<AiScreen> {
             avatar: Icon(option.$3, color: AppTheme.blue, size: 18),
             label: Text(option.$1),
             side: const BorderSide(color: Color(0xFFDCE6FA)),
-            backgroundColor: const Color(0xFFF7F9FF),
+            backgroundColor: scheme.surfaceContainerHighest,
             onPressed: () => _pickReport(option.$2),
           )).toList()),
         ])),
-      ),
+      );
+      },
     );
   }
 
   @override
   Widget build(BuildContext context) {
     final clinic = ref.watch(clinicProvider);
+    final dark = Theme.of(context).brightness == Brightness.dark;
     return DecoratedBox(
-      decoration: const BoxDecoration(gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [Color(0xFFF0F5FF), AppTheme.canvas, Color(0xFFF9FBFF)])),
+      decoration: BoxDecoration(gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: dark ? const [Color(0xFF101827), Color(0xFF131F33), Color(0xFF101827)] : const [Color(0xFFF0F5FF), AppTheme.canvas, Color(0xFFF9FBFF)])),
       child: SafeArea(top: false, child: Center(child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 1100),
         child: Column(children: [
@@ -148,7 +152,7 @@ class _ErrorBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Container(
     margin: const EdgeInsets.fromLTRB(20, 16, 20, 0), padding: const EdgeInsets.all(14),
-    decoration: BoxDecoration(color: const Color(0xFFFFF7ED), borderRadius: BorderRadius.circular(18), border: Border.all(color: const Color(0xFFFED7AA))),
+    decoration: BoxDecoration(color: Theme.of(context).brightness == Brightness.dark ? const Color(0xFF3A2819) : const Color(0xFFFFF7ED), borderRadius: BorderRadius.circular(18), border: Border.all(color: const Color(0xFFFED7AA))),
     child: Row(children: [const Icon(Icons.info_outline_rounded, color: Color(0xFFEA7B00)), const SizedBox(width: 10), const Expanded(child: Text('Verity could not complete that request. Please try again.', style: TextStyle(fontWeight: FontWeight.w600))), TextButton(onPressed: onDismiss, child: const Text('Dismiss'))]),
   );
 }
@@ -172,7 +176,7 @@ class _Suggestion extends StatelessWidget {
   final String text;
   const _Suggestion(this.text);
   @override
-  Widget build(BuildContext context) => Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: const Color(0xFFDDE7FA))), child: Text(text, style: const TextStyle(color: AppTheme.blue, fontWeight: FontWeight.w700)));
+  Widget build(BuildContext context) => Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10), decoration: BoxDecoration(color: Theme.of(context).colorScheme.surface, borderRadius: BorderRadius.circular(16), border: Border.all(color: const Color(0xFFDDE7FA))), child: Text(text, style: const TextStyle(color: AppTheme.blue, fontWeight: FontWeight.w700)));
 }
 
 class _TypingIndicator extends StatelessWidget {
@@ -206,7 +210,7 @@ class _Composer extends StatelessWidget {
   const _Composer({required this.controller, required this.sending, required this.onAttach, required this.onSend});
   @override
   Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.fromLTRB(18, 10, 18, 16), decoration: const BoxDecoration(color: Color(0xEFFFFFFF), border: Border(top: BorderSide(color: Color(0xFFE5ECF8)))),
+    padding: const EdgeInsets.fromLTRB(18, 10, 18, 16), decoration: BoxDecoration(color: Theme.of(context).colorScheme.surface.withValues(alpha: .94), border: const Border(top: BorderSide(color: Color(0xFFE5ECF8)))),
     child: Row(children: [
       IconButton.filledTonal(onPressed: sending ? null : onAttach, icon: const Icon(Icons.add_rounded), tooltip: 'Upload a report'), const SizedBox(width: 10),
       Expanded(child: TextField(controller: controller, minLines: 1, maxLines: 4, textInputAction: TextInputAction.send, onSubmitted: (_) => onSend(), decoration: const InputDecoration(hintText: 'Ask Verity anything…', contentPadding: EdgeInsets.symmetric(horizontal: 18, vertical: 14)))),
@@ -221,17 +225,18 @@ class _MessageBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isUser = message.isUser;
+    final scheme = Theme.of(context).colorScheme;
     return Align(alignment: isUser ? Alignment.centerRight : Alignment.centerLeft, child: ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 650),
       child: Row(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
         if (!isUser) const Padding(padding: EdgeInsets.only(right: 9, bottom: 19), child: _RoundIcon(icon: Icons.auto_awesome_rounded, color: AppTheme.cyan)),
         Flexible(child: Container(margin: const EdgeInsets.only(bottom: 16), padding: const EdgeInsets.fromLTRB(16, 13, 16, 10), decoration: BoxDecoration(
-          gradient: isUser ? const LinearGradient(colors: [Color(0xFF2257E6), Color(0xFF2E72E8)]) : null, color: isUser ? null : Colors.white,
+          gradient: isUser ? const LinearGradient(colors: [Color(0xFF2257E6), Color(0xFF2E72E8)]) : null, color: isUser ? null : scheme.surfaceContainerHighest,
           borderRadius: BorderRadius.only(topLeft: const Radius.circular(20), topRight: const Radius.circular(20), bottomLeft: Radius.circular(isUser ? 20 : 5), bottomRight: Radius.circular(isUser ? 5 : 20)),
           boxShadow: const [BoxShadow(color: Color(0x120B1E49), blurRadius: 16, offset: Offset(0, 6))],
         ), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           if (message.attachment != null) Padding(padding: const EdgeInsets.only(bottom: 6), child: Row(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.attach_file_rounded, size: 16, color: isUser ? Colors.white : AppTheme.blue), const SizedBox(width: 3), Text(message.attachment!, style: TextStyle(fontWeight: FontWeight.w800, color: isUser ? Colors.white : AppTheme.blue))])),
-          Text(message.text, style: TextStyle(color: isUser ? Colors.white : AppTheme.ink, height: 1.5, fontSize: 15)), const SizedBox(height: 7), Text('${message.sentAt.hour.toString().padLeft(2, '0')}:${message.sentAt.minute.toString().padLeft(2, '0')}', style: TextStyle(fontSize: 10, color: isUser ? Colors.white70 : AppTheme.muted)),
+          Text(message.text, style: TextStyle(color: isUser ? Colors.white : scheme.onSurface, height: 1.5, fontSize: 15)), const SizedBox(height: 7), Text('${message.sentAt.hour.toString().padLeft(2, '0')}:${message.sentAt.minute.toString().padLeft(2, '0')}', style: TextStyle(fontSize: 10, color: isUser ? Colors.white70 : AppTheme.muted)),
         ]))),
       ]),
     ));

@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 import httpx
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -427,7 +427,7 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
 
 @router.post("/chat/reports", status_code=status.HTTP_201_CREATED)
 async def upload_patient_chat_report(
-    report_type: str,
+    report_type: str = Form(...),
     document: UploadFile = File(...),
     patient: dict = Depends(get_current_patient),
 ):
