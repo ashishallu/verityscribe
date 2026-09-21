@@ -56,11 +56,13 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
         return;
       }
       if (kIsWeb) {
-        // Chrome's MediaRecorder implementation does not provide a WAV
-        // encoder for startStream. Opus is the browser-native codec and the
-        // backend accepts the resulting WebM/Opus multipart payload.
+        // `startStream` on the web implementation only supports raw PCM16.
+        // The bytes are wrapped in a WAV container before the upload so the
+        // transcription service receives a standard audio file.
         const config = RecordConfig(
-            encoder: AudioEncoder.opus, sampleRate: 48000, numChannels: 1);
+            encoder: AudioEncoder.pcm16bits,
+            sampleRate: 16000,
+            numChannels: 1);
         webBytes.clear();
         webAudio = (await recorder.startStream(config)).listen(webBytes.addAll);
       } else {
@@ -81,9 +83,9 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
           (_) => mounted
               ? setState(() => elapsed += const Duration(seconds: 1))
               : null);
-    } catch (_) {
+    } catch (exception) {
       setState(() => error =
-          'Unable to start recording. Check microphone access and try again.');
+          'Unable to start recording: $exception. Check that no other app is using the microphone.');
     }
   }
 
@@ -103,7 +105,7 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
       final service = VoiceDraftService(ref.read(supabaseAuthProvider));
       final result = kIsWeb
           ? await service.uploadBytes(
-              appointmentId: selectedAppointment!, bytes: webBytes)
+              appointmentId: selectedAppointment!, bytes: _asWav(webBytes))
           : await service.upload(
               appointmentId: selectedAppointment!, filePath: audioPath!);
       if (!mounted) return;
@@ -132,6 +134,28 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
 
   String get clock =>
       '${elapsed.inMinutes.toString().padLeft(2, '0')}:${(elapsed.inSeconds % 60).toString().padLeft(2, '0')}';
+
+  List<int> _asWav(List<int> pcm) {
+    const sampleRate = 16000;
+    const channels = 1;
+    const bitsPerSample = 16;
+    final header = ByteData(44)
+      ..setUint32(0, 0x46464952, Endian.little) // RIFF
+      ..setUint32(4, 36 + pcm.length, Endian.little)
+      ..setUint32(8, 0x45564157, Endian.little) // WAVE
+      ..setUint32(12, 0x20746d66, Endian.little) // format chunk
+      ..setUint32(16, 16, Endian.little)
+      ..setUint16(20, 1, Endian.little)
+      ..setUint16(22, channels, Endian.little)
+      ..setUint32(24, sampleRate, Endian.little)
+      ..setUint32(28, sampleRate * channels * bitsPerSample ~/ 8,
+          Endian.little)
+      ..setUint16(32, channels * bitsPerSample ~/ 8, Endian.little)
+      ..setUint16(34, bitsPerSample, Endian.little)
+      ..setUint32(36, 0x61746164, Endian.little) // data
+      ..setUint32(40, pcm.length, Endian.little);
+    return Uint8List.fromList([...header.buffer.asUint8List(), ...pcm]);
+  }
 
   @override
   Widget build(BuildContext context) {

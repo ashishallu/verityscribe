@@ -64,7 +64,7 @@ class VoiceDraftService {
         'POST', Uri.parse('$apiBaseUrl/appointments/$appointmentId/voice'));
     request.headers['Authorization'] = 'Bearer $token';
     request.files.add(http.MultipartFile.fromBytes('audio', bytes,
-        filename: 'voice_consultation.webm'));
+        filename: 'voice_consultation.wav'));
     final response = await request.send().timeout(const Duration(seconds: 180));
     final text = await response.stream.bytesToString();
     if (response.statusCode < 200 || response.statusCode >= 300)
