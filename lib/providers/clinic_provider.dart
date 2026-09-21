@@ -3,6 +3,9 @@ import '../models/entities.dart';
 import '../repositories/repositories.dart';
 import 'app_providers.dart';
 import '../core/services/api_service.dart';
+import '../core/services/supabase_auth_service.dart';
+import '../core/constants/endpoints.dart';
+import 'package:http/http.dart' as http;
 
 class ChatMessage {
   final String text;
@@ -47,7 +50,7 @@ class ClinicState {
 }
 
 class ClinicNotifier extends StateNotifier<ClinicState> {
-  ClinicNotifier(this._health, this._api)
+  ClinicNotifier(this._health, this._api, this._auth)
       : super(ClinicState(
             selectedDate: DateTime.now(),
             medicines: const [],
@@ -57,6 +60,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
   }
   final HealthRepository _health;
   final ApiClient _api;
+  final SupabaseAuthService _auth;
   Future<void> load() async {
     try {
       final results =
@@ -122,9 +126,40 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     }
   }
 
+  Future<void> uploadReport({
+    required String reportType,
+    required String filename,
+    required List<int> bytes,
+  }) async {
+    final now = DateTime.now();
+    final label = 'Uploaded $filename';
+    final updated = [...state.messages,
+      ChatMessage(text: label, isUser: true, sentAt: now, attachment: reportType)];
+    state = state.copyWith(messages: updated, chatLoading: true, chatError: null);
+    try {
+      final token = await _auth.accessToken();
+      if (token == null) throw const ApiException('Your session has expired. Sign in again.');
+      final request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/chat/reports'))
+        ..headers['Authorization'] = 'Bearer $token'
+        ..fields['report_type'] = reportType
+        ..files.add(http.MultipartFile.fromBytes('document', bytes, filename: filename));
+      final response = await request.send().timeout(const Duration(seconds: 90));
+      final text = await response.stream.bytesToString();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw ApiException(text, statusCode: response.statusCode);
+      }
+      state = state.copyWith(messages: [...updated, ChatMessage(
+        text: 'Your report was saved privately. Ask me a question about its readable content.',
+        isUser: false, sentAt: DateTime.now())], chatLoading: false);
+    } catch (error) {
+      state = state.copyWith(chatLoading: false, chatError: error);
+    }
+  }
+
   void clearChat() => state = state.copyWith(messages: []);
 }
 
 final clinicProvider = StateNotifierProvider<ClinicNotifier, ClinicState>(
     (ref) => ClinicNotifier(
-        ref.read(healthRepositoryProvider), ref.read(apiClientProvider)));
+        ref.read(healthRepositoryProvider), ref.read(apiClientProvider),
+        ref.read(supabaseAuthProvider)));

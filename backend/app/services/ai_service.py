@@ -253,13 +253,28 @@ class AIProvider:
         return self.transcribe_consensus(audio, filename).final_text
 
     def answer(self, prompt: str) -> str:
-        provider_url = os.getenv("AI_LLM_BASE_URL") or f"https://api-inference.huggingface.co/models/{self.LLM_MODEL}"
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        if provider_url.startswith("https://api-inference.huggingface.co") and not token:
+        provider_url = os.getenv("AI_LLM_BASE_URL")
+        if not token and not provider_url:
             raise RuntimeError("AI provider is not configured")
-        payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
-        if isinstance(payload, dict) and isinstance(payload.get("generated_text"), str): return payload["generated_text"]
-        raise RuntimeError("AI provider returned an invalid answer")
+        if provider_url:
+            payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
+            if isinstance(payload, dict) and isinstance(payload.get("generated_text"), str):
+                return payload["generated_text"].strip()
+            raise RuntimeError("AI provider returned an invalid answer")
+        try:
+            response = InferenceClient(api_key=token).chat_completion(
+                model=self.LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=700,
+            )
+            answer = response.choices[0].message.content
+            if not isinstance(answer, str) or not answer.strip():
+                raise RuntimeError("AI provider returned an empty answer")
+            return answer.strip()
+        except Exception as exc:
+            raise RuntimeError(f"Hugging Face chat request failed ({type(exc).__name__})") from exc
 
 
 ai_provider = AIProvider()

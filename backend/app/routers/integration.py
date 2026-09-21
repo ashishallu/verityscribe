@@ -1,4 +1,5 @@
 from datetime import date
+from io import BytesIO
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 import httpx
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 from supabase import Client, create_client
 
 from ..core.config import settings
@@ -78,6 +80,15 @@ class ReportCreate(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     consultation_id: str | None = None
+
+
+CHAT_REPORT_TYPES = {
+    "pdf", "prescription", "blood_report", "x_ray", "mri", "lab_report",
+    "ecg", "medicine_photo",
+}
+CHAT_UPLOAD_TYPES = {
+    "application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp",
+}
 
 class PatientProvisionRequest(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
@@ -150,6 +161,58 @@ def _voice_bucket(client: Client) -> str:
     return bucket
 
 
+def _chat_document_bucket(client: Client) -> str:
+    """Return the private report bucket; clients never receive direct access."""
+    bucket = os.getenv("CHAT_REPORT_STORAGE_BUCKET", "patient-report-uploads")
+    try:
+        client.storage.get_bucket(bucket)
+    except Exception:
+        try:
+            client.storage.create_bucket(
+                bucket,
+                options={"public": False, "file_size_limit": 10 * 1024 * 1024,
+                         "allowed_mime_types": sorted(CHAT_UPLOAD_TYPES)},
+            )
+        except Exception:
+            client.storage.get_bucket(bucket)
+    return bucket
+
+
+def _is_personal_health_question(message: str) -> bool:
+    terms = (
+        "my ", "me ", "i ", "mine", "medical record", "health record",
+        "report", "prescription", "medicine", "medication", "diagnosis",
+        "allergy", "vital", "blood", "mri", "x-ray", "xray", "ecg",
+        "lab result", "consultation",
+    )
+    return any(term in message.lower() for term in terms)
+
+
+def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
+    """Fetch only the authenticated patient's bounded, relevant record data."""
+    reports = _patient_table_rows(client, "reports", patient_id)
+    records = {
+        key: _patient_table_rows(client, key, patient_id)
+        for key in ("allergies", "chronic_conditions", "vitals", "consultations", "prescriptions")
+    }
+    try:
+        extracted = client.table("patient_embeddings").select("content,created_at").eq(
+            "patient_id", patient_id
+        ).order("created_at", desc=True).limit(12).execute().data or []
+    except Exception:
+        extracted = []
+    return {"reports": reports[:25], "records": records,
+            "uploaded_report_text": extracted}
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    try:
+        reader = PdfReader(BytesIO(content))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)[:30000].strip()
+    except Exception:
+        return ""
+
+
 def _storage_error_detail(exc: Exception) -> str:
     """Capture the Storage response body in server logs, never in the UI."""
     response = getattr(exc, "response", None)
@@ -192,27 +255,83 @@ def provision_patient(payload: PatientProvisionRequest, claims: dict = Depends(c
 
 @router.post("/chat")
 def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
+    """Answer general questions or a patient's own record question, never both by accident."""
     client = db()
     role = claims.get("app_metadata", {}).get("role")
+    if role != "patient":
+        raise HTTPException(status_code=403, detail="Patient chat is not available for this role")
+    patient = get_current_patient(claims)
+    personal = _is_personal_health_question(payload.message)
     context: dict[str, Any] = {}
-    if role == "patient":
-        patient = get_current_patient(claims)
-        context = {"patient": {"id": patient["id"], "medical_id": patient.get("medical_id")}, "record": {key: _patient_table_rows(client, key, patient["id"]) for key in ("allergies", "chronic_conditions", "vitals", "consultations", "prescriptions", "reports")}}
-    elif role == "doctor":
-        if payload.consultation_id:
-            consultation = _owned_consultation(client, payload.consultation_id, claims["sub"])
-            context = {"consultation": consultation, "patient": {key: _patient_table_rows(client, key, consultation["patient_id"]) for key in ("allergies", "chronic_conditions", "vitals", "consultations", "prescriptions", "reports")}}
-        else:
-            doctor = get_current_doctor(claims)
-            context = {"doctor": {"id": doctor["id"], "hospital_id": doctor.get("hospital_id"), "department_id": doctor.get("department_id")}}
-    else:
-        raise HTTPException(status_code=403, detail="Chat is not available for this role")
-    prompt = "You are a clinical assistant. Use only the authorized context below. If data is absent, say so. Never reveal other patients. Label clinical interpretations as suggestions.\nContext:\n" + json.dumps(context, default=str) + "\nQuestion:\n" + payload.message
+    if personal:
+        context = _chat_context(client, patient["id"])
+        if not any(context.values()):
+            return {"data": {
+                "answer": "I do not have relevant information in your VerityScribe record for that question. Please upload the report or ask your clinician.",
+                "uses_personal_health_data": True,
+                "context_locked": True,
+            }}
+    instructions = (
+        "You are Verity, a health-information assistant. Do not diagnose, prescribe, or present an AI answer as medical advice. "
+        "For personal-record questions, use ONLY the supplied patient record. If a fact is missing, state that it is not available; never infer it. "
+        "Never mention, compare, or disclose another person's data. For general questions, answer generally and advise urgent care for emergency symptoms. "
+        "Keep the answer clear and concise.\n"
+    )
+    prompt = instructions + ("MODE: PATIENT-RECORD\nAUTHORIZED RECORD:\n" + json.dumps(context, default=str) if personal else "MODE: GENERAL - no patient record was provided.") + "\n\nQUESTION:\n" + payload.message
     try:
         answer = ai_provider.answer(prompt)
     except RuntimeError as exc:
+        logger.exception("Patient chat provider failed: %s", exc)
         raise HTTPException(status_code=503, detail="AI chat is currently unavailable") from exc
-    return {"data": {"answer": answer, "context_locked": role == "patient" or bool(payload.consultation_id)}}
+    return {"data": {"answer": answer, "uses_personal_health_data": personal, "context_locked": True}}
+
+
+@router.post("/chat/reports", status_code=status.HTTP_201_CREATED)
+async def upload_patient_chat_report(
+    report_type: str,
+    document: UploadFile = File(...),
+    patient: dict = Depends(get_current_patient),
+):
+    """Store an uploaded report privately and make its readable PDF text available only to its owner."""
+    normalized_type = report_type.strip().lower().replace(" ", "_")
+    if normalized_type not in CHAT_REPORT_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported report type")
+    content_type = (document.content_type or "").lower()
+    if content_type not in CHAT_UPLOAD_TYPES:
+        raise HTTPException(status_code=422, detail="Upload a PDF, PNG, JPEG, or WEBP report")
+    content = await document.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Report file is empty")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="Report exceeds the 10 MB limit")
+    extracted = _extract_pdf_text(content) if content_type == "application/pdf" else ""
+    if content_type == "application/pdf" and not extracted:
+        raise HTTPException(status_code=422, detail="This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report.")
+    client = db()
+    bucket = _chat_document_bucket(client)
+    document_id = str(__import__("uuid").uuid4())
+    suffix = (document.filename or "report").replace("/", "_").replace("\\", "_")
+    path = f"{patient['id']}/{document_id}-{suffix}"
+    try:
+        client.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": "false"})
+        record = client.table("medical_documents").insert({
+            "id": document_id, "patient_id": patient["id"], "bucket_path": path,
+            "document_type": normalized_type,
+        }).execute().data[0]
+        if extracted:
+            client.table("patient_embeddings").insert({
+                "patient_id": patient["id"], "source_document_id": document_id, "content": extracted,
+            }).execute()
+    except Exception as exc:
+        try:
+            client.storage.from_(bucket).remove([path])
+        except Exception:
+            pass
+        logger.exception("Patient report upload failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Secure report upload is currently unavailable") from exc
+    return {"data": {"document": record, "report_type": normalized_type,
+                      "text_available": bool(extracted),
+                      "message": "Report saved privately. You can now ask Verity about its readable content."}}
 
 
 def _admin_context(claims: dict) -> tuple[Client, dict]:
