@@ -124,7 +124,41 @@ def _voice_bucket(client: Client) -> str:
                     status_code=503,
                     detail="Secure voice storage is unavailable",
                 ) from exc
+    try:
+        # Older manually-created buckets may have an image-only MIME allowlist
+        # or a smaller size cap. Keep this protected bucket compatible with the
+        # recorder's WAV payloads without making it public.
+        client.storage.update_bucket(
+            bucket,
+            options={
+                "public": False,
+                "file_size_limit": 50 * 1024 * 1024,
+                "allowed_mime_types": [
+                    "audio/wav",
+                    "audio/x-wav",
+                    "audio/webm",
+                    "application/octet-stream",
+                ],
+            },
+        )
+    except Exception as exc:
+        logger.exception("Unable to configure the voice Storage bucket")
+        raise HTTPException(
+            status_code=503,
+            detail="Secure voice storage is unavailable",
+        ) from exc
     return bucket
+
+
+def _storage_error_detail(exc: Exception) -> str:
+    """Capture the Storage response body in server logs, never in the UI."""
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            return response.text
+        except Exception:
+            pass
+    return str(exc)
 
 @router.post("/patients/provision", status_code=status.HTTP_201_CREATED)
 def provision_patient(payload: PatientProvisionRequest, claims: dict = Depends(current_claims)):
@@ -698,7 +732,10 @@ async def upload_consultation_voice(consultation_id: str, audio: UploadFile = Fi
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": audio.content_type or "application/octet-stream", "upsert": "false"})
     except Exception as exc:
-        logger.exception("Unable to upload consultation voice recording")
+        logger.exception(
+            "Unable to upload consultation voice recording: %s",
+            _storage_error_detail(exc),
+        )
         raise HTTPException(status_code=503, detail="Secure voice storage is unavailable") from exc
     try:
         recording = client.table("voice_recordings").insert({"id": str(recording_id), "patient_id": consultation["patient_id"], "doctor_id": doctor["id"], "recording_url": path}).execute().data[0]
@@ -734,7 +771,10 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": audio.content_type or "application/octet-stream", "upsert": "false"})
     except Exception as exc:
-        logger.exception("Unable to upload patient voice recording")
+        logger.exception(
+            "Unable to upload patient voice recording: %s",
+            _storage_error_detail(exc),
+        )
         raise HTTPException(status_code=503, detail="Secure voice storage is unavailable") from exc
     try:
         recording = client.table("voice_recordings").insert({"id": str(recording_id), "patient_id": patient["id"], "doctor_id": appointment["doctor_id"], "recording_url": path}).execute().data[0]
