@@ -1,5 +1,6 @@
 from datetime import date
 import json
+import logging
 import os
 import time
 from typing import Any
@@ -14,6 +15,7 @@ from ..core.security import current_claims, get_current_doctor, get_current_pati
 from ..services.ai_service import ai_provider
 
 router = APIRouter(tags=["integration"])
+logger = logging.getLogger(__name__)
 
 
 class AppointmentCreate(BaseModel):
@@ -92,6 +94,37 @@ def db() -> Client:
     if not cfg.supabase_url or not cfg.supabase_service_role_key:
         raise HTTPException(status_code=503, detail="Integration service is unavailable")
     return create_client(cfg.supabase_url, cfg.supabase_service_role_key)
+
+
+def _voice_bucket(client: Client) -> str:
+    """Return the private voice bucket, provisioning it once if missing.
+
+    The server uses the service-role client only after authenticating the
+    caller and checking appointment ownership.  This allows a fresh Supabase
+    project to recover from a missing deployment bucket without making voice
+    recordings public or granting browser clients Storage permissions.
+    """
+    bucket = os.getenv("VOICE_STORAGE_BUCKET", "voice-recordings")
+    try:
+        client.storage.get_bucket(bucket)
+    except Exception:
+        try:
+            client.storage.create_bucket(
+                bucket,
+                options={"public": False, "file_size_limit": 50 * 1024 * 1024},
+            )
+        except Exception:
+            # Another concurrent request can create the bucket first. Verify
+            # it exists before surfacing an actual provisioning failure.
+            try:
+                client.storage.get_bucket(bucket)
+            except Exception as exc:
+                logger.exception("Voice Storage bucket is unavailable")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Secure voice storage is unavailable",
+                ) from exc
+    return bucket
 
 @router.post("/patients/provision", status_code=status.HTTP_201_CREATED)
 def provision_patient(payload: PatientProvisionRequest, claims: dict = Depends(current_claims)):
@@ -659,12 +692,13 @@ async def upload_consultation_voice(consultation_id: str, audio: UploadFile = Fi
         raise HTTPException(status_code=422, detail="Audio file is empty")
     if len(content) > 50 * 1024 * 1024:
         raise HTTPException(status_code=422, detail="Audio file exceeds the 50 MB limit")
-    bucket = os.getenv("VOICE_STORAGE_BUCKET", "voice-recordings")
+    bucket = _voice_bucket(client)
     recording_id = __import__("uuid").uuid4()
     path = f"{consultation_id}/{doctor['id']}/{recording_id}-{audio.filename or 'recording.bin'}"
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": audio.content_type or "application/octet-stream", "upsert": "false"})
     except Exception as exc:
+        logger.exception("Unable to upload consultation voice recording")
         raise HTTPException(status_code=503, detail="Secure voice storage is unavailable") from exc
     try:
         recording = client.table("voice_recordings").insert({"id": str(recording_id), "patient_id": consultation["patient_id"], "doctor_id": doctor["id"], "recording_url": path}).execute().data[0]
@@ -694,12 +728,13 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
         raise HTTPException(status_code=422, detail="Audio file is empty")
     if len(content) > 50 * 1024 * 1024:
         raise HTTPException(status_code=422, detail="Audio file exceeds the 50 MB limit")
-    bucket = os.getenv("VOICE_STORAGE_BUCKET", "voice-recordings")
+    bucket = _voice_bucket(client)
     recording_id = __import__("uuid").uuid4()
     path = f"appointments/{appointment_id}/{patient['id']}/{recording_id}-{audio.filename or 'recording.bin'}"
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": audio.content_type or "application/octet-stream", "upsert": "false"})
     except Exception as exc:
+        logger.exception("Unable to upload patient voice recording")
         raise HTTPException(status_code=503, detail="Secure voice storage is unavailable") from exc
     try:
         recording = client.table("voice_recordings").insert({"id": str(recording_id), "patient_id": patient["id"], "doctor_id": appointment["doctor_id"], "recording_url": path}).execute().data[0]
