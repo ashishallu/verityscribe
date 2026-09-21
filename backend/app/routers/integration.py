@@ -209,7 +209,10 @@ def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
         ).order("created_at", desc=True).limit(12).execute().data or []
     except Exception:
         extracted = []
-    return {"reports": reports[:25], "records": records,
+    patient = client.table("patients").select(
+        "id,height_cm,weight_kg,blood_group"
+    ).eq("id", patient_id).maybe_single().execute().data or {}
+    return {"patient": patient, "reports": reports[:25], "records": records,
             "uploaded_report_text": extracted}
 
 
@@ -228,15 +231,84 @@ def _personal_evidence(question: str, context: dict[str, Any]) -> list[dict[str,
     if any(word in lowered for word in ("temperature", "body temp", "fever")):
         return matches(records.get("vitals", []), ("temperature", "body_temp", "temp"))
     if any(word in lowered for word in ("blood count", "cbc", "hemoglobin", "haemoglobin", "platelet", "white blood")):
-        words = ("cbc", "hemoglobin", "haemoglobin", "platelet", "white blood", "rbc", "wbc")
-        return (matches(context.get("reports", []), words) +
-                matches(context.get("uploaded_report_text", []), words))
+        # Report titles or generic "CBC normal" text are not a blood-count
+        # value. Permit uploaded report text only when it names a test and
+        # includes a numeric result; otherwise fail closed.
+        return [row for row in context.get("uploaded_report_text", [])
+                if any(word in str(row.get("content", "")).lower()
+                       for word in ("hemoglobin", "haemoglobin", "platelet", "wbc", "rbc"))
+                and any(char.isdigit() for char in str(row.get("content", "")))]
     if "asthma" in lowered:
         return (matches(records.get("chronic_conditions", []), ("asthma",)) +
                 matches(records.get("consultations", []), ("asthma",)))
     # For an unrecognised personal-data question, do not let a general model
     # guess which record could answer it.
     return []
+
+
+def _direct_patient_answer(question: str, context: dict[str, Any]) -> str | None:
+    """Give exact profile fields without allowing the model to reinterpret them."""
+    lowered = question.lower()
+    patient = context.get("patient", {})
+    if "height" in lowered:
+        value = patient.get("height_cm")
+        return (f"Your recorded height is {value} cm." if value is not None
+                else "I do not have your height recorded in VerityScribe.")
+    if "weight" in lowered:
+        value = patient.get("weight_kg")
+        return (f"Your recorded weight is {value} kg." if value is not None
+                else "I do not have your weight recorded in VerityScribe.")
+    if "blood group" in lowered or "blood type" in lowered:
+        value = patient.get("blood_group")
+        return (f"Your recorded blood group is {value}." if value
+                else "I do not have your blood group recorded in VerityScribe.")
+    return None
+
+
+def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
+    """Answer record questions deterministically, or explicitly fail closed.
+
+    Clinical-record questions must never be delegated to a generative model:
+    even a tightly scoped prompt can turn an unrelated report into an invented
+    measurement.  The model remains available for genuinely general questions.
+    """
+    direct = _direct_patient_answer(question, context)
+    if direct:
+        return direct
+
+    lowered = question.lower()
+    records = context.get("records", {})
+    if any(word in lowered for word in ("temperature", "body temp", "fever")):
+        for vital in records.get("vitals", []):
+            fields = {str(key).lower(): value for key, value in vital.items()}
+            metric = " ".join(str(value).lower() for value in fields.values())
+            if not any(word in metric for word in ("temperature", "body temp", "temp")):
+                continue
+            value = next((fields.get(key) for key in (
+                "temperature_c", "temperature", "body_temperature", "value"
+            ) if fields.get(key) is not None), None)
+            if value is not None:
+                unit = fields.get("unit") or "°C"
+                return f"Your recorded body temperature is {value} {unit}."
+        return "I do not have a recorded body temperature in VerityScribe."
+
+    if any(word in lowered for word in (
+        "blood count", "cbc", "hemoglobin", "haemoglobin", "platelet", "white blood"
+    )):
+        # Uploaded documents are not treated as structured lab results.  This
+        # prevents a report title, stale demo row, or model inference from being
+        # presented as a patient's CBC value.
+        return "I do not have a structured blood-count result in your VerityScribe record."
+
+    if "asthma" in lowered:
+        asthma_rows = _personal_evidence(question, context)
+        if asthma_rows:
+            return ("Your record contains an asthma-related clinical entry, but it does not "
+                    "state your current asthma status. Please ask your clinician for an assessment.")
+        return "I do not have an asthma-related entry in your VerityScribe record."
+
+    return ("I do not have relevant information in your VerityScribe record for that question. "
+            "Please upload the report or ask your clinician.")
 
 
 def _extract_pdf_text(content: bytes) -> str:
@@ -315,16 +387,11 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
     context: dict[str, Any] = {}
     if personal:
         context = _chat_context(client, patient["id"])
-        evidence = _personal_evidence(payload.message, context)
-        if not evidence:
-            return {"data": {
-                "answer": "I do not have relevant information in your VerityScribe record for that question. Please upload the report or ask your clinician.",
-                "uses_personal_health_data": True,
-                "context_locked": True,
-            }}
-        # Never send unrelated personal records to the model. Evidence is
-        # narrowed by question type before it is used for a response.
-        context = {"matching_record_evidence": evidence}
+        return {"data": {
+            "answer": _safe_personal_record_answer(payload.message, context),
+            "uses_personal_health_data": True,
+            "context_locked": True,
+        }}
     instructions = (
         "You are Verity, a health-information assistant. Do not diagnose, prescribe, or present an AI answer as medical advice. "
         "For personal-record questions, use ONLY the supplied patient record. If a fact is missing, state that it is not available; never infer it. "
@@ -383,9 +450,13 @@ async def upload_patient_chat_report(
             pass
         logger.exception("Patient report upload failed: %s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Secure report upload is currently unavailable") from exc
+    message = (
+        "Report saved privately. Verity can use the extracted text from this PDF."
+        if extracted else
+        "Image saved privately. Text extraction is not available for this image yet, so Verity will not infer clinical details from it."
+    )
     return {"data": {"document": record, "report_type": normalized_type,
-                      "text_available": bool(extracted),
-                      "message": "Report saved privately. You can now ask Verity about its readable content."}}
+                      "text_available": bool(extracted), "message": message}}
 
 
 def _admin_context(claims: dict) -> tuple[Client, dict]:

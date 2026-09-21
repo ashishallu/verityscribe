@@ -41,14 +41,15 @@ class ClinicState {
           List<Consultation>? consultations,
           List<ChatMessage>? messages,
           bool? chatLoading,
-          Object? chatError}) =>
+          Object? chatError,
+          bool clearChatError = false}) =>
       ClinicState(
           selectedDate: selectedDate ?? this.selectedDate,
           medicines: medicines ?? this.medicines,
           consultations: consultations ?? this.consultations,
           messages: messages ?? this.messages,
           chatLoading: chatLoading ?? this.chatLoading,
-          chatError: chatError);
+          chatError: clearChatError ? null : (chatError ?? this.chatError));
 }
 
 class ClinicNotifier extends StateNotifier<ClinicState> {
@@ -100,8 +101,8 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       ...state.messages,
       ChatMessage(text: text, isUser: true, sentAt: now, attachment: attachment)
     ];
-    state =
-        state.copyWith(messages: updated, chatLoading: true, chatError: null);
+    state = state.copyWith(
+        messages: updated, chatLoading: true, clearChatError: true);
     try {
       final response = await _api.post<dynamic>('/chat', {
         'message': text,
@@ -137,7 +138,8 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     final label = 'Uploaded $filename';
     final updated = [...state.messages,
       ChatMessage(text: label, isUser: true, sentAt: now, attachment: reportType)];
-    state = state.copyWith(messages: updated, chatLoading: true, chatError: null);
+    state = state.copyWith(
+        messages: updated, chatLoading: true, clearChatError: true);
     try {
       final token = await _auth.accessToken();
       if (token == null) throw const ApiException('Your session has expired. Sign in again.');
@@ -151,8 +153,15 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(_uploadError(text), statusCode: response.statusCode);
       }
+      final decoded = Map<String, dynamic>.from(jsonDecode(text) as Map);
+      final data = decoded['data'] is Map
+          ? Map<String, dynamic>.from(decoded['data'] as Map)
+          : decoded;
+      final confirmation = (data['message'] ??
+              'Your report was saved privately.')
+          .toString();
       state = state.copyWith(messages: [...updated, ChatMessage(
-        text: 'Your report was saved privately. Ask me a question about its readable content.',
+        text: confirmation,
         isUser: false, sentAt: DateTime.now())], chatLoading: false);
     } catch (error) {
       state = state.copyWith(chatLoading: false, chatError: error);
@@ -179,7 +188,8 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     }
   }
 
-  void clearChat() => state = state.copyWith(messages: []);
+  void clearChat() => state = state.copyWith(messages: [], clearChatError: true);
+  void clearChatError() => state = state.copyWith(clearChatError: true);
 }
 
 final clinicProvider = StateNotifierProvider<ClinicNotifier, ClinicState>(
