@@ -119,9 +119,10 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                     SizedBox(
                         width: double.infinity,
                         child: FilledButton.icon(
-                            onPressed: () {
-                              ref.invalidate(appointmentsLiveProvider);
-                              context.go('/home');
+                            onPressed: () async {
+                              await ref
+                                  .refresh(appointmentsLiveProvider.future);
+                              if (context.mounted) context.go('/home');
                             },
                             icon: const Icon(Icons.home_outlined),
                             label: const Text('Return to home'))),
