@@ -120,7 +120,7 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                         width: double.infinity,
                         child: FilledButton.icon(
                             onPressed: () {
-                              ref.invalidate(appointmentsLiveProvider);
+                              ref.refresh(appointmentsLiveProvider.future);
                               context.go('/home');
                             },
                             icon: const Icon(Icons.home_outlined),
