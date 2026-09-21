@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import json
 import logging
 import os
@@ -79,10 +80,20 @@ class AIProvider:
         if not provider_url:
             raise RuntimeError("ASR provider is not configured")
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        headers = {"Content-Type": "application/octet-stream", "X-Filename": filename, "X-Model": model}
+        # Hugging Face's Inference Providers ASR API accepts an explicit JSON
+        # `inputs` base64 payload.  The previous raw-byte request was rejected
+        # by the router with HTTP 400 even though the stored WAV itself was
+        # valid, so keep this format independent of proxy MIME sniffing.
+        headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        request = Request(provider_url, data=audio, headers=headers, method="POST")
+        payload = {"inputs": base64.b64encode(audio).decode("ascii")}
+        request = Request(
+            provider_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
         try:
             with urlopen(request, timeout=120) as response:
                 body = json.loads(response.read().decode())
