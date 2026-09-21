@@ -788,6 +788,7 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
         consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
     except RuntimeError as exc:
+        logger.exception("Patient voice transcription provider failed: %s", exc)
         raise HTTPException(status_code=503, detail="Voice transcription is currently unavailable") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Unable to persist voice transcript") from exc

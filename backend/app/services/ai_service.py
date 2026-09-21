@@ -1,8 +1,13 @@
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
 import os
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -84,8 +89,14 @@ class AIProvider:
             text = body.get("text") if isinstance(body, dict) else None
             if not text: raise RuntimeError("ASR provider returned no transcript")
             return str(text)
+        except HTTPError as exc:
+            # Keep the response body out of logs because it may contain
+            # provider diagnostics related to patient audio.
+            raise RuntimeError(f"ASR provider request failed (HTTP {exc.code})") from exc
         except Exception as exc:
-            raise RuntimeError("ASR provider request failed") from exc
+            raise RuntimeError(
+                f"ASR provider request failed ({type(exc).__name__})"
+            ) from exc
 
     def _hf_asr_url(self, model: str) -> str:
         return f"https://router.huggingface.co/hf-inference/models/{model}"
@@ -126,8 +137,11 @@ class AIProvider:
                          (self._hf_asr_url(self.SECONDARY_ASR_MODEL) if token else ""))
         if not primary_url or not secondary_url:
             raise RuntimeError("Two ASR providers are not configured")
-        # Run the independent transcription agents concurrently. This keeps
-        # recording review responsive while preserving separate model outputs.
+        # Run the independent transcription agents concurrently. A draft is
+        # still useful when one hosted provider is temporarily unavailable, so
+        # retain a successful result instead of discarding the recording.
+        primary_error: Exception | None = None
+        secondary_error: Exception | None = None
         with ThreadPoolExecutor(max_workers=2) as pool:
             primary_future = pool.submit(
                 self._transcribe_with, audio, filename, primary_url, self.ASR_MODEL
@@ -136,9 +150,38 @@ class AIProvider:
                 self._transcribe_with, audio, filename, secondary_url,
                 self.SECONDARY_ASR_MODEL
             )
-            primary = primary_future.result()
-            secondary = secondary_future.result()
-        final_text, conflicts = self.reconcile_transcripts(primary, secondary)
+            try:
+                primary = primary_future.result()
+            except Exception as exc:
+                primary_error = exc
+                primary = ""
+            try:
+                secondary = secondary_future.result()
+            except Exception as exc:
+                secondary_error = exc
+                secondary = ""
+        if not primary and not secondary:
+            raise RuntimeError(
+                "All ASR providers failed "
+                f"(primary: {primary_error}; secondary: {secondary_error})"
+            ) from (primary_error or secondary_error)
+        if not primary:
+            primary = secondary
+        if not secondary:
+            secondary = primary
+        conflicts: list[str] = []
+        if primary_error:
+            conflicts.append("Primary speech provider was unavailable; the secondary transcript is shown.")
+        if secondary_error:
+            conflicts.append("Secondary speech provider was unavailable; the primary transcript is shown.")
+        try:
+            final_text, reconciliation_conflicts = self.reconcile_transcripts(primary, secondary)
+            conflicts.extend(reconciliation_conflicts)
+        except RuntimeError:
+            # Reconciliation improves a draft but must never block delivery of
+            # an already successful speech-to-text result.
+            final_text = primary
+            conflicts.append("Transcript reconciliation is pending clinician review.")
         return TranscriptConsensus(primary=primary, secondary=secondary, final_text=final_text, conflicts=conflicts)
 
     def reconcile_transcripts(self, primary: str, secondary: str) -> tuple[str, list[str]]:
