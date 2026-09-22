@@ -3,6 +3,7 @@ from io import BytesIO
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -194,6 +195,29 @@ def _is_personal_health_question(message: str) -> bool:
         "lab result", "consultation",
     )
     return any(term in message.lower() for term in terms)
+
+
+def _is_healthcare_question(message: str) -> bool:
+    """Reject off-topic prompts locally, before any database or model call."""
+    lowered = message.lower()
+    words = set(re.findall(r"[a-z]+", lowered))
+    off_topic = {
+        "code", "coding", "python", "javascript", "programming", "software",
+        "politics", "political", "election", "modi", "population", "celebrity",
+        "movie", "song", "game", "cricket", "football", "weather",
+    }
+    if words.intersection(off_topic):
+        return False
+    healthcare_terms = (
+        "health", "medical", "care", "doctor", "hospital", "clinic", "patient",
+        "symptom", "pain", "fever", "cough", "cold", "infection", "medicine",
+        "medication", "drug", "prescription", "dose", "diagnosis", "treatment",
+        "therapy", "diet", "nutrition", "exercise", "fitness", "sleep", "anxiety",
+        "stress", "allergy", "asthma", "blood", "temperature", "height", "weight",
+        "vital", "report", "lab", "scan", "mri", "x-ray", "xray", "ecg",
+        "pregnan", "vaccin",
+    )
+    return any(term in lowered for term in healthcare_terms)
 
 
 def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
@@ -396,14 +420,21 @@ def provision_patient(payload: PatientProvisionRequest, claims: dict = Depends(c
 @router.post("/chat")
 def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
     """Answer general questions or a patient's own record question, never both by accident."""
-    client = db()
     role = claims.get("app_metadata", {}).get("role")
     if role != "patient":
         raise HTTPException(status_code=403, detail="Patient chat is not available for this role")
-    patient = get_current_patient(claims)
+    if not _is_healthcare_question(payload.message):
+        return {"data": {
+            "answer": ("Verity is designed for health, care, and your verified medical record. "
+                       "Please ask a medical or wellbeing question."),
+            "uses_personal_health_data": False,
+            "context_locked": True,
+        }}
     personal = _is_personal_health_question(payload.message)
     context: dict[str, Any] = {}
     if personal:
+        client = db()
+        patient = get_current_patient(claims)
         context = _chat_context(client, patient["id"])
         return {"data": {
             "answer": _safe_personal_record_answer(payload.message, context),
@@ -411,10 +442,9 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
             "context_locked": True,
         }}
     instructions = (
-        "You are Verity, a health-information assistant. Do not diagnose, prescribe, or present an AI answer as medical advice. "
-        "For personal-record questions, use ONLY the supplied patient record. If a fact is missing, state that it is not available; never infer it. "
-        "Never mention, compare, or disclose another person's data. For general questions, answer generally and advise urgent care for emergency symptoms. "
-        "Keep the answer clear and concise.\n"
+        "You are Verity, a health-information assistant. Answer only the health question. "
+        "Do not diagnose or prescribe. Give urgent-care guidance for emergency symptoms. "
+        "Use plain language and no more than 120 words.\n"
     )
     prompt = instructions + ("MODE: PATIENT-RECORD\nAUTHORIZED RECORD:\n" + json.dumps(context, default=str) if personal else "MODE: GENERAL - no patient record was provided.") + "\n\nQUESTION:\n" + payload.message
     try:

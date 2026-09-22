@@ -267,7 +267,9 @@ class AIProvider:
                 model=self.LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=700,
+                # Chat answers are intentionally brief.  Reducing completion
+                # length cuts hosted inference time as well as token usage.
+                max_tokens=260,
             )
             answer = response.choices[0].message.content
             if not isinstance(answer, str) or not answer.strip():
