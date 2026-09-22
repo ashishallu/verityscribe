@@ -189,12 +189,20 @@ def _chat_document_bucket(client: Client) -> str:
 
 def _is_personal_health_question(message: str) -> bool:
     terms = (
-        "my ", "me ", "i ", "mine", "medical record", "health record",
+        "my ", "mine", "medical record", "health record",
         "report", "prescription", "medicine", "medication", "diagnosis",
-        "allergy", "vital", "blood", "mri", "x-ray", "xray", "ecg",
+        "allergy", "allergies", "allergic", "vital", "blood", "mri", "x-ray", "xray", "ecg",
         "lab result", "consultation",
     )
     return any(term in message.lower() for term in terms)
+
+
+def _requires_allergy_screening(message: str) -> bool:
+    """Identify food-safety questions where an allergy must be checked first."""
+    lowered = message.lower()
+    intent = any(phrase in lowered for phrase in ("can i", "should i", "is it safe", "may i"))
+    food = any(word in lowered for word in ("eat", "food", "drink", "consume", "meal", "snack", "fry"))
+    return intent and food
 
 
 def _is_healthcare_question(message: str) -> bool:
@@ -208,16 +216,10 @@ def _is_healthcare_question(message: str) -> bool:
     }
     if words.intersection(off_topic):
         return False
-    healthcare_terms = (
-        "health", "medical", "care", "doctor", "hospital", "clinic", "patient",
-        "symptom", "pain", "fever", "cough", "cold", "infection", "medicine",
-        "medication", "drug", "prescription", "dose", "diagnosis", "treatment",
-        "therapy", "diet", "nutrition", "exercise", "fitness", "sleep", "anxiety",
-        "stress", "allergy", "asthma", "blood", "temperature", "height", "weight",
-        "vital", "report", "lab", "scan", "mri", "x-ray", "xray", "ecg",
-        "pregnan", "vaccin",
-    )
-    return any(term in lowered for term in healthcare_terms)
+    # Medication names and less common health terms cannot be listed
+    # exhaustively. Once obvious off-topic categories are excluded, allow the
+    # request through rather than wrongly blocking legitimate care questions.
+    return True
 
 
 def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
@@ -289,6 +291,42 @@ def _direct_patient_answer(question: str, context: dict[str, Any]) -> str | None
     return None
 
 
+def _recorded_allergens(context: dict[str, Any]) -> list[str]:
+    """Read only human-facing allergy values from this patient's own rows."""
+    labels: list[str] = []
+    for row in context.get("records", {}).get("allergies", []):
+        for key, value in row.items():
+            key = str(key).lower()
+            if value is None or key not in {
+                "allergen", "allergen_name", "allergy", "allergy_name",
+                "substance", "name", "description",
+            }:
+                continue
+            label = " ".join(str(value).split())
+            if label and label.lower() not in {item.lower() for item in labels}:
+                labels.append(label)
+    return labels
+
+
+def _allergy_safety_answer(question: str, context: dict[str, Any]) -> str | None:
+    """Give an immediate, deterministic warning for a recorded food allergy."""
+    labels = _recorded_allergens(context)
+    lowered = question.lower()
+    if any(word in lowered for word in ("allergy", "allergies", "allergic")):
+        return ("Your record lists these allergies: " + ", ".join(labels) + "."
+                if labels else "I do not have any allergies recorded in VerityScribe.")
+    if not _requires_allergy_screening(question):
+        return None
+    words = set(re.findall(r"[a-z]+", lowered))
+    for allergen in labels:
+        allergy_words = set(re.findall(r"[a-z]+", allergen.lower()))
+        if words.intersection(allergy_words):
+            return (f"Your VerityScribe record lists an allergy to {allergen}. "
+                    "Do not eat or drink it, including peanut fry; contact emergency services immediately "
+                    "if you have trouble breathing, facial swelling, or feel faint.")
+    return None
+
+
 def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
     """Answer record questions deterministically, or explicitly fail closed.
 
@@ -299,6 +337,10 @@ def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
     direct = _direct_patient_answer(question, context)
     if direct:
         return direct
+
+    allergy_answer = _allergy_safety_answer(question, context)
+    if allergy_answer:
+        return allergy_answer
 
     lowered = question.lower()
     records = context.get("records", {})
@@ -431,11 +473,20 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
             "context_locked": True,
         }}
     personal = _is_personal_health_question(payload.message)
+    allergy_screening = _requires_allergy_screening(payload.message)
     context: dict[str, Any] = {}
-    if personal:
+    if personal or allergy_screening:
         client = db()
         patient = get_current_patient(claims)
         context = _chat_context(client, patient["id"])
+        allergy_answer = _allergy_safety_answer(payload.message, context)
+        if allergy_answer:
+            return {"data": {
+                "answer": allergy_answer,
+                "uses_personal_health_data": True,
+                "context_locked": True,
+            }}
+    if personal:
         return {"data": {
             "answer": _safe_personal_record_answer(payload.message, context),
             "uses_personal_health_data": True,
