@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:async';
+import 'dart:math';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/entities.dart';
 import '../repositories/repositories.dart';
@@ -147,12 +149,26 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     try {
       final token = await _auth.accessToken();
       if (token == null) throw const ApiException('Your session has expired. Sign in again.');
-      final request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/chat/reports'))
-        ..headers['Authorization'] = 'Bearer $token'
-        ..fields['report_type'] = reportType
-        ..files.add(http.MultipartFile.fromBytes('document', bytes,
-            filename: filename, contentType: _reportMimeType(filename)));
-      final response = await request.send().timeout(const Duration(seconds: 90));
+      final uploadId = '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${Random.secure().nextInt(1 << 32).toRadixString(36)}';
+      Future<http.StreamedResponse> send() {
+        final request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/chat/reports'))
+          ..headers['Authorization'] = 'Bearer $token'
+          ..headers['X-Upload-Id'] = uploadId
+          ..fields['report_type'] = reportType
+          ..files.add(http.MultipartFile.fromBytes('document', bytes,
+              filename: filename, contentType: _reportMimeType(filename)));
+        return request.send().timeout(const Duration(seconds: 120));
+      }
+      late http.StreamedResponse response;
+      try {
+        response = await send();
+      } on TimeoutException catch (_) {
+        // Render can replace a web process during an in-flight vision request.
+        // Repeat once with the same idempotency key so the backend resumes it.
+        response = await send();
+      } on http.ClientException catch (_) {
+        response = await send();
+      }
       final text = await response.stream.bytesToString();
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(_uploadError(text), statusCode: response.statusCode);

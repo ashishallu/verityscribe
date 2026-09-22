@@ -5,9 +5,10 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile, status
 import httpx
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -518,6 +519,7 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
 async def upload_patient_chat_report(
     report_type: str = Form(...),
     document: UploadFile = File(...),
+    upload_id: str | None = Header(default=None, alias="X-Upload-Id"),
     patient: dict = Depends(get_current_patient),
 ):
     """Store an uploaded report privately and make its readable PDF text available only to its owner."""
@@ -538,11 +540,22 @@ async def upload_patient_chat_report(
     except Exception as exc:
         logger.exception("Unable to initialize private report Storage: %s", _storage_error_detail(exc))
         raise HTTPException(status_code=503, detail="Secure report storage could not be initialized") from exc
-    document_id = str(__import__("uuid").uuid4())
+    # A browser retry after a rolling deployment must resume the same private
+    # upload rather than create another object or duplicate chat evidence.
+    if upload_id and not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", upload_id):
+        raise HTTPException(status_code=422, detail="Invalid report upload identifier")
+    document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"report:{patient['id']}:{upload_id}")) if upload_id else str(uuid.uuid4())
+    existing = client.table("medical_documents").select("*").eq("id", document_id).eq(
+        "patient_id", patient["id"]
+    ).maybe_single().execute().data
+    if existing:
+        return {"data": {"document": existing, "report_type": normalized_type,
+                         "text_available": True,
+                         "message": "Your report was already saved privately and is available to Verity."}}
     suffix = (document.filename or "report").replace("/", "_").replace("\\", "_")
     path = f"{patient['id']}/{document_id}-{suffix}"
     try:
-        client.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": "false"})
+        client.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": "true"})
     except Exception as exc:
         logger.exception("Private report file upload failed: %s", _storage_error_detail(exc))
         raise HTTPException(status_code=503, detail="Secure report file upload is currently unavailable") from exc
@@ -578,14 +591,18 @@ async def upload_patient_chat_report(
             detail="Private report image processing is currently unavailable",
         ) from exc
     try:
-        record = client.table("medical_documents").insert({
+        record = client.table("medical_documents").upsert({
             "id": document_id, "patient_id": patient["id"], "bucket_path": path,
             "document_type": normalized_type,
         }).execute().data[0]
         if extracted:
-            client.table("patient_embeddings").insert({
-                "patient_id": patient["id"], "source_document_id": document_id, "content": extracted,
-            }).execute()
+            embedding = client.table("patient_embeddings").select("id").eq(
+                "source_document_id", document_id
+            ).limit(1).execute().data or []
+            if not embedding:
+                client.table("patient_embeddings").insert({
+                    "patient_id": patient["id"], "source_document_id": document_id, "content": extracted,
+                }).execute()
     except Exception as exc:
         try:
             client.storage.from_(bucket).remove([path])
