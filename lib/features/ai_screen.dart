@@ -1,6 +1,7 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/services/api_service.dart';
 import '../providers/clinic_provider.dart';
@@ -236,7 +237,16 @@ class _MessageBubble extends StatelessWidget {
           boxShadow: const [BoxShadow(color: Color(0x120B1E49), blurRadius: 16, offset: Offset(0, 6))],
         ), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           if (message.attachment != null) Padding(padding: const EdgeInsets.only(bottom: 6), child: Row(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.attach_file_rounded, size: 16, color: isUser ? Colors.white : AppTheme.blue), const SizedBox(width: 3), Text(message.attachment!, style: TextStyle(fontWeight: FontWeight.w800, color: isUser ? Colors.white : AppTheme.blue))])),
-          Text(message.text, style: TextStyle(color: isUser ? Colors.white : scheme.onSurface, height: 1.5, fontSize: 15)), const SizedBox(height: 7), Text('${message.sentAt.hour.toString().padLeft(2, '0')}:${message.sentAt.minute.toString().padLeft(2, '0')}', style: TextStyle(fontSize: 10, color: isUser ? Colors.white70 : AppTheme.muted)),
+          Text(message.text, style: TextStyle(color: isUser ? Colors.white : scheme.onSurface, height: 1.5, fontSize: 15)),
+          if (message.action == 'book_appointment') Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: FilledButton.icon(
+              onPressed: () => context.go('/book-appointment'),
+              icon: const Icon(Icons.calendar_month_rounded),
+              label: const Text('Book appointment'),
+            ),
+          ),
+          const SizedBox(height: 7), Text('${message.sentAt.hour.toString().padLeft(2, '0')}:${message.sentAt.minute.toString().padLeft(2, '0')}', style: TextStyle(fontSize: 10, color: isUser ? Colors.white70 : AppTheme.muted)),
         ]))),
       ]),
     ));

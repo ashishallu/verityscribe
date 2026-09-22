@@ -14,11 +14,13 @@ class ChatMessage {
   final bool isUser;
   final DateTime sentAt;
   final String? attachment;
+  final String? action;
   const ChatMessage(
       {required this.text,
       required this.isUser,
       required this.sentAt,
-      this.attachment});
+      this.attachment,
+      this.action});
 }
 
 class ClinicState {
@@ -117,12 +119,14 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           ? Map<String, dynamic>.from(body['data'] as Map)
           : body;
       final answer = (data['answer'] ?? data['message'] ?? '').toString();
+      final action = data['action']?.toString();
       if (answer.isEmpty) {
         throw const ApiException('The care assistant returned no response.');
       }
       state = state.copyWith(messages: [
         ...updated,
-        ChatMessage(text: answer, isUser: false, sentAt: DateTime.now())
+        ChatMessage(
+            text: answer, isUser: false, sentAt: DateTime.now(), action: action)
       ], chatLoading: false);
     } catch (e) {
       state = state.copyWith(chatLoading: false, chatError: e);

@@ -38,6 +38,26 @@ class AIProvider:
     # the hosted default.
     SECONDARY_ASR_MODEL = "openai/whisper-large-v3"
     LLM_MODEL = "Qwen/Qwen3-8B"
+    DOCUMENT_OCR_MODEL = "microsoft/trocr-base-handwritten"
+
+    def extract_document_text(self, image: bytes) -> str:
+        """Extract text from a patient report image using HF server-side only."""
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if not token:
+            raise RuntimeError("Hugging Face token is not configured")
+        model = os.getenv("HF_DOCUMENT_OCR_MODEL", self.DOCUMENT_OCR_MODEL)
+        try:
+            response = InferenceClient(
+                provider="hf-inference", api_key=token, timeout=60,
+            ).image_to_text(image, model=model)
+            text = getattr(response, "generated_text", None)
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("Document model returned no readable text")
+            return text.strip()[:30000]
+        except Exception as exc:
+            raise RuntimeError(
+                f"Hugging Face document extraction failed ({type(exc).__name__})"
+            ) from exc
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():

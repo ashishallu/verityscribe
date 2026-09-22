@@ -215,6 +215,14 @@ def _is_healthcare_question(message: str) -> bool:
     return True
 
 
+def _is_appointment_booking_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in (
+        "book an appointment", "book appointment", "schedule an appointment",
+        "schedule appointment", "make an appointment", "see a doctor",
+    ))
+
+
 def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
     """Fetch only the authenticated patient's bounded, relevant record data."""
     reports = _patient_table_rows(client, "reports", patient_id)
@@ -458,6 +466,13 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
     role = claims.get("app_metadata", {}).get("role")
     if role != "patient":
         raise HTTPException(status_code=403, detail="Patient chat is not available for this role")
+    if _is_appointment_booking_request(payload.message):
+        return {"data": {
+            "answer": "I can help you book an appointment. Choose a hospital, department, doctor, date, and time in the secure booking flow.",
+            "action": "book_appointment",
+            "uses_personal_health_data": False,
+            "context_locked": True,
+        }}
     if not _is_healthcare_question(payload.message):
         return {"data": {
             "answer": ("Verity is designed for health, care, and your verified medical record. "
@@ -517,9 +532,6 @@ async def upload_patient_chat_report(
     content_type = _report_content_type(document, content)
     if not content_type:
         raise HTTPException(status_code=422, detail="Upload a valid PDF, PNG, JPEG, or WEBP report")
-    extracted = _extract_pdf_text(content) if content_type == "application/pdf" else ""
-    if content_type == "application/pdf" and not extracted:
-        raise HTTPException(status_code=422, detail="This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report.")
     client = db()
     try:
         bucket = _chat_document_bucket(client)
@@ -534,6 +546,37 @@ async def upload_patient_chat_report(
     except Exception as exc:
         logger.exception("Private report file upload failed: %s", _storage_error_detail(exc))
         raise HTTPException(status_code=503, detail="Secure report file upload is currently unavailable") from exc
+    try:
+        if content_type == "application/pdf":
+            extracted = _extract_pdf_text(content)
+        else:
+            # The user explicitly requested Hugging Face processing of report
+            # images. The bytes remain server-side and are never exposed to
+            # the Flutter client or a public Storage URL.
+            extracted = ai_provider.extract_document_text(content)
+        if not extracted:
+            detail = (
+                "This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report."
+                if content_type == "application/pdf"
+                else "No readable text was found in this image"
+            )
+            raise HTTPException(status_code=422, detail=detail)
+    except HTTPException:
+        try:
+            client.storage.from_(bucket).remove([path])
+        except Exception:
+            pass
+        raise
+    except RuntimeError as exc:
+        try:
+            client.storage.from_(bucket).remove([path])
+        except Exception:
+            pass
+        logger.exception("Private report image extraction failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Private report image processing is currently unavailable",
+        ) from exc
     try:
         record = client.table("medical_documents").insert({
             "id": document_id, "patient_id": patient["id"], "bucket_path": path,
@@ -550,11 +593,7 @@ async def upload_patient_chat_report(
             pass
         logger.exception("Private report metadata save failed: %s", _storage_error_detail(exc))
         raise HTTPException(status_code=503, detail="Secure report metadata is currently unavailable") from exc
-    message = (
-        "Report saved privately. Verity can use the extracted text from this PDF."
-        if extracted else
-        "Image saved privately. Text extraction is not available for this image yet, so Verity will not infer clinical details from it."
-    )
+    message = "Report saved privately and processed. Ask Verity about its readable content."
     return {"data": {"document": record, "report_type": normalized_type,
                       "text_available": bool(extracted), "message": message}}
 
