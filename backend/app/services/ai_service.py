@@ -44,61 +44,47 @@ class AIProvider:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
             raise RuntimeError("Hugging Face token is not configured")
-        # Let Hugging Face select its currently hosted document-QA default
-        # unless an operator deliberately pins a compatible deployed model.
-        model = os.getenv("HF_DOCUMENT_QA_MODEL") or None
+        model = os.getenv("HF_DOCUMENT_VLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
         try:
-            # The generic image-to-text route does not consistently host OCR
-            # models on HF Inference. Document QA is explicitly supported by
-            # that provider and serializes images as JSON/base64 itself, so do
-            # not override its JSON Content-Type with the original image type.
+            # hf-inference no longer hosts the document-QA and BLIP models
+            # returned by its task defaults. Use Hugging Face's automatic
+            # provider routing with a warm vision-language model instead. The
+            # image is retained in memory and sent as a data URI only from the
+            # backend; no public Storage URL is ever created.
+            image_url = (
+                f"data:{content_type};base64,"
+                f"{base64.b64encode(image).decode('ascii')}"
+            )
             response = InferenceClient(
-                provider="hf-inference",
                 api_key=token,
                 timeout=60,
-            ).document_question_answering(
-                image,
-                question=(
-                    "What medicines, dosages, diagnoses, clinical findings, "
-                    "test results, and other readable details appear in this medical document?"
-                ),
+            ).chat_completion(
                 model=model,
-                top_k=10,
-                lang="en",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Transcribe only the readable text in this medical document. "
+                                "Include medicine names, dosages, instructions, diagnoses, and test values. "
+                                "Do not infer or add facts that are not visible."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                temperature=0,
+                max_tokens=700,
             )
-            answers = []
-            for item in response:
-                answer = getattr(item, "answer", None)
-                if isinstance(answer, str) and answer.strip() and answer.strip() not in answers:
-                    answers.append(answer.strip())
-            if not answers:
-                raise RuntimeError("Document model returned no readable text")
-            return "Extracted from uploaded document: " + "; ".join(answers)[:30000]
+            text = response.choices[0].message.content
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("Vision model returned no readable text")
+            return "Extracted from uploaded document: " + text.strip()[:30000]
         except Exception as exc:
-            logger.warning(
-                "Hugging Face document-QA failed (%s); trying image-to-text fallback",
-                type(exc).__name__,
-            )
-            try:
-                # A provider can temporarily omit its document-QA model. The
-                # hosted image-to-text task remains a safe CV fallback: it
-                # keeps bytes server-side and returns a bounded description
-                # rather than failing the patient's private upload outright.
-                fallback = InferenceClient(
-                    provider="hf-inference",
-                    api_key=token,
-                    timeout=60,
-                    headers={"Content-Type": content_type},
-                ).image_to_text(image)
-                text = getattr(fallback, "generated_text", None)
-                if not isinstance(text, str) or not text.strip():
-                    raise RuntimeError("Fallback model returned no readable output")
-                return "Extracted from uploaded document image: " + text.strip()[:30000]
-            except Exception as fallback_exc:
-                raise RuntimeError(
-                    "Hugging Face document extraction failed "
-                    f"(document QA: {type(exc).__name__}; image fallback: {type(fallback_exc).__name__})"
-                ) from fallback_exc
+            raise RuntimeError(
+                f"Hugging Face vision document extraction failed ({type(exc).__name__})"
+            ) from exc
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():
