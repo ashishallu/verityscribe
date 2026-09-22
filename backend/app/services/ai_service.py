@@ -40,15 +40,21 @@ class AIProvider:
     LLM_MODEL = "Qwen/Qwen3-8B"
     DOCUMENT_OCR_MODEL = "microsoft/trocr-base-handwritten"
 
-    def extract_document_text(self, image: bytes) -> str:
+    def extract_document_text(self, image: bytes, content_type: str) -> str:
         """Extract text from a patient report image using HF server-side only."""
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
             raise RuntimeError("Hugging Face token is not configured")
         model = os.getenv("HF_DOCUMENT_OCR_MODEL", self.DOCUMENT_OCR_MODEL)
         try:
+            # The SDK cannot infer a MIME type from raw bytes. The routed
+            # image-to-text endpoint rejects a missing Content-Type, so pass
+            # through the MIME type verified by the upload endpoint.
             response = InferenceClient(
-                provider="hf-inference", api_key=token, timeout=60,
+                provider="hf-inference",
+                api_key=token,
+                timeout=60,
+                headers={"Content-Type": content_type},
             ).image_to_text(image, model=model)
             text = getattr(response, "generated_text", None)
             if not isinstance(text, str) or not text.strip():

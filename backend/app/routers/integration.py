@@ -553,7 +553,7 @@ async def upload_patient_chat_report(
             # The user explicitly requested Hugging Face processing of report
             # images. The bytes remain server-side and are never exposed to
             # the Flutter client or a public Storage URL.
-            extracted = ai_provider.extract_document_text(content)
+            extracted = ai_provider.extract_document_text(content, content_type)
         if not extracted:
             detail = (
                 "This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report."
