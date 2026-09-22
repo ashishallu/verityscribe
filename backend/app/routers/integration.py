@@ -163,27 +163,20 @@ def _voice_bucket(client: Client) -> str:
 
 
 def _chat_document_bucket(client: Client) -> str:
-    """Return the private report bucket; clients never receive direct access."""
-    bucket = os.getenv("CHAT_REPORT_STORAGE_BUCKET", "patient-report-uploads")
+    """Return a private report bucket without mutating it during each upload."""
+    # The original bucket can have a manually-created MIME configuration which
+    # rejects valid browser uploads.  A fresh private bucket avoids that legacy
+    # setting. Server-side validation below remains the size/type guard.
+    bucket = os.getenv("CHAT_REPORT_STORAGE_BUCKET", "patient-report-uploads-v2")
     try:
         client.storage.get_bucket(bucket)
     except Exception:
         try:
-            client.storage.create_bucket(
-                bucket,
-                options={"public": False, "file_size_limit": 10 * 1024 * 1024,
-                         "allowed_mime_types": sorted(CHAT_UPLOAD_TYPES)},
-            )
+            client.storage.create_bucket(bucket, options={"public": False})
         except Exception:
+            # A concurrent request may create it first. Verify that before
+            # treating the initialization as unavailable.
             client.storage.get_bucket(bucket)
-    # A bucket may already exist from a prior deploy with a different MIME
-    # allowlist. Keep it private while accepting the same safe types as the
-    # patient upload endpoint.
-    client.storage.update_bucket(
-        bucket,
-        options={"public": False, "file_size_limit": 10 * 1024 * 1024,
-                 "allowed_mime_types": sorted(CHAT_UPLOAD_TYPES)},
-    )
     return bucket
 
 
@@ -528,12 +521,20 @@ async def upload_patient_chat_report(
     if content_type == "application/pdf" and not extracted:
         raise HTTPException(status_code=422, detail="This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report.")
     client = db()
-    bucket = _chat_document_bucket(client)
+    try:
+        bucket = _chat_document_bucket(client)
+    except Exception as exc:
+        logger.exception("Unable to initialize private report Storage: %s", _storage_error_detail(exc))
+        raise HTTPException(status_code=503, detail="Secure report storage could not be initialized") from exc
     document_id = str(__import__("uuid").uuid4())
     suffix = (document.filename or "report").replace("/", "_").replace("\\", "_")
     path = f"{patient['id']}/{document_id}-{suffix}"
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": "false"})
+    except Exception as exc:
+        logger.exception("Private report file upload failed: %s", _storage_error_detail(exc))
+        raise HTTPException(status_code=503, detail="Secure report file upload is currently unavailable") from exc
+    try:
         record = client.table("medical_documents").insert({
             "id": document_id, "patient_id": patient["id"], "bucket_path": path,
             "document_type": normalized_type,
@@ -547,8 +548,8 @@ async def upload_patient_chat_report(
             client.storage.from_(bucket).remove([path])
         except Exception:
             pass
-        logger.exception("Patient report upload failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=503, detail="Secure report upload is currently unavailable") from exc
+        logger.exception("Private report metadata save failed: %s", _storage_error_detail(exc))
+        raise HTTPException(status_code=503, detail="Secure report metadata is currently unavailable") from exc
     message = (
         "Report saved privately. Verity can use the extracted text from this PDF."
         if extracted else
