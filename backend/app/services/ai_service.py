@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -44,47 +45,59 @@ class AIProvider:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
             raise RuntimeError("Hugging Face token is not configured")
-        model = os.getenv("HF_DOCUMENT_VLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
-        try:
-            # hf-inference no longer hosts the document-QA and BLIP models
-            # returned by its task defaults. Use Hugging Face's automatic
-            # provider routing with a warm vision-language model instead. The
-            # image is retained in memory and sent as a data URI only from the
-            # backend; no public Storage URL is ever created.
-            image_url = (
-                f"data:{content_type};base64,"
-                f"{base64.b64encode(image).decode('ascii')}"
-            )
-            response = InferenceClient(
-                api_key=token,
-                timeout=60,
-            ).chat_completion(
-                model=model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Transcribe only the readable text in this medical document. "
-                                "Include medicine names, dosages, instructions, diagnoses, and test values. "
-                                "Do not infer or add facts that are not visible."
-                            ),
-                        },
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                }],
-                temperature=0,
-                max_tokens=700,
-            )
-            text = response.choices[0].message.content
-            if not isinstance(text, str) or not text.strip():
-                raise RuntimeError("Vision model returned no readable text")
-            return "Extracted from uploaded document: " + text.strip()[:30000]
-        except Exception as exc:
-            raise RuntimeError(
-                f"Hugging Face vision document extraction failed ({type(exc).__name__})"
-            ) from exc
+        preferred_model = os.getenv("HF_DOCUMENT_VLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+        # Separate models/providers prevent one saturated provider from making
+        # a patient's report impossible to process.
+        models = list(dict.fromkeys((preferred_model, "HuggingFaceTB/SmolVLM2-2.2B-Instruct")))
+        image_url = (
+            f"data:{content_type};base64,"
+            f"{base64.b64encode(image).decode('ascii')}"
+        )
+        last_error: Exception | None = None
+        for model in models:
+            for attempt in range(2):
+                try:
+                    # hf-inference no longer hosts the document-QA and BLIP
+                    # models returned by its task defaults. Use Hugging Face's
+                    # automatic provider routing with a vision-language model.
+                    response = InferenceClient(api_key=token, timeout=30).chat_completion(
+                        model=model,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Transcribe only the readable text in this medical document. "
+                                        "Include medicine names, dosages, instructions, diagnoses, and test values. "
+                                        "Do not infer or add facts that are not visible."
+                                    ),
+                                },
+                                {"type": "image_url", "image_url": {"url": image_url}},
+                            ],
+                        }],
+                        temperature=0,
+                        max_tokens=700,
+                    )
+                    text = response.choices[0].message.content
+                    if not isinstance(text, str) or not text.strip():
+                        raise RuntimeError("Vision model returned no readable text")
+                    return "Extracted from uploaded document: " + text.strip()[:30000]
+                except Exception as exc:
+                    last_error = exc
+                    message = str(exc).lower()
+                    # Retry only transient capacity or 5xx errors; an invalid
+                    # image/model must move on to the alternate model instead.
+                    if attempt == 0 and ("capacity" in message or "503" in message):
+                        logger.warning("Vision provider capacity is temporary; retrying without logging document data")
+                        time.sleep(2)
+                        continue
+                    break
+        error_message = str(last_error).lower()
+        reason = "capacity_exhausted" if ("capacity" in error_message or "503" in error_message) else type(last_error).__name__
+        raise RuntimeError(
+            f"Hugging Face vision document extraction failed ({reason})"
+        ) from last_error
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():

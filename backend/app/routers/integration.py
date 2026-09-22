@@ -586,6 +586,16 @@ async def upload_patient_chat_report(
             pass
         raise
     except RuntimeError as exc:
+        is_temporary_capacity_error = "capacity" in str(exc).lower() or "503" in str(exc).lower()
+        if is_temporary_capacity_error:
+            # Keep the object private and retain it for the idempotent retry.
+            # It has not been added to chat context until extraction succeeds.
+            logger.warning("Report vision provider is temporarily at capacity; retaining private upload for retry")
+            raise HTTPException(
+                status_code=503,
+                detail="Report processing is temporarily busy. Your private file was retained; retry shortly.",
+                headers={"Retry-After": "5"},
+            ) from exc
         try:
             client.storage.from_(bucket).remove([path])
         except Exception:
