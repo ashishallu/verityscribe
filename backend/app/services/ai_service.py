@@ -38,7 +38,7 @@ class AIProvider:
     # the hosted default.
     SECONDARY_ASR_MODEL = "openai/whisper-large-v3"
     LLM_MODEL = "Qwen/Qwen3-8B"
-    def extract_document_text(self, image: bytes) -> str:
+    def extract_document_text(self, image: bytes, content_type: str) -> str:
         """Extract patient-document evidence through Hugging Face server-side only."""
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
@@ -74,9 +74,30 @@ class AIProvider:
                 raise RuntimeError("Document model returned no readable text")
             return "Extracted from uploaded document: " + "; ".join(answers)[:30000]
         except Exception as exc:
-            raise RuntimeError(
-                f"Hugging Face document extraction failed ({type(exc).__name__})"
-            ) from exc
+            logger.warning(
+                "Hugging Face document-QA failed (%s); trying image-to-text fallback",
+                type(exc).__name__,
+            )
+            try:
+                # A provider can temporarily omit its document-QA model. The
+                # hosted image-to-text task remains a safe CV fallback: it
+                # keeps bytes server-side and returns a bounded description
+                # rather than failing the patient's private upload outright.
+                fallback = InferenceClient(
+                    provider="hf-inference",
+                    api_key=token,
+                    timeout=60,
+                    headers={"Content-Type": content_type},
+                ).image_to_text(image)
+                text = getattr(fallback, "generated_text", None)
+                if not isinstance(text, str) or not text.strip():
+                    raise RuntimeError("Fallback model returned no readable output")
+                return "Extracted from uploaded document image: " + text.strip()[:30000]
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    "Hugging Face document extraction failed "
+                    f"(document QA: {type(exc).__name__}; image fallback: {type(fallback_exc).__name__})"
+                ) from fallback_exc
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():
