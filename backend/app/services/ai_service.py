@@ -38,28 +38,41 @@ class AIProvider:
     # the hosted default.
     SECONDARY_ASR_MODEL = "openai/whisper-large-v3"
     LLM_MODEL = "Qwen/Qwen3-8B"
-    DOCUMENT_OCR_MODEL = "microsoft/trocr-base-handwritten"
-
-    def extract_document_text(self, image: bytes, content_type: str) -> str:
-        """Extract text from a patient report image using HF server-side only."""
+    def extract_document_text(self, image: bytes) -> str:
+        """Extract patient-document evidence through Hugging Face server-side only."""
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
             raise RuntimeError("Hugging Face token is not configured")
-        model = os.getenv("HF_DOCUMENT_OCR_MODEL", self.DOCUMENT_OCR_MODEL)
+        # Let Hugging Face select its currently hosted document-QA default
+        # unless an operator deliberately pins a compatible deployed model.
+        model = os.getenv("HF_DOCUMENT_QA_MODEL") or None
         try:
-            # The SDK cannot infer a MIME type from raw bytes. The routed
-            # image-to-text endpoint rejects a missing Content-Type, so pass
-            # through the MIME type verified by the upload endpoint.
+            # The generic image-to-text route does not consistently host OCR
+            # models on HF Inference. Document QA is explicitly supported by
+            # that provider and serializes images as JSON/base64 itself, so do
+            # not override its JSON Content-Type with the original image type.
             response = InferenceClient(
                 provider="hf-inference",
                 api_key=token,
                 timeout=60,
-                headers={"Content-Type": content_type},
-            ).image_to_text(image, model=model)
-            text = getattr(response, "generated_text", None)
-            if not isinstance(text, str) or not text.strip():
+            ).document_question_answering(
+                image,
+                question=(
+                    "What medicines, dosages, diagnoses, clinical findings, "
+                    "test results, and other readable details appear in this medical document?"
+                ),
+                model=model,
+                top_k=10,
+                lang="en",
+            )
+            answers = []
+            for item in response:
+                answer = getattr(item, "answer", None)
+                if isinstance(answer, str) and answer.strip() and answer.strip() not in answers:
+                    answers.append(answer.strip())
+            if not answers:
                 raise RuntimeError("Document model returned no readable text")
-            return text.strip()[:30000]
+            return "Extracted from uploaded document: " + "; ".join(answers)[:30000]
         except Exception as exc:
             raise RuntimeError(
                 f"Hugging Face document extraction failed ({type(exc).__name__})"
