@@ -545,9 +545,14 @@ async def upload_patient_chat_report(
     if upload_id and not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", upload_id):
         raise HTTPException(status_code=422, detail="Invalid report upload identifier")
     document_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"report:{patient['id']}:{upload_id}")) if upload_id else str(uuid.uuid4())
-    existing = client.table("medical_documents").select("*").eq("id", document_id).eq(
-        "patient_id", patient["id"]
-    ).maybe_single().execute().data
+    existing_result = client.table("medical_documents").select("*").eq(
+        "id", document_id
+    ).eq("patient_id", patient["id"]).limit(1).execute()
+    # supabase-py may return no response object for a zero-row single query
+    # depending on the deployed PostgREST version. Treat it as no prior retry,
+    # never as an application error.
+    existing_rows = getattr(existing_result, "data", None) or []
+    existing = existing_rows[0] if existing_rows else None
     if existing:
         return {"data": {"document": existing, "report_type": normalized_type,
                          "text_available": True,
@@ -591,14 +596,22 @@ async def upload_patient_chat_report(
             detail="Private report image processing is currently unavailable",
         ) from exc
     try:
-        record = client.table("medical_documents").upsert({
+        record_result = client.table("medical_documents").upsert({
             "id": document_id, "patient_id": patient["id"], "bucket_path": path,
             "document_type": normalized_type,
-        }).execute().data[0]
+        }).execute()
+        record_rows = getattr(record_result, "data", None) or []
+        record = record_rows[0] if record_rows else {
+            "id": document_id,
+            "patient_id": patient["id"],
+            "bucket_path": path,
+            "document_type": normalized_type,
+        }
         if extracted:
-            embedding = client.table("patient_embeddings").select("id").eq(
+            embedding_result = client.table("patient_embeddings").select("id").eq(
                 "source_document_id", document_id
-            ).limit(1).execute().data or []
+            ).limit(1).execute()
+            embedding = getattr(embedding_result, "data", None) or []
             if not embedding:
                 client.table("patient_embeddings").insert({
                     "patient_id": patient["id"], "source_document_id": document_id, "content": extracted,
