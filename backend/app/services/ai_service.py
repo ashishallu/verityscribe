@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import re
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -275,9 +276,11 @@ class AIProvider:
             conflicts.extend(reconciliation_conflicts)
         except RuntimeError:
             # Reconciliation improves a draft but must never block delivery of
-            # an already successful speech-to-text result.
-            final_text = primary
-            conflicts.append("Transcript reconciliation is pending clinician review.")
+            # an already successful speech-to-text result. Crucially, never
+            # default to the primary provider: compare both drafts and retain
+            # the more complete, lower-noise one until clinician review.
+            final_text = self._best_transcript(primary, secondary)
+            conflicts.append("Automated reconciliation was unavailable; the clearer ASR draft was retained for clinician review.")
         return TranscriptConsensus(primary=primary, secondary=secondary, final_text=final_text, conflicts=conflicts)
 
     def reconcile_transcripts(self, primary: str, secondary: str) -> tuple[str, list[str]]:
@@ -289,7 +292,9 @@ class AIProvider:
             raise RuntimeError("Transcript reconciler is not configured")
         prompt = ("Compare two automatic speech-recognition transcripts from the same clinical conversation. "
                   "Return only JSON: {\"final_transcript\": string, \"conflicts\": [string]}. "
-                  "Do not invent clinical facts. Retain uncertainty where audio is unclear.\n\n"
+                  "Create one clean transcript from the words supported by either draft; remove repeated filler, "
+                  "false starts, and obvious noise. Do not invent clinical facts, medicines, measurements, or diagnoses. "
+                  "If drafts disagree on a clinical fact, omit it from final_transcript and list the disagreement in conflicts.\n\n"
                   f"TRANSCRIPT A:\n{primary}\n\nTRANSCRIPT B:\n{secondary}")
         if provider_url:
             payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
@@ -299,7 +304,10 @@ class AIProvider:
         else:
             generated = self._hf_chat(prompt, token)
         try:
-            result = json.loads(generated.strip().removeprefix("```json").removesuffix("```"))
+            match = re.search(r"\{.*\}", generated, flags=re.DOTALL)
+            if not match:
+                raise ValueError("no JSON object")
+            result = json.loads(match.group(0))
             final_text = str(result["final_transcript"]).strip()
             conflicts = [str(item) for item in result.get("conflicts", [])]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -307,6 +315,21 @@ class AIProvider:
         if not final_text:
             raise RuntimeError("Transcript reconciler returned no transcript")
         return final_text, conflicts
+
+    @staticmethod
+    def _best_transcript(primary: str, secondary: str) -> str:
+        """Deterministically select the cleaner ASR draft if LLM reconciliation fails."""
+        filler = {"um", "uh", "erm", "hmm", "ah", "like", "you", "know"}
+
+        def score(text: str) -> tuple[int, int, int]:
+            words = re.findall(r"[a-z0-9']+", text.lower())
+            meaningful = [word for word in words if word not in filler]
+            # More unique content and fewer filler tokens are preferable. The
+            # final length component makes ties deterministic without treating
+            # the first provider as inherently better.
+            return (len(set(meaningful)), -sum(word in filler for word in words), len(meaningful))
+
+        return max((primary.strip(), secondary.strip()), key=score)
 
     def transcribe(self, audio: bytes, filename: str = "recording.wav") -> str:
         """Backward-compatible single-result access for existing callers."""

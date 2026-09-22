@@ -1,4 +1,5 @@
 import logging
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
@@ -23,7 +24,10 @@ app.add_middleware(
 )
 
 @app.get("/health")
-async def health() -> dict: return {"status": "ok", "environment": config.environment}
+async def health() -> dict:
+    """Expose a non-sensitive release marker so deploy verification is exact."""
+    release = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "local"
+    return {"status": "ok", "environment": config.environment, "release": release[:12]}
 
 app.include_router(integration_router, prefix=config.api_prefix)
 for name in ("patients", "doctors", "prescriptions", "reports", "insurance", "analytics", "admin", "voice"):
