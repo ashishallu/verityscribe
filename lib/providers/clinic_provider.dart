@@ -140,12 +140,16 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     required String filename,
     required List<int> bytes,
   }) async {
+    // Do not submit the same selected file twice while its first submission
+    // is still in progress.  This prevents duplicate attachment bubbles and
+    // duplicate processing requests.
+    if (state.chatLoading) return;
+
     final now = DateTime.now();
     final label = 'Uploaded $filename';
-    final updated = [...state.messages,
-      ChatMessage(text: label, isUser: true, sentAt: now, attachment: reportType)];
+    final existingMessages = state.messages;
     state = state.copyWith(
-        messages: updated, chatLoading: true, clearChatError: true);
+        chatLoading: true, clearChatError: true);
     try {
       final token = await _auth.accessToken();
       if (token == null) throw const ApiException('Your session has expired. Sign in again.');
@@ -160,16 +164,30 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
         return request.send().timeout(const Duration(seconds: 120));
       }
       late http.StreamedResponse response;
-      try {
-        response = await send();
-      } on TimeoutException catch (_) {
-        // Render can replace a web process during an in-flight vision request.
-        // Repeat once with the same idempotency key so the backend resumes it.
-        response = await send();
-      } on http.ClientException catch (_) {
-        response = await send();
+      var text = '';
+      for (var attempt = 0; attempt < 2; attempt++) {
+        try {
+          response = await send();
+          text = await response.stream.bytesToString();
+          if (response.statusCode != 503 || attempt == 1) break;
+
+          // A vision model may be briefly full.  The backend returns
+          // Retry-After when that is the case; resend a fresh multipart body
+          // with the same idempotency key after the suggested short pause.
+          final retryAfter = int.tryParse(response.headers['retry-after'] ?? '');
+          final retrySeconds = (retryAfter ?? 3).clamp(1, 10).toInt();
+          await Future<void>.delayed(
+            Duration(seconds: retrySeconds),
+          );
+        } on TimeoutException {
+          if (attempt == 1) rethrow;
+          await Future<void>.delayed(const Duration(seconds: 1));
+        } on http.ClientException {
+          if (attempt == 1) rethrow;
+          await Future<void>.delayed(const Duration(seconds: 1));
+        }
       }
-      final text = await response.stream.bytesToString();
+
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(_uploadError(text), statusCode: response.statusCode);
       }
@@ -180,9 +198,16 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       final confirmation = (data['message'] ??
               'Your report was saved privately.')
           .toString();
-      state = state.copyWith(messages: [...updated, ChatMessage(
-        text: confirmation,
-        isUser: false, sentAt: DateTime.now())], chatLoading: false);
+      state = state.copyWith(messages: [
+        ...existingMessages,
+        ChatMessage(
+          text: label,
+          isUser: true,
+          sentAt: now,
+          attachment: reportType,
+        ),
+        ChatMessage(text: confirmation, isUser: false, sentAt: DateTime.now()),
+      ], chatLoading: false);
     } catch (error) {
       state = state.copyWith(chatLoading: false, chatError: error);
     }

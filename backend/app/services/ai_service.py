@@ -45,15 +45,18 @@ class AIProvider:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
             raise RuntimeError("Hugging Face token is not configured")
-        preferred_model = os.getenv("HF_DOCUMENT_VLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
-        # Separate models/providers prevent one saturated provider from making
-        # a patient's report impossible to process.
-        models = list(dict.fromkeys((preferred_model, "HuggingFaceTB/SmolVLM2-2.2B-Instruct")))
+        preferred_model = os.getenv("HF_DOCUMENT_VLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
+        # Use models listed for HF Inference Providers' VLM chat task. SmolVLM
+        # is not consistently exposed by the router; a rejected fallback must
+        # never hide an earlier capacity error from the upload retry handler.
+        fallback_model = os.getenv("HF_DOCUMENT_VLM_FALLBACK_MODEL", "zai-org/GLM-4.5V")
+        models = list(dict.fromkeys((preferred_model, fallback_model)))
         image_url = (
             f"data:{content_type};base64,"
             f"{base64.b64encode(image).decode('ascii')}"
         )
         last_error: Exception | None = None
+        capacity_error: Exception | None = None
         for model in models:
             for attempt in range(2):
                 try:
@@ -86,18 +89,25 @@ class AIProvider:
                 except Exception as exc:
                     last_error = exc
                     message = str(exc).lower()
+                    if any(marker in message for marker in ("capacity", "503", "429", "temporarily unavailable")):
+                        capacity_error = exc
                     # Retry only transient capacity or 5xx errors; an invalid
                     # image/model must move on to the alternate model instead.
-                    if attempt == 0 and ("capacity" in message or "503" in message):
+                    if attempt == 0 and capacity_error is exc:
                         logger.warning("Vision provider capacity is temporary; retrying without logging document data")
                         time.sleep(2)
                         continue
                     break
-        error_message = str(last_error).lower()
-        reason = "capacity_exhausted" if ("capacity" in error_message or "503" in error_message) else type(last_error).__name__
+        # Preserve transient status across provider/model fallbacks. If Qwen
+        # reports capacity and the second model is unsupported, the upload is
+        # still retryable; returning the last exception would make the router
+        # delete the securely stored file and report a permanent failure.
+        final_error = capacity_error or last_error
+        error_message = str(final_error).lower()
+        reason = "capacity_exhausted" if capacity_error else type(final_error).__name__
         raise RuntimeError(
             f"Hugging Face vision document extraction failed ({reason})"
-        ) from last_error
+        ) from final_error
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():

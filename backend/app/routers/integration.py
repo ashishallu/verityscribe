@@ -386,6 +386,38 @@ def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
         # a patient's CBC value.
         return "I do not have a structured blood-count result in your VerityScribe record."
 
+    if any(word in lowered for word in (
+        "prescription", "prescribed", "medicine", "medication", "dosage", "dose", "tablet", "capsule"
+    )):
+        # Return the patient's own extracted source text, never a generated
+        # interpretation of drug names or handwriting. The upload path labels
+        # image OCR and the UI advises verification before acting on it.
+        medication_terms = (
+            "prescription", "prescribed", "medicine", "medication", "dosage",
+            "dose", "tablet", "capsule", "take ", " mg", " ml", "daily",
+        )
+        extracted_reports = [
+            " ".join(str(document.get("content", "")).split())
+            for document in context.get("uploaded_report_text", [])
+            if any(term in str(document.get("content", "")).lower() for term in medication_terms)
+        ]
+        if extracted_reports:
+            source_text = "\n\n".join(extracted_reports)[:2400]
+            return (
+                "This is the text extracted from your uploaded medical document, "
+                "not a verified prescription:\n" + source_text +
+                "\n\nAutomated reading can misread handwriting, medicine names, or doses. "
+                "Please confirm every medicine and dose with your doctor or pharmacist before taking it."
+            )
+        prescription_rows = records.get("prescriptions", [])
+        if prescription_rows:
+            return (
+                "Your recorded prescription details are:\n" +
+                json.dumps(prescription_rows[:8], default=str)[:2400] +
+                "\nPlease confirm medication instructions with your clinician or pharmacist."
+            )
+        return "I do not have readable prescription details in your VerityScribe record. Upload a clear image or PDF, or ask your pharmacist."
+
     if "asthma" in lowered:
         asthma_rows = _personal_evidence(question, context)
         if asthma_rows:
@@ -633,7 +665,13 @@ async def upload_patient_chat_report(
             pass
         logger.exception("Private report metadata save failed: %s", _storage_error_detail(exc))
         raise HTTPException(status_code=503, detail="Secure report metadata is currently unavailable") from exc
-    message = "Report saved privately and processed. Ask Verity about its readable content."
+    if content_type == "application/pdf":
+        message = "Report saved privately. Extracted text:\n" + extracted[:1800]
+    else:
+        message = (
+            "Report saved privately. Text read from the image (verify medicine names and doses; "
+            "handwriting recognition can be inaccurate):\n" + extracted[:1800]
+        )
     return {"data": {"document": record, "report_type": normalized_type,
                       "text_available": bool(extracted), "message": message}}
 

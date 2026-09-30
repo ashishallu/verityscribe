@@ -40,6 +40,7 @@ class _AiScreenState extends ConsumerState<AiScreen> {
   }
 
   Future<void> _pickReport(String reportType) async {
+    if (ref.read(clinicProvider).chatLoading) return;
     final selected = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: const ['pdf', 'png', 'jpg', 'jpeg', 'webp'],
