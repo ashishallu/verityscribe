@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/entities.dart';
 import '../repositories/repositories.dart';
@@ -148,14 +149,22 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     final now = DateTime.now();
     final label = 'Uploaded $filename';
     final existingMessages = state.messages;
-    state = state.copyWith(
-        chatLoading: true, clearChatError: true);
+    var uploadStage = 'reading your session';
+    state = state.copyWith(chatLoading: true, clearChatError: true);
     try {
       final token = await _auth.accessToken();
-      if (token == null) throw const ApiException('Your session has expired. Sign in again.');
-      final uploadId = '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${Random.secure().nextInt(1 << 32).toRadixString(36)}';
+      if (token == null) {
+        throw const ApiException('Your session has expired. Sign in again.');
+      }
+      uploadStage = 'preparing the secure upload';
+      // Avoid `1 << 32` here: the Dart-to-JavaScript web compiler can lower
+      // that bit shift to zero, causing Random.nextInt(0) to throw RangeError.
+      final uploadId =
+          '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${Random.secure().nextInt(0x7fffffff).toRadixString(36)}';
       Future<http.StreamedResponse> send() {
-        final request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/chat/reports'))
+        uploadStage = 'building the multipart request';
+        final request = http.MultipartRequest(
+            'POST', Uri.parse('$apiBaseUrl/chat/reports'))
           ..headers['Authorization'] = 'Bearer $token'
           ..headers['X-Upload-Id'] = uploadId
           ..fields['report_type'] = reportType
@@ -166,7 +175,9 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       // The API already performs model fallback. Do not send the full image a
       // second time after a model-capacity response or browser network error:
       // that adds latency and cannot make an unreachable/CORS-blocked API work.
+      uploadStage = 'sending the report to the API';
       final response = await send();
+      uploadStage = 'reading the API response';
       final text = await response.stream.bytesToString();
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -211,11 +222,14 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           'The report service returned an unreadable response. Please retry.',
         ),
       );
-    } catch (error) {
+    } catch (error, stackTrace) {
+      debugPrint(
+          'Report upload failed while $uploadStage (${error.runtimeType}): $error');
+      debugPrintStack(stackTrace: stackTrace);
       state = state.copyWith(
         chatLoading: false,
         chatError: ApiException(
-          'Report upload failed (${error.runtimeType}). Please retry; if it repeats, share this error with support.',
+          'Report upload failed while $uploadStage (${error.runtimeType}). Check the browser console for diagnostic details.',
         ),
       );
     }

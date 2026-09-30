@@ -46,12 +46,26 @@ class _AiScreenState extends ConsumerState<AiScreen> {
       allowedExtensions: const ['pdf', 'png', 'jpg', 'jpeg', 'webp'],
       withData: true,
     );
-    if (!mounted || selected == null || selected.files.single.bytes == null) return;
+    if (!mounted || selected == null) return;
+    if (selected.files.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No file was selected. Please choose a PDF or image.')),
+      );
+      return;
+    }
+    final file = selected.files.first;
+    final fileBytes = file.bytes;
+    if (fileBytes == null || fileBytes.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('The selected file could not be read. Please choose it again.')),
+      );
+      return;
+    }
     Navigator.of(context).pop();
     await ref.read(clinicProvider.notifier).uploadReport(
       reportType: reportType,
-      filename: selected.files.single.name,
-      bytes: selected.files.single.bytes!,
+      filename: file.name,
+      bytes: fileBytes,
     );
     _scrollToLatest();
     if (!mounted) return;
