@@ -163,30 +163,11 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
               filename: filename, contentType: _reportMimeType(filename)));
         return request.send().timeout(const Duration(seconds: 120));
       }
-      late http.StreamedResponse response;
-      var text = '';
-      for (var attempt = 0; attempt < 2; attempt++) {
-        try {
-          response = await send();
-          text = await response.stream.bytesToString();
-          if (response.statusCode != 503 || attempt == 1) break;
-
-          // A vision model may be briefly full.  The backend returns
-          // Retry-After when that is the case; resend a fresh multipart body
-          // with the same idempotency key after the suggested short pause.
-          final retryAfter = int.tryParse(response.headers['retry-after'] ?? '');
-          final retrySeconds = (retryAfter ?? 3).clamp(1, 10).toInt();
-          await Future<void>.delayed(
-            Duration(seconds: retrySeconds),
-          );
-        } on TimeoutException {
-          if (attempt == 1) rethrow;
-          await Future<void>.delayed(const Duration(seconds: 1));
-        } on http.ClientException {
-          if (attempt == 1) rethrow;
-          await Future<void>.delayed(const Duration(seconds: 1));
-        }
-      }
+      // The API already performs model fallback. Do not send the full image a
+      // second time after a model-capacity response or browser network error:
+      // that adds latency and cannot make an unreachable/CORS-blocked API work.
+      final response = await send();
+      final text = await response.stream.bytesToString();
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(_uploadError(text), statusCode: response.statusCode);
@@ -208,8 +189,35 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
         ),
         ChatMessage(text: confirmation, isUser: false, sentAt: DateTime.now()),
       ], chatLoading: false);
+    } on TimeoutException {
+      state = state.copyWith(
+        chatLoading: false,
+        chatError: const ApiException(
+          'Report processing timed out. The file may be saved privately; retry after checking your connection.',
+        ),
+      );
+    } on http.ClientException catch (error) {
+      final host = Uri.tryParse(apiBaseUrl)?.host ?? 'the configured API';
+      state = state.copyWith(
+        chatLoading: false,
+        chatError: ApiException(
+          'Could not reach $host from this browser. Check the API URL and CORS settings, then retry. (${error.message})',
+        ),
+      );
+    } on FormatException {
+      state = state.copyWith(
+        chatLoading: false,
+        chatError: const ApiException(
+          'The report service returned an unreadable response. Please retry.',
+        ),
+      );
     } catch (error) {
-      state = state.copyWith(chatLoading: false, chatError: error);
+      state = state.copyWith(
+        chatLoading: false,
+        chatError: ApiException(
+          'Report upload failed (${error.runtimeType}). Please retry; if it repeats, share this error with support.',
+        ),
+      );
     }
   }
 

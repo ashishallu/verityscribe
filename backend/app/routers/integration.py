@@ -555,6 +555,12 @@ async def upload_patient_chat_report(
     patient: dict = Depends(get_current_patient),
 ):
     """Store an uploaded report privately and make its readable PDF text available only to its owner."""
+    started_at = time.perf_counter()
+    diagnostic_id = (
+        upload_id
+        if upload_id and re.fullmatch(r"[A-Za-z0-9_-]{12,80}", upload_id)
+        else uuid.uuid4().hex
+    )
     normalized_type = report_type.strip().lower().replace(" ", "_")
     if normalized_type not in CHAT_REPORT_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported report type")
@@ -566,11 +572,22 @@ async def upload_patient_chat_report(
     content_type = _report_content_type(document, content)
     if not content_type:
         raise HTTPException(status_code=422, detail="Upload a valid PDF, PNG, JPEG, or WEBP report")
+    logger.info(
+        "Chat report upload received: request_id=%s type=%s bytes=%d content_type=%s",
+        diagnostic_id,
+        normalized_type,
+        len(content),
+        content_type,
+    )
     client = db()
     try:
         bucket = _chat_document_bucket(client)
     except Exception as exc:
-        logger.exception("Unable to initialize private report Storage: %s", _storage_error_detail(exc))
+        logger.exception(
+            "Unable to initialize private report Storage: request_id=%s error=%s",
+            diagnostic_id,
+            _storage_error_detail(exc),
+        )
         raise HTTPException(status_code=503, detail="Secure report storage could not be initialized") from exc
     # A browser retry after a rolling deployment must resume the same private
     # upload rather than create another object or duplicate chat evidence.
@@ -593,8 +610,13 @@ async def upload_patient_chat_report(
     path = f"{patient['id']}/{document_id}-{suffix}"
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": "true"})
+        logger.info("Chat report stored privately: request_id=%s", diagnostic_id)
     except Exception as exc:
-        logger.exception("Private report file upload failed: %s", _storage_error_detail(exc))
+        logger.exception(
+            "Private report file upload failed: request_id=%s error=%s",
+            diagnostic_id,
+            _storage_error_detail(exc),
+        )
         raise HTTPException(status_code=503, detail="Secure report file upload is currently unavailable") from exc
     try:
         if content_type == "application/pdf":
@@ -604,6 +626,12 @@ async def upload_patient_chat_report(
             # images. The bytes remain server-side and are never exposed to
             # the Flutter client or a public Storage URL.
             extracted = ai_provider.extract_document_text(content, content_type)
+        logger.info(
+            "Chat report extraction completed: request_id=%s elapsed_ms=%d chars=%d",
+            diagnostic_id,
+            round((time.perf_counter() - started_at) * 1000),
+            len(extracted or ""),
+        )
         if not extracted:
             detail = (
                 "This PDF has no readable text. Upload a text-based PDF or ask your clinician to share the report."
@@ -622,7 +650,11 @@ async def upload_patient_chat_report(
         if is_temporary_capacity_error:
             # Keep the object private and retain it for the idempotent retry.
             # It has not been added to chat context until extraction succeeds.
-            logger.warning("Report vision provider is temporarily at capacity; retaining private upload for retry")
+            logger.warning(
+                "Report vision provider is temporarily at capacity: request_id=%s elapsed_ms=%d",
+                diagnostic_id,
+                round((time.perf_counter() - started_at) * 1000),
+            )
             raise HTTPException(
                 status_code=503,
                 detail="Report processing is temporarily busy. Your private file was retained; retry shortly.",
@@ -632,7 +664,11 @@ async def upload_patient_chat_report(
             client.storage.from_(bucket).remove([path])
         except Exception:
             pass
-        logger.exception("Private report image extraction failed: %s", exc)
+        logger.exception(
+            "Private report image extraction failed: request_id=%s error=%s",
+            diagnostic_id,
+            exc,
+        )
         raise HTTPException(
             status_code=503,
             detail="Private report image processing is currently unavailable",
@@ -663,7 +699,11 @@ async def upload_patient_chat_report(
             client.storage.from_(bucket).remove([path])
         except Exception:
             pass
-        logger.exception("Private report metadata save failed: %s", _storage_error_detail(exc))
+        logger.exception(
+            "Private report metadata save failed: request_id=%s error=%s",
+            diagnostic_id,
+            _storage_error_detail(exc),
+        )
         raise HTTPException(status_code=503, detail="Secure report metadata is currently unavailable") from exc
     if content_type == "application/pdf":
         message = "Report saved privately. Extracted text:\n" + extracted[:1800]

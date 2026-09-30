@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -58,52 +57,45 @@ class AIProvider:
         last_error: Exception | None = None
         capacity_error: Exception | None = None
         for model in models:
-            for attempt in range(2):
-                try:
-                    # hf-inference no longer hosts the document-QA and BLIP
-                    # models returned by its task defaults. Use Hugging Face's
-                    # automatic provider routing with a vision-language model.
-                    response = InferenceClient(api_key=token, timeout=30).chat_completion(
-                        model=model,
-                        messages=[{
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "Transcribe only the readable text in this medical document. "
-                                        "Include medicine names, dosages, instructions, diagnoses, and test values. "
-                                        "Do not infer or add facts that are not visible."
-                                    ),
-                                },
-                                {"type": "image_url", "image_url": {"url": image_url}},
-                            ],
-                        }],
-                        temperature=0,
-                        max_tokens=700,
-                    )
-                    text = response.choices[0].message.content
-                    if not isinstance(text, str) or not text.strip():
-                        raise RuntimeError("Vision model returned no readable text")
-                    return "Extracted from uploaded document: " + text.strip()[:30000]
-                except Exception as exc:
-                    last_error = exc
-                    message = str(exc).lower()
-                    if any(marker in message for marker in ("capacity", "503", "429", "temporarily unavailable")):
-                        capacity_error = exc
-                    # Retry only transient capacity or 5xx errors; an invalid
-                    # image/model must move on to the alternate model instead.
-                    if attempt == 0 and capacity_error is exc:
-                        logger.warning("Vision provider capacity is temporary; retrying without logging document data")
-                        time.sleep(2)
-                        continue
-                    break
+            try:
+                # hf-inference no longer hosts the document-QA and BLIP
+                # models returned by its task defaults. Use Hugging Face's
+                # automatic provider routing with a vision-language model.
+                response = InferenceClient(api_key=token, timeout=20).chat_completion(
+                    model=model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Read this medical document. Return a concise transcription of only clearly "
+                                    "visible names, medicine/dose/instructions, diagnoses, and measurements. "
+                                    "Mark uncertain handwriting as [unclear]. Never guess or add facts."
+                                ),
+                            },
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }],
+                    temperature=0,
+                    max_tokens=420,
+                )
+                text = response.choices[0].message.content
+                if not isinstance(text, str) or not text.strip():
+                    raise RuntimeError("Vision model returned no readable text")
+                return "Extracted from uploaded document: " + text.strip()[:30000]
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if any(marker in message for marker in ("capacity", "503", "429", "temporarily unavailable")):
+                    capacity_error = exc
+                # Move to the alternate model immediately; another request to
+                # the same saturated provider only increases upload latency.
         # Preserve transient status across provider/model fallbacks. If Qwen
         # reports capacity and the second model is unsupported, the upload is
         # still retryable; returning the last exception would make the router
         # delete the securely stored file and report a permanent failure.
         final_error = capacity_error or last_error
-        error_message = str(final_error).lower()
         reason = "capacity_exhausted" if capacity_error else type(final_error).__name__
         raise RuntimeError(
             f"Hugging Face vision document extraction failed ({reason})"

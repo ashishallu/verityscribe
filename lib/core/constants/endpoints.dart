@@ -12,4 +12,6 @@ abstract class Endpoints {
 }
 
 const apiBaseUrl = String.fromEnvironment('API_BASE_URL',
-    defaultValue: 'http://10.0.2.2:8000/api/v1');
+    // Safe default for browser/release runs. Local API development can still
+    // override this with --dart-define=API_BASE_URL=http://10.0.2.2:8000/api/v1.
+    defaultValue: 'https://verityscribe-1.onrender.com/api/v1');
