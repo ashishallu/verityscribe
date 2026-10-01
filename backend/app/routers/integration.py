@@ -622,9 +622,9 @@ async def upload_patient_chat_report(
         if content_type == "application/pdf":
             extracted = _extract_pdf_text(content)
         else:
-            # The user explicitly requested Hugging Face processing of report
-            # images. The bytes remain server-side and are never exposed to
-            # the Flutter client or a public Storage URL.
+            # The configured server-side vision provider (Cloudflare when its
+            # credentials exist, otherwise Hugging Face) receives the image;
+            # bytes are never exposed to Flutter or a public Storage URL.
             extracted = ai_provider.extract_document_text(content, content_type)
         logger.info(
             "Chat report extraction completed: request_id=%s elapsed_ms=%d chars=%d",

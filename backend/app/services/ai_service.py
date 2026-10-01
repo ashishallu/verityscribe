@@ -40,7 +40,91 @@ class AIProvider:
     SECONDARY_ASR_MODEL = "openai/whisper-large-v3"
     LLM_MODEL = "Qwen/Qwen3-8B"
     def extract_document_text(self, image: bytes, content_type: str) -> str:
-        """Extract patient-document evidence through Hugging Face server-side only."""
+        """Extract image evidence using Cloudflare when configured, otherwise HF."""
+        cloudflare_account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        cloudflare_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        if cloudflare_account_id or cloudflare_token:
+            if not cloudflare_account_id or not cloudflare_token:
+                raise RuntimeError(
+                    "Cloudflare document extraction requires both CLOUDFLARE_ACCOUNT_ID "
+                    "and CLOUDFLARE_API_TOKEN"
+                )
+            return self._extract_document_text_cloudflare(
+                image, content_type, cloudflare_account_id, cloudflare_token
+            )
+
+        return self._extract_document_text_huggingface(image, content_type)
+
+    def _extract_document_text_cloudflare(
+        self, image: bytes, content_type: str, account_id: str, token: str
+    ) -> str:
+        """Send an uploaded image directly to Cloudflare Workers AI, never to the client."""
+        model = os.getenv(
+            "CLOUDFLARE_VISION_MODEL", "@cf/meta/llama-3.2-11b-vision-instruct"
+        ).strip()
+        if not model or not re.fullmatch(r"@[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+", model):
+            raise RuntimeError("Cloudflare vision model configuration is invalid")
+        image_data_url = (
+            f"data:{content_type};base64,{base64.b64encode(image).decode('ascii')}"
+        )
+        payload = {
+            "image": image_data_url,
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "Transcribe this medical document. Extract only clearly legible text, "
+                    "including medicine names, doses, instructions, diagnoses, and measured "
+                    "values. Preserve the document's wording. Mark uncertain handwriting "
+                    "as [unclear]. Never guess, infer, or add missing facts. Return concise "
+                    "plain text only."
+                ),
+            }],
+            "temperature": 0,
+            "max_tokens": 420,
+        }
+        url = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{account_id}/ai/run/{model}"
+        )
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            # Do not include or log provider response bodies: they may echo
+            # private prompt or patient-document content.
+            if exc.code == 429 or exc.code >= 500:
+                raise RuntimeError(
+                    f"Cloudflare vision provider capacity error (HTTP {exc.code})"
+                ) from exc
+            raise RuntimeError(
+                f"Cloudflare vision document extraction failed (HTTP {exc.code})"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cloudflare vision document extraction failed ({type(exc).__name__})"
+            ) from exc
+
+        if not isinstance(body, dict) or body.get("success") is False:
+            raise RuntimeError("Cloudflare vision provider returned an unsuccessful response")
+        result = body.get("result")
+        text = result.get("response") if isinstance(result, dict) else result
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError("Cloudflare vision provider returned no readable text")
+        return "Extracted from uploaded document: " + text.strip()[:30000]
+
+    def _extract_document_text_huggingface(
+        self, image: bytes, content_type: str
+    ) -> str:
+        """Existing Hugging Face fallback, kept unchanged for deployments without CF keys."""
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         if not token:
             raise RuntimeError("Hugging Face token is not configured")
