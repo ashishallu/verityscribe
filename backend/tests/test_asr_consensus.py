@@ -119,6 +119,34 @@ class TranscriptConsensusTests(unittest.TestCase):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
+    def test_wrapped_http_status_and_reason_are_identified_without_leaking_body(self):
+        class HTTPProviderFailure(Exception):
+            pass
+
+        def fail_provider(*_args, **_kwargs):
+            try:
+                raise HTTPProviderFailure("401 Client Error: Invalid token; private body")
+            except HTTPProviderFailure as exc:
+                raise RuntimeError("Hugging Face ASR request failed (HTTPError)") from exc
+
+        with patch.object(self.provider, "_transcribe_with", side_effect=fail_provider):
+            with self.assertRaisesRegex(RuntimeError, "authentication_failed") as error:
+                self.provider.transcribe_consensus(b"audio", "visit.wav")
+        self.assertNotIn("private body", str(error.exception))
+
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
+    def test_unsupported_model_provider_error_is_actionable(self):
+        def fail_provider(*_args, **_kwargs):
+            try:
+                raise ValueError("Model not supported by provider deepinfra")
+            except ValueError as exc:
+                raise RuntimeError("Hugging Face ASR request failed (ValueError)") from exc
+
+        with patch.object(self.provider, "_transcribe_with", side_effect=fail_provider):
+            with self.assertRaisesRegex(RuntimeError, "model_provider_unsupported"):
+                self.provider.transcribe_consensus(b"audio", "visit.wav")
+
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
     def test_unclassified_provider_failure_preserves_safe_exception_category(self):
         class TransportProtocolFailure(Exception):
             pass

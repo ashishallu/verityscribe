@@ -310,7 +310,9 @@ class AIProvider:
         provider: str = "auto",
     ) -> str:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        timeout = max(10.0, min(180.0, float(os.getenv("AI_ASR_TIMEOUT_SECONDS", "60"))))
+        # One stalled provider must not hold the complete ensemble for nearly
+        # a minute. Keep an env override for longer recordings, but bound it.
+        timeout = max(10.0, min(45.0, float(os.getenv("AI_ASR_TIMEOUT_SECONDS", "30"))))
         # Use the official client for Hugging Face's routed endpoint. It owns
         # the provider-specific ASR serialization and avoids fragile manual
         # HTTP payload construction.
@@ -401,29 +403,52 @@ class AIProvider:
             while current is not None and current not in chain:
                 chain.append(current)
                 current = current.__cause__ or current.__context__
-            statuses = []
+            statuses: list[int] = []
             names = []
             details = []
             for item in chain:
                 names.append(type(item).__name__.lower())
-                details.append(str(item).lower())
-                status = getattr(item, "status_code", None) or getattr(item, "code", None)
+                message = str(item).lower()
+                details.append(message)
+                status = getattr(item, "status_code", None) or getattr(item, "status", None) or getattr(item, "code", None)
                 response = getattr(item, "response", None)
-                status = status or getattr(response, "status_code", None)
+                status = status or getattr(response, "status_code", None) or getattr(response, "status", None)
                 if response is not None:
-                    # Some SDK errors carry only the status on the response;
-                    # include its short diagnostic body for classification,
-                    # never for logs or API output.
+                    # Use response text only for classification. Never log or
+                    # return it because provider bodies can contain request data.
                     details.append(str(getattr(response, "text", "")).lower())
                 if isinstance(status, int):
                     statuses.append(status)
+                # huggingface_hub sometimes wraps requests.HTTPError without
+                # preserving the response object. Recover only the numeric
+                # status from the exception text (never its body).
+                if not isinstance(status, int):
+                    match = re.search(r"\b([45]\d\d)\s+(?:client|server) error\b|\bhttp\s+([45]\d\d)\b", message)
+                    if match:
+                        statuses.append(int(next(group for group in match.groups() if group)))
             diagnostic = " ".join(details)
             if any(term in diagnostic for term in (
                 "gated", "agree to share", "contact information", "accept the conditions"
             )):
                 code = "gated_model_access_required"
-            elif "model not supported by provider" in diagnostic:
+            elif any(term in diagnostic for term in (
+                "model not supported by provider", "not supported by any provider",
+                "provider does not support", "unsupported provider",
+            )):
                 code = "model_provider_unsupported"
+            elif any(term in diagnostic for term in (
+                "insufficient credits", "insufficient balance", "payment required",
+                "billing is required", "billing limit", "out of credits",
+            )):
+                code = "provider_billing_required"
+            elif any(term in diagnostic for term in (
+                "invalid token", "invalid credentials", "unauthorized", "authentication failed",
+            )):
+                code = "authentication_failed"
+            elif any(term in diagnostic for term in (
+                "rate limit", "rate_limit", "too many requests", "quota exceeded",
+            )):
+                code = "provider_rate_limited"
             else:
                 code = ""
             status = next((code for code in statuses if code in {400, 401, 402, 403, 404, 408, 429} or code >= 500), None)
