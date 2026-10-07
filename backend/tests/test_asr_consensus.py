@@ -19,6 +19,12 @@ from app.services.ai_service import AIProvider
 class TranscriptConsensusTests(unittest.TestCase):
     def setUp(self):
         self.provider = AIProvider()
+        credentials = patch.dict(os.environ, {
+            "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
+            "CLOUDFLARE_API_TOKEN": "cf-token-test",
+        })
+        credentials.start()
+        self.addCleanup(credentials.stop)
 
     TWO_MODEL_CONFIG = json.dumps([
         {"model": "openai/whisper-large-v3-turbo", "endpoint": "https://asr-primary.test", "weight": 1.1},
@@ -70,17 +76,19 @@ class TranscriptConsensusTests(unittest.TestCase):
         self.assertEqual(result.final_text, "patient has a cough")
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
-    def test_default_setup_configures_five_provider_routed_models(self):
+    def test_default_setup_configures_four_cloudflare_models_and_working_hf_model(self):
         configs = self.provider._asr_model_configs()
 
         self.assertEqual(len(configs), 5)
         self.assertEqual(len({entry["model"] for entry in configs}), 5)
         providers = {entry["model"]: entry["provider"] for entry in configs}
-        self.assertEqual(providers["openai/whisper-large-v3"], "fal-ai")
-        self.assertEqual(providers["Qwen/Qwen3-ASR-1.7B"], "deepinfra")
-        self.assertEqual(providers["nvidia/nemotron-3.5-asr-streaming-0.6b"], "fal-ai")
-        self.assertIn("openai/whisper-large-v3", {entry["model"] for entry in configs})
-        self.assertIn("Qwen/Qwen3-ASR-1.7B", {entry["model"] for entry in configs})
+        cloudflare_models = {model for model, provider in providers.items() if provider == "cloudflare"}
+        self.assertEqual(len(cloudflare_models), 4)
+        self.assertIn("@cf/openai/whisper-large-v3-turbo", cloudflare_models)
+        self.assertIn("@cf/openai/whisper", cloudflare_models)
+        self.assertIn("@cf/openai/whisper-tiny-en", cloudflare_models)
+        self.assertIn("@cf/deepgram/nova-3", cloudflare_models)
+        self.assertEqual(providers["openai/whisper-large-v3-turbo"], "auto")
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
     def test_all_provider_failures_report_safe_actionable_codes(self):
@@ -184,6 +192,63 @@ class TranscriptConsensusTests(unittest.TestCase):
 
         self.assertEqual(text, "clinical transcription")
         self.assertEqual(client_kwargs[0]["provider"], "deepinfra")
+
+    @patch.dict(os.environ, {
+        "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
+        "CLOUDFLARE_API_TOKEN": "cf-token-test",
+        "AI_ASR_TIMEOUT_SECONDS": "11",
+    })
+    def test_cloudflare_whisper_uses_json_audio_bytes_and_parses_transcript(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self): return b'{"success":true,"result":{"text":"whisper text"}}'
+
+        seen = {}
+
+        def fake_urlopen(request, timeout):
+            seen["url"] = request.full_url
+            seen["headers"] = request.headers
+            seen["body"] = json.loads(request.data.decode())
+            seen["timeout"] = timeout
+            return Response()
+
+        with patch.object(ai_service, "urlopen", side_effect=fake_urlopen):
+            text = self.provider._transcribe_with(
+                b"wav-bytes", "visit.wav", None, "@cf/openai/whisper", "cloudflare"
+            )
+
+        self.assertEqual(text, "whisper text")
+        self.assertTrue(seen["url"].endswith("/ai/run/@cf/openai/whisper"))
+        self.assertEqual(seen["body"], {"audio": list(b"wav-bytes")})
+        self.assertEqual(seen["headers"]["Authorization"], "Bearer cf-token-test")
+        self.assertEqual(seen["timeout"], 11)
+
+    @patch.dict(os.environ, {
+        "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
+        "CLOUDFLARE_API_TOKEN": "cf-token-test",
+    })
+    def test_cloudflare_nova3_uses_binary_wav_payload(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self): return b'{"success":true,"result":{"results":{"channels":[{"alternatives":[{"transcript":"nova text"}]}]}}}'
+
+        seen = {}
+
+        def fake_urlopen(request, timeout):
+            seen["body"] = request.data
+            seen["headers"] = request.headers
+            return Response()
+
+        with patch.object(ai_service, "urlopen", side_effect=fake_urlopen):
+            text = self.provider._transcribe_with(
+                b"wav-bytes", "visit.wav", None, "@cf/deepgram/nova-3", "cloudflare"
+            )
+
+        self.assertEqual(text, "nova text")
+        self.assertEqual(seen["body"], b"wav-bytes")
+        self.assertEqual(seen["headers"]["Content-type"], "audio/wav")
 
     @patch.dict(os.environ, {"HF_TOKEN": ""})
     def test_five_models_run_and_return_individual_predictions(self):

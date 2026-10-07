@@ -51,14 +51,14 @@ class AIProvider:
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "openai/whisper-large-v3")
     LLM_MODEL = "Qwen/Qwen3-8B"
     DEFAULT_ASR_MODELS = (
-        # Keep the OpenAI models on Hub auto-routing. Pin models whose current
-        # Hub model cards advertise a specific provider to avoid routing them
-        # to an unsupported backend.
-        ("openai/whisper-large-v3", "fal-ai", 1.20),
+        # Four batch ASR models available through Workers AI plus the known-
+        # working Hugging Face route. The turbo model intentionally appears
+        # on both services so provider reliability can be compared.
+        ("@cf/openai/whisper-large-v3-turbo", "cloudflare", 1.20),
+        ("@cf/openai/whisper", "cloudflare", 1.10),
+        ("@cf/openai/whisper-tiny-en", "cloudflare", 0.80),
+        ("@cf/deepgram/nova-3", "cloudflare", 1.10),
         ("openai/whisper-large-v3-turbo", "auto", 1.15),
-        ("Qwen/Qwen3-ASR-1.7B", "deepinfra", 1.15),
-        ("nvidia/nemotron-3.5-asr-streaming-0.6b", "fal-ai", 1.00),
-        ("CohereLabs/cohere-transcribe-03-2026", "fal-ai", 1.10),
     )
 
     def _asr_model_configs(self) -> list[dict[str, str | float | None]]:
@@ -79,19 +79,22 @@ class AIProvider:
                     weight = float(item.get("weight", 1.0))
                 except (TypeError, ValueError) as exc:
                     raise RuntimeError("ASR model weights must be numeric") from exc
-                token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
                 endpoint = str(item.get("endpoint", "")).strip()
                 provider = str(item.get("provider", "auto")).strip().lower()
-                if not endpoint and not token:
-                    raise RuntimeError("HF_TOKEN is required for Hugging Face-routed ASR models")
                 if not model or not math.isfinite(weight) or weight <= 0:
                     raise RuntimeError("Each ASR model requires a model id and positive weight")
                 if endpoint and not endpoint.startswith(("http://", "https://")):
                     raise RuntimeError("Custom ASR endpoints must use HTTP or HTTPS")
-                if not endpoint and provider not in {
-                    "auto", "hf-inference", "fal-ai", "deepinfra", "together"
-                }:
-                    raise RuntimeError("Unsupported Hugging Face ASR provider")
+                if not endpoint and provider == "cloudflare":
+                    if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
+                        raise RuntimeError(
+                            "Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
+                        )
+                elif not endpoint:
+                    if provider not in {"auto", "hf-inference", "fal-ai", "deepinfra", "together"}:
+                        raise RuntimeError("Unsupported ASR provider")
+                    if not (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")):
+                        raise RuntimeError("HF_TOKEN is required for Hugging Face-routed ASR models")
                 configs.append({
                     "model": model,
                     "endpoint": endpoint or None,
@@ -102,11 +105,14 @@ class AIProvider:
                 raise RuntimeError("ASR model ids must be unique")
             return configs
 
-        # Run five distinct provider-backed models by default. Custom endpoints
-        # and weights can still be supplied explicitly through AI_ASR_MODELS_JSON.
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        if not token:
-            raise RuntimeError("HF_TOKEN is required for the five-model ASR ensemble")
+        # Custom endpoints, providers, and weights can still be supplied
+        # explicitly through AI_ASR_MODELS_JSON.
+        if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
+            raise RuntimeError(
+                "Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
+            )
+        if not (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")):
+            raise RuntimeError("HF_TOKEN is required for the Hugging Face ASR model")
         return [
             {
                 "model": model,
@@ -313,6 +319,62 @@ class AIProvider:
         # One stalled provider must not hold the complete ensemble for nearly
         # a minute. Keep an env override for longer recordings, but bound it.
         timeout = max(10.0, min(45.0, float(os.getenv("AI_ASR_TIMEOUT_SECONDS", "30"))))
+        if provider == "cloudflare" and provider_url is None:
+            account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+            cloudflare_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+            if not account_id or not cloudflare_token:
+                raise RuntimeError("Cloudflare ASR credentials are not configured")
+            url = (
+                "https://api.cloudflare.com/client/v4/accounts/"
+                f"{account_id}/ai/run/{model}"
+            )
+            # Nova-3's Workers AI endpoint accepts raw audio bytes. Whisper
+            # routes use the documented JSON array-of-byte format.
+            if model == "@cf/deepgram/nova-3":
+                request = Request(
+                    url,
+                    data=audio,
+                    headers={
+                        "Authorization": f"Bearer {cloudflare_token}",
+                        "Content-Type": "audio/wav",
+                    },
+                    method="POST",
+                )
+            else:
+                request = Request(
+                    url,
+                    data=json.dumps({"audio": list(audio)}).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {cloudflare_token}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                if not isinstance(body, dict) or body.get("success") is False:
+                    raise RuntimeError("Cloudflare ASR returned an unsuccessful response")
+                result = body.get("result")
+                text = result.get("text") if isinstance(result, dict) else None
+                if not text and isinstance(result, dict):
+                    # Deepgram Nova-3 returns the standard Deepgram `results`
+                    # envelope; Whisper returns a flat `text` field.
+                    channels = result.get("results", {}).get("channels", [])
+                    if channels and isinstance(channels[0], dict):
+                        alternatives = channels[0].get("alternatives", [])
+                        if alternatives and isinstance(alternatives[0], dict):
+                            text = alternatives[0].get("transcript")
+                if not isinstance(text, str) or not text.strip():
+                    raise RuntimeError("Cloudflare ASR returned no transcript")
+                return text.strip()
+            except HTTPError as exc:
+                raise RuntimeError(f"Cloudflare ASR request failed (HTTP {exc.code})") from exc
+            except Exception as exc:
+                if isinstance(exc, RuntimeError):
+                    raise
+                raise RuntimeError(f"Cloudflare ASR request failed ({type(exc).__name__})") from exc
+
         # Use the official client for Hugging Face's routed endpoint. It owns
         # the provider-specific ASR serialization and avoids fragile manual
         # HTTP payload construction.
