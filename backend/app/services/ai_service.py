@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import base64
+from difflib import SequenceMatcher
 import json
 import logging
+import math
 import os
 import re
+from time import perf_counter
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -24,21 +27,92 @@ class AIDraft:
 
 
 @dataclass(frozen=True)
+class ASRPrediction:
+    model: str
+    weight: float
+    status: str
+    text: str
+    latency_ms: int
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
 class TranscriptConsensus:
     primary: str
     secondary: str
     final_text: str
     conflicts: list[str]
+    reconciliation_status: str = "reconciled"
+    predictions: list[ASRPrediction] | None = None
 
 
 class AIProvider:
-    ASR_MODEL = "openai/whisper-large-v3-turbo"
-    # Both models are served by Hugging Face Inference Providers. The former
-    # Indic Conformer choice requires a separately deployed endpoint, so it
-    # remains usable through AI_ASR_SECONDARY_BASE_URL but cannot be used as
-    # the hosted default.
-    SECONDARY_ASR_MODEL = "openai/whisper-large-v3"
+    ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "openai/whisper-large-v3-turbo")
+    SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "openai/whisper-large-v3")
     LLM_MODEL = "Qwen/Qwen3-8B"
+    DEFAULT_ASR_MODELS = (
+        ("openai/whisper-large-v3", "fal-ai", 1.20),
+        ("openai/whisper-large-v3-turbo", "deepinfra", 1.15),
+        ("Qwen/Qwen3-ASR-0.6B", "deepinfra", 1.00),
+        ("Qwen/Qwen3-ASR-1.7B", "deepinfra", 1.15),
+        ("nvidia/parakeet-tdt-0.6b-v3", "together", 1.00),
+    )
+
+    def _asr_model_configs(self) -> list[dict[str, str | float | None]]:
+        raw = os.getenv("AI_ASR_MODELS_JSON", "").strip()
+        if raw:
+            try:
+                models = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("AI_ASR_MODELS_JSON must contain a JSON array") from exc
+            if not isinstance(models, list) or not 1 <= len(models) <= 5:
+                raise RuntimeError("AI_ASR_MODELS_JSON must define between one and five models")
+            configs = []
+            for item in models:
+                if not isinstance(item, dict):
+                    raise RuntimeError("Each ASR model entry must be an object")
+                model = str(item.get("model", "")).strip()
+                try:
+                    weight = float(item.get("weight", 1.0))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("ASR model weights must be numeric") from exc
+                token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+                endpoint = str(item.get("endpoint", "")).strip()
+                provider = str(item.get("provider", "auto")).strip().lower()
+                if not endpoint and not token:
+                    raise RuntimeError("HF_TOKEN is required for Hugging Face-routed ASR models")
+                if not model or not math.isfinite(weight) or weight <= 0:
+                    raise RuntimeError("Each ASR model requires a model id and positive weight")
+                if endpoint and not endpoint.startswith(("http://", "https://")):
+                    raise RuntimeError("Custom ASR endpoints must use HTTP or HTTPS")
+                if not endpoint and provider not in {
+                    "auto", "hf-inference", "fal-ai", "deepinfra", "together"
+                }:
+                    raise RuntimeError("Unsupported Hugging Face ASR provider")
+                configs.append({
+                    "model": model,
+                    "endpoint": endpoint or None,
+                    "provider": provider,
+                    "weight": weight,
+                })
+            if len({entry["model"] for entry in configs}) != len(configs):
+                raise RuntimeError("ASR model ids must be unique")
+            return configs
+
+        # Run five distinct provider-backed models by default. Custom endpoints
+        # and weights can still be supplied explicitly through AI_ASR_MODELS_JSON.
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if not token:
+            raise RuntimeError("HF_TOKEN is required for the five-model ASR ensemble")
+        return [
+            {
+                "model": model,
+                "endpoint": None,
+                "provider": provider,
+                "weight": weight,
+            }
+            for model, provider, weight in self.DEFAULT_ASR_MODELS
+        ]
     def extract_document_text(self, image: bytes, content_type: str) -> str:
         """Extract image evidence using Cloudflare when configured, otherwise HF."""
         cloudflare_account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
@@ -211,12 +285,12 @@ class AIProvider:
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("AI provider returned an invalid draft") from exc
 
-    def _request(self, url: str, payload: dict, token: str | None = None) -> dict:
+    def _request(self, url: str, payload: dict, token: str | None = None, timeout: float = 120) -> dict:
         headers = {"Content-Type": "application/json"}
         if token: headers["Authorization"] = f"Bearer {token}"
         request = Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode())
         except Exception as exc:
             raise RuntimeError("AI provider request failed") from exc
@@ -224,20 +298,27 @@ class AIProvider:
             raise RuntimeError("AI provider returned a non-object response")
         return body
 
-    def _transcribe_with(self, audio: bytes, filename: str, provider_url: str, model: str) -> str:
-        if not provider_url:
-            raise RuntimeError("ASR provider is not configured")
+    def _transcribe_with(
+        self,
+        audio: bytes,
+        filename: str,
+        provider_url: str | None,
+        model: str,
+        provider: str = "auto",
+    ) -> str:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        timeout = max(10.0, min(180.0, float(os.getenv("AI_ASR_TIMEOUT_SECONDS", "60"))))
         # Use the official client for Hugging Face's routed endpoint. It owns
         # the provider-specific ASR serialization and avoids fragile manual
         # HTTP payload construction.
-        if provider_url.startswith("https://router.huggingface.co/hf-inference/"):
+        if provider_url is None or provider_url.startswith("https://router.huggingface.co/"):
             if not token:
                 raise RuntimeError("Hugging Face token is not configured")
             try:
                 response = InferenceClient(
-                    provider="hf-inference",
+                    provider=provider,
                     api_key=token,
+                    timeout=timeout,
                     # The SDK receives bytes rather than a filesystem path,
                     # so it cannot infer their type. HF rejects a missing
                     # content type even for a valid WAV container.
@@ -266,7 +347,7 @@ class AIProvider:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode())
             text = body.get("text") if isinstance(body, dict) else None
             if not text: raise RuntimeError("ASR provider returned no transcript")
@@ -280,10 +361,7 @@ class AIProvider:
                 f"ASR provider request failed ({type(exc).__name__})"
             ) from exc
 
-    def _hf_asr_url(self, model: str) -> str:
-        return f"https://router.huggingface.co/hf-inference/models/{model}"
-
-    def _hf_chat(self, prompt: str, token: str) -> str:
+    def _hf_chat(self, prompt: str, token: str, timeout: float = 120) -> str:
         """Call Hugging Face's OpenAI-compatible chat endpoint server-side."""
         payload = {
             "model": self.LLM_MODEL,
@@ -301,7 +379,7 @@ class AIProvider:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode())
             content = body["choices"][0]["message"]["content"]
             if not isinstance(content, str) or not content.strip():
@@ -311,83 +389,98 @@ class AIProvider:
             raise RuntimeError("Transcript reconciler request failed") from exc
 
     def transcribe_consensus(self, audio: bytes, filename: str = "recording.wav") -> TranscriptConsensus:
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        primary_url = (os.getenv("AI_ASR_PRIMARY_BASE_URL") or
-                       os.getenv("AI_ASR_BASE_URL") or
-                       (self._hf_asr_url(self.ASR_MODEL) if token else ""))
-        secondary_url = (os.getenv("AI_ASR_SECONDARY_BASE_URL") or
-                         (self._hf_asr_url(self.SECONDARY_ASR_MODEL) if token else ""))
-        if not primary_url or not secondary_url:
-            raise RuntimeError("Two ASR providers are not configured")
-        # Run the independent transcription agents concurrently. A draft is
-        # still useful when one hosted provider is temporarily unavailable, so
-        # retain a successful result instead of discarding the recording.
-        primary_error: Exception | None = None
-        secondary_error: Exception | None = None
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            primary_future = pool.submit(
-                self._transcribe_with, audio, filename, primary_url, self.ASR_MODEL
-            )
-            secondary_future = pool.submit(
-                self._transcribe_with, audio, filename, secondary_url,
-                self.SECONDARY_ASR_MODEL
-            )
-            try:
-                primary = primary_future.result()
-            except Exception as exc:
-                primary_error = exc
-                primary = ""
-            try:
-                secondary = secondary_future.result()
-            except Exception as exc:
-                secondary_error = exc
-                secondary = ""
-        if not primary and not secondary:
-            raise RuntimeError(
-                "All ASR providers failed "
-                f"(primary: {primary_error}; secondary: {secondary_error})"
-            ) from (primary_error or secondary_error)
-        if not primary:
-            primary = secondary
-        if not secondary:
-            secondary = primary
-        conflicts: list[str] = []
-        if primary_error:
-            conflicts.append("Primary speech provider was unavailable; the secondary transcript is shown.")
-        if secondary_error:
-            conflicts.append("Secondary speech provider was unavailable; the primary transcript is shown.")
-        try:
-            final_text, reconciliation_conflicts = self.reconcile_transcripts(primary, secondary)
-            conflicts.extend(reconciliation_conflicts)
-        except RuntimeError:
-            # Reconciliation improves a draft but must never block delivery of
-            # an already successful speech-to-text result. Crucially, never
-            # default to the primary provider: compare both drafts and retain
-            # the more complete, lower-noise one until clinician review.
-            final_text = self._best_transcript(primary, secondary)
-            conflicts.append("Automated reconciliation was unavailable; the clearer ASR draft was retained for clinician review.")
-        return TranscriptConsensus(primary=primary, secondary=secondary, final_text=final_text, conflicts=conflicts)
+        configs = self._asr_model_configs()
 
-    def reconcile_transcripts(self, primary: str, secondary: str) -> tuple[str, list[str]]:
-        if primary.strip() == secondary.strip():
-            return primary.strip(), []
+        def run_model(config: dict[str, str | float | None]) -> ASRPrediction:
+            started = perf_counter()
+            model = str(config["model"])
+            try:
+                endpoint = config.get("endpoint")
+                text = self._transcribe_with(
+                    audio,
+                    filename,
+                    str(endpoint) if endpoint else None,
+                    model,
+                    str(config.get("provider", "auto")),
+                ).strip()
+                if not text:
+                    raise RuntimeError("empty_transcript")
+                return ASRPrediction(model, float(config["weight"]), "success", text,
+                                     int((perf_counter() - started) * 1000))
+            except Exception as exc:
+                return ASRPrediction(model, float(config["weight"]), "unavailable", "",
+                                     int((perf_counter() - started) * 1000),
+                                     "provider_error" if str(exc) != "empty_transcript" else "empty_transcript")
+
+        # Submit every configured recognizer before waiting, so wall time is
+        # bounded by the slowest provider rather than the sum of all providers.
+        with ThreadPoolExecutor(max_workers=len(configs)) as pool:
+            predictions = list(pool.map(run_model, configs))
+        successful = [item for item in predictions if item.status == "success"]
+        if not successful:
+            raise RuntimeError("All configured ASR models were unavailable")
+
+        conflicts = [
+            f"{item.model} did not return a transcript ({item.error_code})."
+            for item in predictions if item.status != "success"
+        ]
+        if len(successful) == 1:
+            final_text = successful[0].text
+            status = "single_provider"
+        elif len({self._normalized_transcript(item.text) for item in successful}) == 1:
+            final_text = max(successful, key=lambda item: item.weight).text
+            status = "identical"
+        else:
+            try:
+                final_text, reconciliation_conflicts = self.reconcile_ensemble(successful)
+                conflicts.extend(reconciliation_conflicts)
+                status = "reconciled"
+            except RuntimeError:
+                final_text = self._weighted_medoid(successful)
+                conflicts.append("Automated reconciliation was unavailable; weighted model agreement selected a draft for clinician review.")
+                status = "fallback_selected"
+
+        return TranscriptConsensus(
+            primary=predictions[0].text if predictions[0].status == "success" else "",
+            secondary=(predictions[1].text if len(predictions) > 1 and predictions[1].status == "success" else ""),
+            final_text=final_text,
+            conflicts=conflicts,
+            reconciliation_status=status,
+            predictions=predictions,
+        )
+
+    def reconcile_ensemble(self, predictions: list[ASRPrediction]) -> tuple[str, list[str]]:
+        if len(predictions) < 2:
+            raise RuntimeError("At least two successful ASR drafts are needed")
+        prompt_items = [
+            {"model": item.model, "weight": item.weight, "transcript": item.text}
+            for item in predictions
+        ]
+        prompt = (
+            "Reconcile the following ASR drafts from one clinical recording. Return only JSON with "
+            "keys final_transcript (string) and conflicts (array of strings). Use model weights as "
+            "evidence weights: a clinical detail is eligible only when at least two models support it "
+            "and their combined weight is at least 55% of the total successful-model weight. Weights "
+            "must never override a direct contradiction in a clinical detail. Keep the final transcript "
+            "concise and faithful; remove filler and repeated phrases. Include clinical facts, medicine "
+            "names, doses, measurements, and negations only when the support threshold is met. If models "
+            "differ or a detail appears below that threshold, leave it out of the final transcript and "
+            "name the model(s) and competing wording in conflicts. Never guess, complete unclear audio, "
+            "or invent details.\n\n"
+            + json.dumps(prompt_items, ensure_ascii=False)
+        )
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         provider_url = os.getenv("AI_TRANSCRIPT_RECONCILER_BASE_URL") or os.getenv("AI_LLM_BASE_URL")
-        if not provider_url and not token:
-            raise RuntimeError("Transcript reconciler is not configured")
-        prompt = ("Compare two automatic speech-recognition transcripts from the same clinical conversation. "
-                  "Return only JSON: {\"final_transcript\": string, \"conflicts\": [string]}. "
-                  "Create one clean transcript from the words supported by either draft; remove repeated filler, "
-                  "false starts, and obvious noise. Do not invent clinical facts, medicines, measurements, or diagnoses. "
-                  "If drafts disagree on a clinical fact, omit it from final_transcript and list the disagreement in conflicts.\n\n"
-                  f"TRANSCRIPT A:\n{primary}\n\nTRANSCRIPT B:\n{secondary}")
+        timeout = max(10.0, min(120.0, float(os.getenv("AI_TRANSCRIPT_RECONCILER_TIMEOUT_SECONDS", "35"))))
         if provider_url:
-            payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
+            payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token, timeout)
             generated = payload.get("generated_text") if isinstance(payload, dict) else None
-            if not isinstance(generated, str):
-                raise RuntimeError("Transcript reconciler returned an invalid response")
+        elif token:
+            generated = self._hf_chat(prompt, token, timeout=timeout)
         else:
-            generated = self._hf_chat(prompt, token)
+            raise RuntimeError("Transcript reconciler is not configured")
+        if not isinstance(generated, str):
+            raise RuntimeError("Transcript reconciler returned an invalid response")
         try:
             match = re.search(r"\{.*\}", generated, flags=re.DOTALL)
             if not match:
@@ -400,6 +493,56 @@ class AIProvider:
         if not final_text:
             raise RuntimeError("Transcript reconciler returned no transcript")
         return final_text, conflicts
+
+    @classmethod
+    def _weighted_medoid(cls, predictions: list[ASRPrediction]) -> str:
+        def score(candidate: ASRPrediction) -> float:
+            own = candidate.weight
+            agreement = sum(
+                other.weight * SequenceMatcher(
+                    None,
+                    cls._normalized_transcript(candidate.text),
+                    cls._normalized_transcript(other.text),
+                ).ratio()
+                for other in predictions if other is not candidate
+            )
+            return own + agreement
+        return max(predictions, key=score).text
+
+    @staticmethod
+    def consensus_payload(consensus: TranscriptConsensus) -> dict:
+        predictions = consensus.predictions or []
+        return {
+            "primary_model": predictions[0].model if predictions else None,
+            "secondary_model": predictions[1].model if len(predictions) > 1 else None,
+            "primary_transcript": consensus.primary,
+            "secondary_transcript": consensus.secondary,
+            "reconciliation_status": consensus.reconciliation_status,
+            "conflicts": consensus.conflicts,
+            "predictions": [
+                {
+                    "model": item.model,
+                    "weight": item.weight,
+                    "status": item.status,
+                    "text": item.text,
+                    "latency_ms": item.latency_ms,
+                    "error_code": item.error_code,
+                }
+                for item in predictions
+            ],
+        }
+
+    def reconcile_transcripts(self, primary: str, secondary: str) -> tuple[str, list[str]]:
+        predictions = [
+            ASRPrediction(self.ASR_MODEL, 1.10, "success", primary, 0),
+            ASRPrediction(self.SECONDARY_ASR_MODEL, 1.15, "success", secondary, 0),
+        ]
+        return self.reconcile_ensemble(predictions)
+
+    @staticmethod
+    def _normalized_transcript(text: str) -> str:
+        """Normalize punctuation/case so equivalent ASR drafts skip extra LLM latency."""
+        return " ".join(re.findall(r"[a-z0-9']+", text.lower()))
 
     @staticmethod
     def _best_transcript(primary: str, secondary: str) -> str:

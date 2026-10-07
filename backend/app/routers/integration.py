@@ -1247,7 +1247,7 @@ async def upload_consultation_voice(consultation_id: str, audio: UploadFile = Fi
     try:
         consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
-        return {"data": {"recording": recording, "transcript": transcript, "asr": {"primary_model": ai_provider.ASR_MODEL, "secondary_model": ai_provider.SECONDARY_ASR_MODEL, "primary_transcript": consensus.primary, "secondary_transcript": consensus.secondary, "conflicts": consensus.conflicts}, "status": "transcribed"}}
+        return {"data": {"recording": recording, "transcript": transcript, "asr": ai_provider.consensus_payload(consensus), "status": "transcribed"}}
     except Exception:
         return {"data": {"recording": recording, "transcript": None, "status": "transcription_unavailable"}}
 
@@ -1293,7 +1293,7 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
         raise HTTPException(status_code=503, detail="Voice transcription is currently unavailable") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Unable to persist voice transcript") from exc
-    return {"data": {"recording": recording, "transcript": transcript, "asr": {"primary_model": ai_provider.ASR_MODEL, "secondary_model": ai_provider.SECONDARY_ASR_MODEL, "primary_transcript": consensus.primary, "secondary_transcript": consensus.secondary, "conflicts": consensus.conflicts}, "requires_doctor_review": True}}
+    return {"data": {"recording": recording, "transcript": transcript, "asr": ai_provider.consensus_payload(consensus), "requires_doctor_review": True}}
 
 
 class AIProcessRequest(BaseModel):
