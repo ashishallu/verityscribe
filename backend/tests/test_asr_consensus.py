@@ -76,7 +76,7 @@ class TranscriptConsensusTests(unittest.TestCase):
         self.assertEqual(len(configs), 5)
         self.assertEqual(len({entry["model"] for entry in configs}), 5)
         providers = {entry["model"]: entry["provider"] for entry in configs}
-        self.assertEqual(providers["openai/whisper-large-v3"], "auto")
+        self.assertEqual(providers["openai/whisper-large-v3"], "fal-ai")
         self.assertEqual(providers["Qwen/Qwen3-ASR-1.7B"], "deepinfra")
         self.assertEqual(providers["nvidia/nemotron-3.5-asr-streaming-0.6b"], "fal-ai")
         self.assertIn("openai/whisper-large-v3", {entry["model"] for entry in configs})

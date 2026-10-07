@@ -54,7 +54,7 @@ class AIProvider:
         # Keep the OpenAI models on Hub auto-routing. Pin models whose current
         # Hub model cards advertise a specific provider to avoid routing them
         # to an unsupported backend.
-        ("openai/whisper-large-v3", "auto", 1.20),
+        ("openai/whisper-large-v3", "fal-ai", 1.20),
         ("openai/whisper-large-v3-turbo", "auto", 1.15),
         ("Qwen/Qwen3-ASR-1.7B", "deepinfra", 1.15),
         ("nvidia/nemotron-3.5-asr-streaming-0.6b", "fal-ai", 1.00),
