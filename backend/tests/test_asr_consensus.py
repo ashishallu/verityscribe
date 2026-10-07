@@ -75,7 +75,10 @@ class TranscriptConsensusTests(unittest.TestCase):
 
         self.assertEqual(len(configs), 5)
         self.assertEqual(len({entry["model"] for entry in configs}), 5)
-        self.assertTrue(all(entry["provider"] == "auto" for entry in configs))
+        providers = {entry["model"]: entry["provider"] for entry in configs}
+        self.assertEqual(providers["openai/whisper-large-v3"], "auto")
+        self.assertEqual(providers["Qwen/Qwen3-ASR-1.7B"], "deepinfra")
+        self.assertEqual(providers["nvidia/nemotron-3.5-asr-streaming-0.6b"], "fal-ai")
         self.assertIn("openai/whisper-large-v3", {entry["model"] for entry in configs})
         self.assertIn("Qwen/Qwen3-ASR-1.7B", {entry["model"] for entry in configs})
 
@@ -98,6 +101,21 @@ class TranscriptConsensusTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "inference_provider_permission_or_billing"
             ):
+                self.provider.transcribe_consensus(b"audio", "visit.wav")
+
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
+    def test_gated_model_provider_failure_is_identified(self):
+        class ProviderFailure(Exception):
+            status_code = 403
+
+        def fail_provider(*_args, **_kwargs):
+            try:
+                raise ProviderFailure("Please agree to share contact information to access this gated model")
+            except ProviderFailure as exc:
+                raise RuntimeError("Hugging Face ASR request failed") from exc
+
+        with patch.object(self.provider, "_transcribe_with", side_effect=fail_provider):
+            with self.assertRaisesRegex(RuntimeError, "gated_model_access_required"):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
 
     @patch.dict(os.environ, {"HF_TOKEN": "test-token"})

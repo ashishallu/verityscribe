@@ -170,7 +170,7 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
                   ?.copyWith(fontWeight: FontWeight.w800)),
           const SizedBox(height: 6),
           const Text(
-              'Two speech-recognition services will independently transcribe this recording. A third AI service reconciles differences before clinician review.',
+              'Two ASR passes run in parallel. When both return a transcript, a reconciliation step compares them before clinician review.',
               style: TextStyle(color: AppTheme.muted, height: 1.45)),
           const SizedBox(height: 20),
           appointments.when(
@@ -245,7 +245,7 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
           Center(
               child: Text(
                   processing
-                      ? 'Running independent transcripts and reconciliation…'
+                      ? 'Running configured ASR models in parallel…'
                       : recording
                           ? 'Recording securely'
                           : 'Ready to record',
@@ -375,12 +375,57 @@ class _SessionReviewScreenState extends ConsumerState<SessionReviewScreen> {
               'You may correct wording for clarity. This draft is not a diagnosis or prescription and cannot be accepted as a clinical record until your assigned doctor reviews it.',
               style: TextStyle(color: AppTheme.muted, height: 1.45)),
           const SizedBox(height: 22),
-          const SectionTitle('Reconciled transcript'),
+          SoftCard(
+              child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                Icon(
+                    result.reconciliationStatus == 'reconciled' ||
+                            result.reconciliationStatus == 'identical'
+                        ? Icons.verified_outlined
+                        : Icons.info_outline_rounded,
+                    color: AppTheme.blue),
+                const SizedBox(width: 10),
+                Expanded(
+                    child: Text(_reconciliationMessage(result),
+                        style: const TextStyle(height: 1.4)))
+              ])),
+          const SizedBox(height: 14),
+          const SectionTitle('Curated transcript draft'),
           TextField(
               controller: transcript,
               maxLines: null,
               minLines: 8,
               decoration: const InputDecoration(hintText: 'Transcript')),
+          const SizedBox(height: 8),
+          Card(
+              clipBehavior: Clip.antiAlias,
+              child: ExpansionTile(
+                  leading: const Icon(Icons.graphic_eq_rounded,
+                      color: AppTheme.blue),
+                  title: Text('View model predictions (${result.predictions.length})'),
+                  subtitle: const Text('Open to compare each model with the curated draft'),
+                  childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  children: [
+                    Wrap(spacing: 10, runSpacing: 4, children: [
+                      _legendDot(Colors.deepOrange, 'Missing from final'),
+                      _legendDot(Colors.amber.shade800, 'Model disagreement'),
+                    ]),
+                    const SizedBox(height: 10),
+                    ...result.predictions.map(_predictionCard),
+                    if (result.conflicts.isNotEmpty) ...[
+                      const Divider(),
+                      Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text('Review these differences',
+                              style: Theme.of(context).textTheme.titleSmall)),
+                      ...result.conflicts.map((item) => Align(
+                          alignment: Alignment.centerLeft,
+                          child: Padding(
+                              padding: const EdgeInsets.only(top: 6),
+                              child: Text('• $item')))),
+                    ]
+                  ])),
           if (saveError != null)
             Padding(
               padding: const EdgeInsets.only(top: 10),
@@ -393,31 +438,6 @@ class _SessionReviewScreenState extends ConsumerState<SessionReviewScreen> {
             icon: const Icon(Icons.save_outlined),
             label: Text(saving ? 'Saving…' : 'Save transcript correction'),
           ),
-          const SizedBox(height: 20),
-          const SectionTitle('Independent transcription check'),
-          SoftCard(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                const Text('Primary ASR',
-                    style: TextStyle(fontWeight: FontWeight.w800)),
-                const SizedBox(height: 6),
-                Text(result.primaryTranscript),
-                const Divider(height: 28),
-                const Text('Secondary ASR',
-                    style: TextStyle(fontWeight: FontWeight.w800)),
-                const SizedBox(height: 6),
-                Text(result.secondaryTranscript),
-                if (result.conflicts.isNotEmpty) ...[
-                  const Divider(height: 28),
-                  const Text('Items requiring clinician attention',
-                      style: TextStyle(fontWeight: FontWeight.w800)),
-                  const SizedBox(height: 6),
-                  ...result.conflicts.map((item) => Padding(
-                      padding: const EdgeInsets.only(bottom: 4),
-                      child: Text('• $item')))
-                ]
-              ])),
           const SizedBox(height: 18),
           SoftCard(
               color: const Color(0xFFF3EDFF),
@@ -438,5 +458,105 @@ class _SessionReviewScreenState extends ConsumerState<SessionReviewScreen> {
                   minimumSize: const Size.fromHeight(54)),
               child: const Text('View medical records'))
         ]));
+  }
+
+  String _reconciliationMessage(VoiceDraftResult result) => switch (
+        result.reconciliationStatus) {
+          'reconciled' => 'Available ASR drafts were compared and reconciled. Review the wording and any flagged differences below.',
+          'identical' => 'All available ASR drafts match. Please still review the transcript before submitting it to your clinician.',
+          'single_provider' => 'Only one ASR model returned a transcript. It is shown as a draft, not as a cross-checked result.',
+          'fallback_selected' => 'Automatic comparison was unavailable. Weighted model agreement selected a best-effort draft; please review it carefully.',
+          _ => 'Review this best-effort transcript carefully before submitting it to your clinician.',
+        };
+
+  Widget _legendDot(Color color, String label) => Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(width: 10, height: 10, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+        const SizedBox(width: 5),
+        Text(label, style: Theme.of(context).textTheme.labelSmall),
+      ]);
+
+  Widget _predictionCard(ASRModelPrediction prediction) {
+    final successful = widget.result!.predictions
+        .where((item) => item.status == 'success')
+        .toList();
+    final tokenCounts = <String, int>{};
+    for (final item in successful) {
+      final uniqueWords = RegExp(r"[a-z0-9']+")
+          .allMatches(item.text.toLowerCase())
+          .map((match) => match.group(0)!)
+          .toSet();
+      for (final word in uniqueWords) {
+        tokenCounts.update(word, (count) => count + 1, ifAbsent: () => 1);
+      }
+    }
+    final finalWords = RegExp(r"[a-z0-9']+")
+        .allMatches(transcript.text.toLowerCase())
+        .map((match) => match.group(0)!)
+        .toSet();
+    final statusColor = prediction.status == 'success'
+        ? Colors.teal
+        : Theme.of(context).colorScheme.error;
+    final predictionStyle = Theme.of(context).textTheme.bodyMedium?.copyWith(
+          fontSize: 14,
+          height: 1.5,
+          color: Theme.of(context).colorScheme.onSurface,
+        ) ??
+        const TextStyle(fontSize: 14, height: 1.5);
+    final predictionText = prediction.text.isEmpty
+        ? Text('No transcript returned (${prediction.errorCode ?? 'provider unavailable'}).',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: statusColor,
+                  height: 1.35,
+                ))
+        : RichText(
+            text: TextSpan(
+                style: predictionStyle,
+                children: RegExp(r'\S+\s*')
+                    .allMatches(prediction.text)
+                    .map((match) {
+                  final token = match.group(0)!;
+                  final wordMatch = RegExp(r"[a-z0-9']+")
+                      .firstMatch(token.toLowerCase());
+                  final word = wordMatch?.group(0);
+                  final missing = word != null && !finalWords.contains(word);
+                  final disputed = word != null &&
+                      (tokenCounts[word] ?? 0) < successful.length;
+                  final color = missing
+                      ? Colors.deepOrange
+                      : disputed
+                          ? Colors.amber.shade800
+                          : null;
+                  return TextSpan(
+                      text: token,
+                      style: color == null
+                          ? null
+                          : TextStyle(
+                              color: color,
+                              decoration: TextDecoration.underline,
+                              decorationColor: color,
+                              decorationThickness: 1.25));
+                }).toList()));
+    return Card(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Icon(Icons.circle, size: 10, color: statusColor),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: Text(prediction.model,
+                            style: const TextStyle(fontWeight: FontWeight.w700))),
+                    Text(prediction.status == 'success'
+                        ? '${prediction.latencyMs} ms'
+                        : 'unavailable')
+                  ]),
+                  const SizedBox(height: 8),
+                  predictionText,
+                ])));
   }
 }

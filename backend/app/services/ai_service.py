@@ -51,14 +51,14 @@ class AIProvider:
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "openai/whisper-large-v3")
     LLM_MODEL = "Qwen/Qwen3-8B"
     DEFAULT_ASR_MODELS = (
-        # Let the Hub select a currently live provider per model. Hard-coded
-        # model/provider pairs can silently become invalid as provider catalogs
-        # change, leaving the whole ensemble unavailable.
+        # Keep the OpenAI models on Hub auto-routing. Pin models whose current
+        # Hub model cards advertise a specific provider to avoid routing them
+        # to an unsupported backend.
         ("openai/whisper-large-v3", "auto", 1.20),
         ("openai/whisper-large-v3-turbo", "auto", 1.15),
-        ("Qwen/Qwen3-ASR-1.7B", "auto", 1.15),
-        ("nvidia/nemotron-3.5-asr-streaming-0.6b", "auto", 1.00),
-        ("CohereLabs/cohere-transcribe-03-2026", "auto", 1.10),
+        ("Qwen/Qwen3-ASR-1.7B", "deepinfra", 1.15),
+        ("nvidia/nemotron-3.5-asr-streaming-0.6b", "fal-ai", 1.00),
+        ("CohereLabs/cohere-transcribe-03-2026", "fal-ai", 1.10),
     )
 
     def _asr_model_configs(self) -> list[dict[str, str | float | None]]:
@@ -403,20 +403,36 @@ class AIProvider:
                 current = current.__cause__ or current.__context__
             statuses = []
             names = []
+            details = []
             for item in chain:
                 names.append(type(item).__name__.lower())
+                details.append(str(item).lower())
                 status = getattr(item, "status_code", None)
                 response = getattr(item, "response", None)
                 status = status or getattr(response, "status_code", None)
+                if response is not None:
+                    # Some SDK errors carry only the status on the response;
+                    # include its short diagnostic body for classification,
+                    # never for logs or API output.
+                    details.append(str(getattr(response, "text", "")).lower())
                 if isinstance(status, int):
                     statuses.append(status)
-            status = next((code for code in statuses if code in {401, 402, 403, 404, 400, 429} or code >= 500), None)
+            diagnostic = " ".join(details)
+            if any(term in diagnostic for term in (
+                "gated", "agree to share", "contact information", "accept the conditions"
+            )):
+                return "gated_model_access_required"
+            if "model not supported by provider" in diagnostic:
+                return "model_provider_unsupported"
+            status = next((code for code in statuses if code in {400, 401, 402, 403, 404, 408, 429} or code >= 500), None)
             if status == 401:
                 return "authentication_failed"
             if status == 402:
                 return "provider_billing_required"
             if status == 403:
                 return "inference_provider_permission_or_billing"
+            if status == 408:
+                return "provider_timeout"
             if status == 404:
                 return "model_provider_unavailable"
             if status == 400:

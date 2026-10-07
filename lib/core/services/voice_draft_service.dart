@@ -9,27 +9,86 @@ class VoiceDraftResult {
       required this.finalTranscript,
       required this.primaryTranscript,
       required this.secondaryTranscript,
-      required this.conflicts});
+      required this.conflicts,
+      required this.primaryModel,
+      required this.secondaryModel,
+      required this.reconciliationStatus,
+      required this.predictions});
   final String transcriptId,
       finalTranscript,
       primaryTranscript,
       secondaryTranscript;
   final List<String> conflicts;
+  final String primaryModel, secondaryModel, reconciliationStatus;
+  final List<ASRModelPrediction> predictions;
   factory VoiceDraftResult.fromJson(Map<String, dynamic> body) {
     final data = Map<String, dynamic>.from((body['data'] as Map?) ?? body);
     final transcript =
         Map<String, dynamic>.from(data['transcript'] as Map? ?? const {});
     final asr = Map<String, dynamic>.from(data['asr'] as Map? ?? const {});
+    final predictions = (asr['predictions'] as List? ?? const [])
+        .whereType<Map>()
+        .map((value) => ASRModelPrediction.fromJson(
+            Map<String, dynamic>.from(value)))
+        .toList();
+    if (predictions.isEmpty) {
+      for (final entry in [
+        (asr['primary_model'], asr['primary_transcript']),
+        (asr['secondary_model'], asr['secondary_transcript']),
+      ]) {
+        final model = (entry.$1 ?? '').toString();
+        final text = (entry.$2 ?? '').toString();
+        if (model.isNotEmpty || text.isNotEmpty) {
+          predictions.add(ASRModelPrediction(
+              model: model.isEmpty ? 'ASR model' : model,
+              text: text,
+              status: text.isEmpty ? 'unavailable' : 'success',
+              weight: 1,
+              latencyMs: 0));
+        }
+      }
+    }
     return VoiceDraftResult(
       transcriptId: (transcript['id'] ?? '').toString(),
       finalTranscript: (transcript['transcript_text'] ?? '').toString(),
       primaryTranscript: (asr['primary_transcript'] ?? '').toString(),
       secondaryTranscript: (asr['secondary_transcript'] ?? '').toString(),
+      primaryModel: (asr['primary_model'] ?? '').toString(),
+      secondaryModel: (asr['secondary_model'] ?? '').toString(),
+      reconciliationStatus:
+          (asr['reconciliation_status'] ?? 'unknown').toString(),
+      predictions: predictions,
       conflicts: (asr['conflicts'] as List? ?? const [])
           .map((value) => value.toString())
           .toList(),
     );
   }
+}
+
+class ASRModelPrediction {
+  const ASRModelPrediction({
+    required this.model,
+    required this.text,
+    required this.status,
+    required this.weight,
+    required this.latencyMs,
+    this.errorCode,
+  });
+
+  final String model, text, status;
+  final double weight;
+  final int latencyMs;
+  final String? errorCode;
+
+  factory ASRModelPrediction.fromJson(Map<String, dynamic> json) =>
+      ASRModelPrediction(
+        model: (json['model'] ?? 'ASR model').toString(),
+        text: (json['text'] ?? '').toString(),
+        status: (json['status'] ?? 'unknown').toString(),
+        weight: double.tryParse('${json['weight'] ?? 1}') ?? 1,
+        latencyMs: int.tryParse('${json['latency_ms'] ?? 0}') ?? 0,
+        errorCode: json['error_code']?.toString(),
+      );
 }
 
 class VoiceDraftService {
