@@ -394,8 +394,8 @@ class AIProvider:
     def transcribe_consensus(self, audio: bytes, filename: str = "recording.wav") -> TranscriptConsensus:
         configs = self._asr_model_configs()
 
-        def provider_error_code(exc: Exception) -> str:
-            """Return actionable, non-sensitive provider diagnostics."""
+        def provider_error_details(exc: Exception) -> tuple[str, str, str]:
+            """Return safe provider diagnostics without logging request/audio data."""
             chain: list[Exception] = []
             current: Exception | None = exc
             while current is not None and current not in chain:
@@ -407,7 +407,7 @@ class AIProvider:
             for item in chain:
                 names.append(type(item).__name__.lower())
                 details.append(str(item).lower())
-                status = getattr(item, "status_code", None)
+                status = getattr(item, "status_code", None) or getattr(item, "code", None)
                 response = getattr(item, "response", None)
                 status = status or getattr(response, "status_code", None)
                 if response is not None:
@@ -421,29 +421,37 @@ class AIProvider:
             if any(term in diagnostic for term in (
                 "gated", "agree to share", "contact information", "accept the conditions"
             )):
-                return "gated_model_access_required"
-            if "model not supported by provider" in diagnostic:
-                return "model_provider_unsupported"
+                code = "gated_model_access_required"
+            elif "model not supported by provider" in diagnostic:
+                code = "model_provider_unsupported"
+            else:
+                code = ""
             status = next((code for code in statuses if code in {400, 401, 402, 403, 404, 408, 429} or code >= 500), None)
-            if status == 401:
-                return "authentication_failed"
-            if status == 402:
-                return "provider_billing_required"
-            if status == 403:
-                return "inference_provider_permission_or_billing"
-            if status == 408:
-                return "provider_timeout"
-            if status == 404:
-                return "model_provider_unavailable"
-            if status == 400:
-                return "invalid_audio_or_model_request"
-            if status == 429:
-                return "provider_rate_limited"
-            if status is not None and status >= 500:
-                return "provider_unavailable"
-            if any("timeout" in name for name in names):
-                return "provider_timeout"
-            return "provider_error"
+            if not code:
+                code = {
+                    401: "authentication_failed",
+                    402: "provider_billing_required",
+                    403: "inference_provider_permission_or_billing",
+                    404: "model_provider_unavailable",
+                    408: "provider_timeout",
+                    400: "invalid_audio_or_model_request",
+                    429: "provider_rate_limited",
+                }.get(status, "provider_unavailable" if status and status >= 500 else "")
+            if not code and any("timeout" in name for name in names):
+                code = "provider_timeout"
+            if not code:
+                # Preserve the innermost exception class as a safe clue. The
+                # wrapped message/body is deliberately excluded: it may contain
+                # private request metadata and is not needed for diagnosis.
+                root_name = next(
+                    (name for name in reversed(names)
+                     if name not in {"runtimeerror", "exception", "error"}),
+                    "unknown",
+                )
+                safe_name = re.sub(r"[^a-z0-9]+", "_", root_name).strip("_")
+                code = f"provider_{safe_name}" if safe_name != "unknown" else "provider_error"
+            chain_label = ">".join(names[:5])
+            return code, chain_label, str(status) if status is not None else "none"
 
         def run_model(config: dict[str, str | float | None]) -> ASRPrediction:
             started = perf_counter()
@@ -462,12 +470,14 @@ class AIProvider:
                 return ASRPrediction(model, float(config["weight"]), "success", text,
                                      int((perf_counter() - started) * 1000))
             except Exception as exc:
-                error_code = provider_error_code(exc)
+                error_code, exception_chain, http_status = provider_error_details(exc)
                 logger.warning(
-                    "ASR model unavailable model=%s provider=%s error_code=%s latency_ms=%d",
+                    "ASR model unavailable model=%s provider=%s error_code=%s exception_chain=%s http_status=%s latency_ms=%d",
                     model,
                     config.get("provider", "auto"),
                     error_code,
+                    exception_chain,
+                    http_status,
                     int((perf_counter() - started) * 1000),
                 )
                 return ASRPrediction(model, float(config["weight"]), "unavailable", "",

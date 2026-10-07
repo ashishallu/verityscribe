@@ -118,6 +118,20 @@ class TranscriptConsensusTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "gated_model_access_required"):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
 
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
+    def test_unclassified_provider_failure_preserves_safe_exception_category(self):
+        class TransportProtocolFailure(Exception):
+            pass
+
+        with patch.object(
+            self.provider,
+            "_transcribe_with",
+            side_effect=TransportProtocolFailure("private request content must not be shown"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "provider_transportprotocolfailure") as error:
+                self.provider.transcribe_consensus(b"audio", "visit.wav")
+        self.assertNotIn("private request content", str(error.exception))
+
     @patch.dict(os.environ, {"HF_TOKEN": "test-token"})
     def test_provider_routed_model_uses_its_configured_provider(self):
         client_kwargs = []
