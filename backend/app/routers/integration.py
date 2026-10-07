@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query
 import httpx
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from starlette.concurrency import run_in_threadpool
 from supabase import Client, create_client
 
 from ..core.config import settings
@@ -1245,7 +1246,9 @@ async def upload_consultation_voice(consultation_id: str, audio: UploadFile = Fi
         except Exception: pass
         raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
     try:
-        consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
+        consensus = await run_in_threadpool(
+            ai_provider.transcribe_consensus, content, audio.filename or "recording.bin"
+        )
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
         return {"data": {"recording": recording, "transcript": transcript, "asr": ai_provider.consensus_payload(consensus), "status": "transcribed"}}
     except Exception:
@@ -1286,7 +1289,9 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
             pass
         raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
     try:
-        consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
+        consensus = await run_in_threadpool(
+            ai_provider.transcribe_consensus, content, audio.filename or "recording.bin"
+        )
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
     except RuntimeError as exc:
         # Do not log a traceback from a third-party SDK here: exception chains
