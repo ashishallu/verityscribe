@@ -75,7 +75,30 @@ class TranscriptConsensusTests(unittest.TestCase):
 
         self.assertEqual(len(configs), 5)
         self.assertEqual(len({entry["model"] for entry in configs}), 5)
-        self.assertTrue(all(entry["provider"] for entry in configs))
+        self.assertTrue(all(entry["provider"] == "auto" for entry in configs))
+        self.assertIn("openai/whisper-large-v3", {entry["model"] for entry in configs})
+        self.assertIn("Qwen/Qwen3-ASR-1.7B", {entry["model"] for entry in configs})
+
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
+    def test_all_provider_failures_report_safe_actionable_codes(self):
+        class ProviderFailure(Exception):
+            status_code = 403
+
+        def fail_provider(*_args, **_kwargs):
+            try:
+                raise ProviderFailure("private response")
+            except ProviderFailure as exc:
+                raise RuntimeError("request failed") from exc
+
+        with patch.object(
+            self.provider,
+            "_transcribe_with",
+            side_effect=fail_provider,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "inference_provider_permission_or_billing"
+            ):
+                self.provider.transcribe_consensus(b"audio", "visit.wav")
 
     @patch.dict(os.environ, {"HF_TOKEN": "test-token"})
     def test_provider_routed_model_uses_its_configured_provider(self):

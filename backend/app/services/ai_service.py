@@ -51,11 +51,14 @@ class AIProvider:
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "openai/whisper-large-v3")
     LLM_MODEL = "Qwen/Qwen3-8B"
     DEFAULT_ASR_MODELS = (
-        ("openai/whisper-large-v3", "fal-ai", 1.20),
-        ("openai/whisper-large-v3-turbo", "deepinfra", 1.15),
-        ("Qwen/Qwen3-ASR-0.6B", "deepinfra", 1.00),
-        ("Qwen/Qwen3-ASR-1.7B", "deepinfra", 1.15),
-        ("nvidia/parakeet-tdt-0.6b-v3", "together", 1.00),
+        # Let the Hub select a currently live provider per model. Hard-coded
+        # model/provider pairs can silently become invalid as provider catalogs
+        # change, leaving the whole ensemble unavailable.
+        ("openai/whisper-large-v3", "auto", 1.20),
+        ("openai/whisper-large-v3-turbo", "auto", 1.15),
+        ("Qwen/Qwen3-ASR-1.7B", "auto", 1.15),
+        ("nvidia/nemotron-3.5-asr-streaming-0.6b", "auto", 1.00),
+        ("CohereLabs/cohere-transcribe-03-2026", "auto", 1.10),
     )
 
     def _asr_model_configs(self) -> list[dict[str, str | float | None]]:
@@ -391,6 +394,41 @@ class AIProvider:
     def transcribe_consensus(self, audio: bytes, filename: str = "recording.wav") -> TranscriptConsensus:
         configs = self._asr_model_configs()
 
+        def provider_error_code(exc: Exception) -> str:
+            """Return actionable, non-sensitive provider diagnostics."""
+            chain: list[Exception] = []
+            current: Exception | None = exc
+            while current is not None and current not in chain:
+                chain.append(current)
+                current = current.__cause__ or current.__context__
+            statuses = []
+            names = []
+            for item in chain:
+                names.append(type(item).__name__.lower())
+                status = getattr(item, "status_code", None)
+                response = getattr(item, "response", None)
+                status = status or getattr(response, "status_code", None)
+                if isinstance(status, int):
+                    statuses.append(status)
+            status = next((code for code in statuses if code in {401, 402, 403, 404, 400, 429} or code >= 500), None)
+            if status == 401:
+                return "authentication_failed"
+            if status == 402:
+                return "provider_billing_required"
+            if status == 403:
+                return "inference_provider_permission_or_billing"
+            if status == 404:
+                return "model_provider_unavailable"
+            if status == 400:
+                return "invalid_audio_or_model_request"
+            if status == 429:
+                return "provider_rate_limited"
+            if status is not None and status >= 500:
+                return "provider_unavailable"
+            if any("timeout" in name for name in names):
+                return "provider_timeout"
+            return "provider_error"
+
         def run_model(config: dict[str, str | float | None]) -> ASRPrediction:
             started = perf_counter()
             model = str(config["model"])
@@ -408,9 +446,17 @@ class AIProvider:
                 return ASRPrediction(model, float(config["weight"]), "success", text,
                                      int((perf_counter() - started) * 1000))
             except Exception as exc:
+                error_code = provider_error_code(exc)
+                logger.warning(
+                    "ASR model unavailable model=%s provider=%s error_code=%s latency_ms=%d",
+                    model,
+                    config.get("provider", "auto"),
+                    error_code,
+                    int((perf_counter() - started) * 1000),
+                )
                 return ASRPrediction(model, float(config["weight"]), "unavailable", "",
                                      int((perf_counter() - started) * 1000),
-                                     "provider_error" if str(exc) != "empty_transcript" else "empty_transcript")
+                                     "empty_transcript" if str(exc) == "empty_transcript" else error_code)
 
         # Submit every configured recognizer before waiting, so wall time is
         # bounded by the slowest provider rather than the sum of all providers.
@@ -418,7 +464,10 @@ class AIProvider:
             predictions = list(pool.map(run_model, configs))
         successful = [item for item in predictions if item.status == "success"]
         if not successful:
-            raise RuntimeError("All configured ASR models were unavailable")
+            failures = ", ".join(
+                f"{item.model}:{item.error_code or 'unknown'}" for item in predictions
+            )
+            raise RuntimeError(f"All configured ASR models were unavailable ({failures})")
 
         conflicts = [
             f"{item.model} did not return a transcript ({item.error_code})."

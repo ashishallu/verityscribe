@@ -1289,8 +1289,33 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
         consensus = ai_provider.transcribe_consensus(content, audio.filename or "recording.bin")
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
     except RuntimeError as exc:
-        logger.exception("Patient voice transcription provider failed: %s", exc)
-        raise HTTPException(status_code=503, detail="Voice transcription is currently unavailable") from exc
+        # Do not log a traceback from a third-party SDK here: exception chains
+        # can include provider response bodies. transcribe_consensus emits
+        # per-model status codes without audio or transcript data.
+        logger.error("Patient voice transcription provider failed: %s", exc)
+        reason = str(exc)
+        if "inference_provider_permission_or_billing" in reason:
+            detail = (
+                "Hugging Face rejected ASR access. The HF token in Render needs "
+                "Inference Providers permission, and provider billing/credits must be enabled. "
+                "Your recording was saved securely; retry after updating the token."
+            )
+        elif "authentication_failed" in reason:
+            detail = (
+                "The Hugging Face token configured in Render was rejected. "
+                "Your recording was saved securely; replace the token and retry."
+            )
+        elif "provider_billing_required" in reason:
+            detail = (
+                "Hugging Face Inference Providers require billing or available credits. "
+                "Your recording was saved securely; retry after resolving billing."
+            )
+        else:
+            detail = (
+                "Voice transcription is temporarily unavailable. Your recording was saved securely; "
+                "please retry shortly."
+            )
+        raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Unable to persist voice transcript") from exc
     return {"data": {"recording": recording, "transcript": transcript, "asr": ai_provider.consensus_payload(consensus), "requires_doctor_review": True}}
