@@ -223,6 +223,12 @@ def _report_text_is_persisted(client: Client, document_id: str, patient_id: str)
 
 
 def _is_personal_health_question(message: str) -> bool:
+    # Patient-specific values are often phrased with a possessive (“the
+    # patient's platelet count”), not only as “my …”. Normalize curly quotes
+    # because that is the default apostrophe on many mobile keyboards.
+    lowered = message.lower().replace("’", "'")
+    if re.search(r"\b(?:my|mine|patient's|patients')\b", lowered):
+        return True
     terms = (
         "my ", "mine", "medical record", "health record",
         "report", "prescription", "medicine", "medication", "diagnosis",

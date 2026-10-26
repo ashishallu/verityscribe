@@ -199,6 +199,32 @@ class SessionScopedDocumentTests(unittest.TestCase):
         self.assertNotIn("Drug A 10 mg", captured["prompt"])
         self.assertNotIn("DOCUMENT EVIDENCE", captured["prompt"])
 
+    def test_patient_possessive_lab_question_uses_attached_report_context(self):
+        client = _Client()
+        client.texts[0]["content"] = (
+            "[Page 1]\nPlatelet count: 72,000/µL\nHemoglobin: 10.8 g/dL"
+        )
+        captured = {}
+
+        def answer(prompt):
+            captured["prompt"] = prompt
+            return "The attached report lists 72,000/µL; this is unverified extracted text."
+
+        with patch("app.routers.integration.db", return_value=client), \
+             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
+             patch("app.routers.integration.ai_provider.answer", side_effect=answer):
+            result = secure_chat(
+                ChatRequest(message="What is the patient’s platelet count?", session_id=SESSION_A),
+                {"sub": "patient-a", "app_metadata": {"role": "patient"}},
+            )
+
+        self.assertIn("Platelet count: 72,000/µL", captured["prompt"])
+        self.assertIn("answering a question about documents attached", captured["prompt"])
+        self.assertNotIn("MODE: GENERAL", captured["prompt"])
+        self.assertTrue(result["data"]["uses_personal_health_data"])
+        self.assertEqual(result["data"]["answer"],
+                         "The attached report lists 72,000/µL; this is unverified extracted text.")
+
     def test_remove_detaches_only_this_session_without_deleting_source_text(self):
         client = _Client()
         with patch("app.routers.integration.db", return_value=client), \
