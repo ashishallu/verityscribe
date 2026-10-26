@@ -1,11 +1,9 @@
 import os
 import json
 import base64
-from io import BytesIO
 import sys
 import types
 import unittest
-import wave
 from unittest.mock import patch
 
 # These tests exercise only the provider-agnostic consensus logic. Keep them
@@ -25,14 +23,13 @@ class TranscriptConsensusTests(unittest.TestCase):
         credentials = patch.dict(os.environ, {
             "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
             "CLOUDFLARE_API_TOKEN": "cf-token-test",
-            "CLOUDFLARE_AI_GATEWAY": "test-gateway",
         })
         credentials.start()
         self.addCleanup(credentials.stop)
 
     TWO_MODEL_CONFIG = json.dumps([
         {"model": "@cf/openai/whisper-large-v3-turbo", "provider": "cloudflare", "weight": 1.1},
-        {"model": "@cf/deepgram/flux", "provider": "cloudflare", "weight": 1.15},
+        {"model": "@cf/openai/whisper", "provider": "cloudflare", "weight": 1.15},
     ])
 
     def test_single_provider_result_is_not_duplicated_as_two_drafts(self):
@@ -80,21 +77,36 @@ class TranscriptConsensusTests(unittest.TestCase):
         self.assertEqual(result.final_text, "patient has a cough")
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": ""})
-    def test_default_setup_preserves_three_working_models_and_has_two_replacements(self):
+    def test_default_setup_contains_only_the_four_working_models(self):
         configs = self.provider._asr_model_configs()
 
-        self.assertEqual(len(configs), 5)
-        self.assertEqual(len({entry["model"] for entry in configs}), 5)
+        self.assertEqual(len(configs), 4)
+        self.assertEqual(len({entry["model"] for entry in configs}), 4)
         providers = {entry["model"]: entry["provider"] for entry in configs}
         self.assertEqual(set(providers), {
             "@cf/openai/whisper", "@cf/openai/whisper-tiny-en",
-            "@cf/deepgram/nova-3", "@cf/deepgram/flux",
+            "@cf/deepgram/nova-3",
             "@cf/openai/whisper-large-v3-turbo",
         })
         self.assertEqual(set(providers.values()), {"cloudflare"})
         self.assertEqual([entry["model"] for entry in configs[:3]], [
             "@cf/openai/whisper", "@cf/openai/whisper-tiny-en", "@cf/deepgram/nova-3"
         ])
+
+    def test_flux_is_rejected_from_custom_asr_configuration(self):
+        config = json.dumps([{"model": "@cf/deepgram/flux", "provider": "cloudflare"}])
+        with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": config}):
+            with self.assertRaisesRegex(RuntimeError, "not on the approved"):
+                self.provider._asr_model_configs()
+
+    def test_custom_asr_configuration_cannot_exceed_four_models(self):
+        config = json.dumps([
+            {"model": model, "provider": "cloudflare"}
+            for model, _provider, _weight in self.provider.DEFAULT_ASR_MODELS
+        ] + [{"model": "@cf/openai/whisper", "provider": "cloudflare"}])
+        with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": config}):
+            with self.assertRaisesRegex(RuntimeError, "between one and four"):
+                self.provider._asr_model_configs()
 
     def test_three_existing_cloudflare_model_wire_formats_are_preserved(self):
         class Response:
@@ -136,49 +148,6 @@ class TranscriptConsensusTests(unittest.TestCase):
         request = post.call_args.args[0]
         self.assertEqual(json.loads(request.data), {"audio": base64.b64encode(audio).decode("ascii")})
         self.assertIn("/ai/run/@cf/openai/whisper-large-v3-turbo", request.full_url)
-
-    def test_flux_websocket_replays_pcm_and_collects_final_turn_transcript(self):
-        import websockets.sync.client
-
-        pcm = b"\x01\x00" * 160
-        wav_buffer = BytesIO()
-        with wave.open(wav_buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(16000)
-            wav_file.writeframes(pcm)
-        sent = []
-
-        class Socket:
-            def __enter__(self): return self
-            def __exit__(self, *_args): pass
-            def send(self, message): sent.append(message)
-            def recv(self, timeout=None):
-                if not hasattr(self, "received"):
-                    self.received = True
-                    return json.dumps({
-                        "type": "TurnInfo",
-                        "event": "EndOfTurn",
-                        "transcript": "Flux transcript",
-                    })
-                raise TimeoutError("done")
-
-        with patch.object(websockets.sync.client, "connect", return_value=Socket()) as connect:
-            transcript = self.provider._transcribe_with(
-                wav_buffer.getvalue(), "visit.wav", None, "@cf/deepgram/flux", "cloudflare"
-            )
-        self.assertEqual(transcript, "Flux transcript")
-        self.assertEqual(sent[0], pcm)
-        self.assertEqual(json.loads(sent[-1]), {"type": "CloseStream"})
-        self.assertIn("model=%40cf%2Fdeepgram%2Fflux", connect.call_args.args[0])
-        self.assertEqual(
-            connect.call_args.kwargs["additional_headers"]["cf-aig-authorization"],
-            "cf-token-test",
-        )
-
-    def test_flux_requires_valid_pcm_wav(self):
-        with self.assertRaisesRegex(RuntimeError, "valid PCM WAV"):
-            self.provider._transcribe_flux(b"not-wav", "acct", "token", 10)
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
     def test_all_provider_failures_report_safe_actionable_codes(self):
@@ -293,7 +262,7 @@ class TranscriptConsensusTests(unittest.TestCase):
             with self.assertRaises(ai_service.ASRAllModelsFailed) as caught:
                 self.provider.transcribe_consensus(b"audio", "visit.wav", "correlation-test")
         self.assertEqual(caught.exception.request_id, "correlation-test")
-        self.assertEqual(len(caught.exception.predictions), 5)
+        self.assertEqual(len(caught.exception.predictions), 4)
         self.assertTrue(all(item.status == "TIMEOUT" for item in caught.exception.predictions))
         payload = self.provider.failed_consensus_payload(caught.exception.predictions)
         self.assertEqual(payload["execution_status"], "all_failed")
@@ -306,7 +275,7 @@ class TranscriptConsensusTests(unittest.TestCase):
                 self.provider._asr_model_configs()
 
     @patch.dict(os.environ, {"HF_TOKEN": "test-token"})
-    def test_five_models_run_and_return_individual_predictions(self):
+    def test_four_models_run_and_return_individual_predictions(self):
         configs = [
             {"model": model, "provider": "cloudflare", "weight": weight}
             for model, _provider, weight in self.provider.DEFAULT_ASR_MODELS
@@ -318,7 +287,7 @@ class TranscriptConsensusTests(unittest.TestCase):
         ) as reconcile:
             result = self.provider.transcribe_consensus(b"audio", "visit.wav")
 
-        self.assertEqual(len(result.predictions), 5)
+        self.assertEqual(len(result.predictions), 4)
         self.assertTrue(all(item.status == "SUCCESS" for item in result.predictions))
         self.assertEqual(result.execution_status, "all_success")
         self.assertEqual(result.final_text, "curated text")

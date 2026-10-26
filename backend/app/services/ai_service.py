@@ -1,9 +1,6 @@
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import base64
-from io import BytesIO
-from urllib.parse import quote
-import wave
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 import json
@@ -83,13 +80,11 @@ class AIProvider:
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "@cf/openai/whisper-large-v3-turbo")
     LLM_MODEL = "Qwen/Qwen3-8B"
     DEFAULT_ASR_MODELS = (
-        # Preserve the three reported-working Cloudflare routes and their
-        # existing weights. Replace the two failed Turbo routes with the
-        # Cloudflare batch Turbo adapter and the distinct real-time Flux model.
+        # Four user-verified working Cloudflare routes. Keep their weights and
+        # wire formats stable; Flux was removed after repeated Gateway 401s.
         ("@cf/openai/whisper", "cloudflare", 1.10),
         ("@cf/openai/whisper-tiny-en", "cloudflare", 0.80),
         ("@cf/deepgram/nova-3", "cloudflare", 1.10),
-        ("@cf/deepgram/flux", "cloudflare", 1.00),
         ("@cf/openai/whisper-large-v3-turbo", "cloudflare", 1.15),
     )
 
@@ -100,8 +95,8 @@ class AIProvider:
                 models = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("AI_ASR_MODELS_JSON must contain a JSON array") from exc
-            if not isinstance(models, list) or not 1 <= len(models) <= 5:
-                raise RuntimeError("AI_ASR_MODELS_JSON must define between one and five models")
+            if not isinstance(models, list) or not 1 <= len(models) <= 4:
+                raise RuntimeError("AI_ASR_MODELS_JSON must define between one and four models")
             configs = []
             for item in models:
                 if not isinstance(item, dict):
@@ -351,9 +346,6 @@ class AIProvider:
         if not account_id or not token:
             raise RuntimeError("Cloudflare ASR credentials are not configured")
 
-        if model == "@cf/deepgram/flux":
-            return self._transcribe_flux(audio, account_id, token, timeout)
-
         url = (
             "https://api.cloudflare.com/client/v4/accounts/"
             f"{account_id}/ai/run/{model}"
@@ -400,85 +392,6 @@ class AIProvider:
         return text.strip()
 
     @staticmethod
-    def _wav_pcm16_mono_16khz(audio: bytes) -> bytes:
-        """Extract the app's documented PCM WAV format for Deepgram streaming."""
-        try:
-            with wave.open(BytesIO(audio), "rb") as wav_file:
-                if (wav_file.getnchannels(), wav_file.getsampwidth(), wav_file.getframerate()) != (1, 2, 16000):
-                    raise RuntimeError("Flux requires mono 16-bit PCM WAV audio at 16 kHz")
-                return wav_file.readframes(wav_file.getnframes())
-        except (wave.Error, EOFError) as exc:
-            raise RuntimeError("Flux requires a valid PCM WAV recording") from exc
-
-    def _transcribe_flux(self, audio: bytes, account_id: str, token: str, timeout: float) -> str:
-        gateway = os.getenv("CLOUDFLARE_AI_GATEWAY", "default").strip() or "default"
-        try:
-            from websockets.sync.client import connect
-        except ImportError as exc:
-            raise RuntimeError("Cloudflare Flux requires the websockets runtime") from exc
-
-        pcm = self._wav_pcm16_mono_16khz(audio)
-        url = (
-            "wss://gateway.ai.cloudflare.com/v1/"
-            f"{quote(account_id, safe='')}/{quote(gateway, safe='')}/workers-ai"
-            "?model=%40cf%2Fdeepgram%2Fflux&encoding=linear16&sample_rate=16000"
-            "&eot_timeout_ms=1000&eot_threshold=0.5"
-        )
-        transcripts: list[str] = []
-        try:
-            with connect(
-                url,
-                # AI Gateway's provider-native WebSocket auth expects the raw
-                # Cloudflare API token in this header (unlike REST Bearer auth).
-                additional_headers={"cf-aig-authorization": token},
-                open_timeout=min(timeout, 15.0),
-                close_timeout=2.0,
-            ) as socket:
-                # 100 ms PCM chunks keep the live-stream framing modest while
-                # allowing buffered recordings to be replayed without storing
-                # or re-encoding additional copies of patient audio.
-                chunk_bytes = 16000 * 2 // 10
-                for offset in range(0, len(pcm), chunk_bytes):
-                    socket.send(pcm[offset:offset + chunk_bytes])
-                socket.send(json.dumps({"type": "CloseStream"}))
-                deadline = perf_counter() + timeout
-                while perf_counter() < deadline:
-                    try:
-                        raw_message = socket.recv(timeout=max(0.1, deadline - perf_counter()))
-                    except TimeoutError:
-                        break
-                    except Exception:
-                        if transcripts:
-                            break
-                        raise
-                    if isinstance(raw_message, bytes):
-                        raw_message = raw_message.decode("utf-8", errors="replace")
-                    try:
-                        message = json.loads(raw_message)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    event = str(message.get("event") or message.get("type") or "")
-                    transcript = message.get("transcript")
-                    if not transcript:
-                        transcript = (
-                            message.get("channel", {})
-                            .get("alternatives", [{}])[0]
-                            .get("transcript")
-                        )
-                    if isinstance(transcript, str) and transcript.strip() and event in {
-                        "EndOfTurn", "Results", "result"
-                    }:
-                        transcripts.append(transcript.strip())
-                    if event in {"CloseStream", "closed"}:
-                        break
-        except Exception as exc:
-            raise RuntimeError(f"Cloudflare Flux request failed ({type(exc).__name__})") from exc
-        text = " ".join(dict.fromkeys(transcripts)).strip()
-        if not text:
-            raise RuntimeError("Cloudflare Flux returned no final transcript")
-        return text
-
-    @staticmethod
     def _exception_chain(exc: Exception) -> list[Exception]:
         chain: list[Exception] = []
         current: Exception | None = exc
@@ -515,8 +428,6 @@ class AIProvider:
                 diagnostic_parts.append(response_text.lower())
         diagnostic = " ".join(diagnostic_parts)
         status = cls._provider_status(exc)
-        if "requires cloudflare_ai_gateway" in diagnostic:
-            return "provider_configuration_missing"
         if any(term in diagnostic for term in (
             "gated", "agree to share", "contact information", "accept the conditions",
         )):
@@ -712,7 +623,7 @@ class AIProvider:
                     started_clock.isoformat(), completed.isoformat(), retry_count, diagnostic,
                 )
 
-        # Bound in-flight calls while still starting all four/five models in parallel.
+        # Bound in-flight calls while starting every configured model in parallel.
         predictions = list(_ASR_EXECUTOR.map(run_model, configs))
         successful = [item for item in predictions if item.status == "SUCCESS"]
         if not successful:
