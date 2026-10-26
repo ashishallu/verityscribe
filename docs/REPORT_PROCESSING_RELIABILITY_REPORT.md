@@ -1,5 +1,98 @@
 # Medical report processing reliability report
 
+> **Latest live failure diagnosis — 2026-10-26.** Both Render services (`verityscribe-1` and `verityscribe`) are live on commit `b70a675c8886f30dcf7fa3899651cbd6ec023cee` (`Harden medical report processing and retries`). This deployed commit still invokes Cloudflare Vision; the local Tesseract/PDFium changes are only uncommitted working-tree changes. Latest upload `request_id=hnkp9gix2w94w7ek` on `verityscribe-1` (2026-10-26 15:04:28–15:04:31 UTC) passed authentication and private Storage upload, then Cloudflare returned HTTP 403, code `5016` (model terms not accepted). FastAPI returned HTTP 503. A read-only Supabase check confirmed the private object remains but no matching `medical_documents` or `patient_embeddings` rows exist. This is the first failing stage: legacy hosted Vision, before local OCR and persistence. No deploy or push was performed.
+
+## Live request trace for the persistent error
+
+- Render confirms both services auto-deploy from `master` and both latest deployments are live on `b70a675c8886f30dcf7fa3899651cbd6ec023cee`. `verityscribe-1` (`srv-d9l1ghtaeets73fnlbng`, deploy `dep-dbfm2co473hc73a8nll0`) uses Docker context `backend` and `backend/Dockerfile`; `verityscribe` (`srv-d9l19qoae00c7388iu50`, deploy `dep-dbfm2co473hc73a8nls0`) uses root directory `backend`, context `.`, and `Dockerfile`. Both resolve to the same backend Dockerfile/source at the same commit. The deployed Dockerfile does not install Tesseract; deployed requirements do not include `pypdfium2`/Pillow. `git show HEAD:backend/app/services/ai_service.py` confirms Cloudflare Vision remains active. The local OCR implementation is not running in production.
+- Exact latest request trace: request/correlation ID `hnkp9gix2w94w7ek`; `POST /api/v1/chat/reports`; `type=prescription`, 28,930 bytes, `image/jpeg`. At `15:04:28.862791448Z` the route logged receipt; at `15:04:30.711306747Z` it logged `Chat report stored privately`; at `15:04:31.512558497Z` it logged `Report provider failed`, category `vision_model_terms_required`, HTTP 403, provider code `5016`, `retained=True`, elapsed 2650 ms; at `15:04:31.513415693Z` the response was HTTP 503. Authentication, validation, bucket lookup, and upload succeeded. The first failing stage is the legacy Cloudflare Vision request—not Storage, local OCR, structured extraction, or database persistence. No token, image bytes, or medical text are included here.
+- Read-only Supabase checks for this request found one private Storage object and zero matching rows in `public.medical_documents` and `public.patient_embeddings`. The latest object was retained; no extraction metadata/text persistence occurred. Earlier request `hnkmw3lx2wfvkwfs` (13:38 UTC) removed its object under the older unclassified-error behavior; that is not what happened for the latest `retained=True` request. No RLS or bucket policy was changed.
+- Render MCP service/deploy/log inspection does not expose environment variable values or remote shell. Dashboard inspection timed out, so the two services' runtime environment key sets cannot be compared from available evidence. No secret values were requested, printed, or changed. The sanitized `5016` terms-required response is evidence against diagnosing this request as a missing/invalid token.
+- Flutter's current `ClinicNotifier.uploadReport` parses a non-2xx JSON body's `detail` into `ApiException`, and `AiScreen` displays that message. Its generic “The report could not be uploaded” fallback is used only when no `ApiException` reaches the screen. That generic wording can therefore indicate a stale/different Flutter client or a non-JSON/unexpected response; it does not change the confirmed backend 503 cause for the logged requests.
+- The Render MCP exposes service, deploy, and log inspection but no shell/exec command. I could not invoke `tesseract --version` inside the deployed instance. The live commit evidence is conclusive that the currently deployed image lacks the newly declared OCR installation steps; it is not evidence that the new OCR runtime works.
+
+**Confirmed root cause of the current live failure:** production is still executing the Cloudflare Vision route, and the Cloudflare account has not accepted the model agreement (`5016`). The local OCR replacement is undeployed. Missing Tesseract/PDFium is a deployment blocker for that replacement, not the direct cause of the current logged 503.
+
+> **Current implementation update — 2026-10-26 (supersedes the earlier findings below).** The image route no longer calls Cloudflare Vision or Hugging Face image inference. Scanned and mixed PDFs now have a local OCR path. The earlier report below is retained as history; it describes the pre-replacement state and must not be read as the current implementation.
+
+## Current result
+
+**Verdict: PARTIALLY VERIFIED.** Locally, document extraction now uses open-source OCR and 38 automated backend tests pass, including mocked OCR and patient-scope tests. In production, both Render services remain on the prior Cloudflare Vision implementation, which is currently failing with code `5016`. The new OCR runtime and private Storage-to-draft persistence path remain unverified end to end: the local Docker engine is unavailable, no remote shell is exposed, and no synthetic OCR upload was run against a deployed build. The hosted service must not be described as fixed until the scoped code is authorized, deployed, and a synthetic upload passes through OCR and persistence.
+
+### Synthetic reproduction performed in this investigation (local only)
+
+These were real local execution attempts against the current working-tree implementation, not mocked OCR, and did **not** contact production:
+
+| Synthetic input / check | Result | What it establishes |
+|---|---|---|
+| PNG with printed text `VERITYSCRIBE OCR TEST — Patient reports headache for two days.` passed to local `extract_image_text` | Failed immediately with `engine_not_installed` because no `tesseract` executable is installed on this workstation | Local OCR code correctly detects the missing executable; no OCR recognition result was obtained. |
+| In-memory text-based PDF containing `VERITYSCRIBE OCR TEST - Patient reports headache for two days.` passed to local PDF extractor | Passed; extracted the expected sentence with its page marker | Local embedded-PDF-text path works on this synthetic sample. |
+| In-memory scanned PDF rendered from the synthetic image, passed to local PDF extractor | PDFium rendered the page; subsequent OCR failed with `engine_not_installed` | Local PDFium import/render path works on this sample, but scanned-PDF OCR is unverified because Tesseract is absent. |
+| Deployed `tesseract --version`, language-data check, and synthetic recognition | Not executable: Render offers no shell/exec through the connected MCP; deployed commit also lacks the install commands | There is no evidence that Tesseract or `eng`/`kan` data exists in either deployed container. |
+| Authenticated production synthetic PNG/PDF upload through Flutter → API → private Storage → OCR → DB → Reports list | Not run | No production patient session/JWT or approved diagnostic upload path was available. The real prescription request trace is evidence only of the old route failing; it is not a synthetic OCR test. |
+
+**Precise unresolved boundary:** after code review and the production trace, we can identify the current live failure exactly (Cloudflare Vision returns 403/code `5016` before extraction). We cannot establish from current production evidence that the replacement container installs or runs Tesseract, because that implementation is not deployed and Render MCP provides neither remote command execution nor a diagnostic endpoint. The next valid verification is a scoped deployment of only the OCR changes, followed by a synthetic upload using an authorized test patient, then read-only confirmation of the object, extracted draft rows, and `/me/reports` result.
+
+## Current pipeline and changes
+
+1. Patient uploads are authenticated; file bytes are signature-checked, bounded to the existing 10 MB default, and image dimensions/format are validated before private Storage writes. Image OCR is run in a worker thread. PDF processing keeps the existing 25-page limit and extracts text directly when available; scanned pages are rendered one at a time with PDFium, then OCRed. Mixed pages preserve both embedded and separately recognized text, page labels are retained, OCR is capped at 35 seconds per page and 90 seconds per PDF request, and a page/image that cannot be verified or read fails rather than disappearing silently.
+2. **OCR engine:** Tesseract OCR (`tesseract-ocr` plus English and Kannada trained data; invoked as `tesseract stdin stdout -l eng+kan --oem 1 --psm 6`). It is a local executable, not a hosted model/API. Pillow applies EXIF orientation, grayscale/contrast normalization, and bounded downscaling. `pypdfium2` provides local PDF page rendering; `pypdf` continues embedded-text extraction and encryption/page-count validation. OCR processes pages serially to avoid loading a vision model or several page images at once.
+3. The original upload remains in the existing private Supabase bucket; extracted text and metadata continue to be persisted in `medical_documents` and `patient_embeddings` through the existing authenticated patient → service-side write path. `/me/reports` now includes the patient's own uploaded drafts in the existing Reports list without creating an authoritative `reports` row. The UI visibly labels these as **Unverified OCR draft**. Upload success invalidates the Reports-list provider so it refreshes.
+4. The chatbot route is separate from OCR. It already queries `patient_embeddings` filtered by the authenticated patient ID and personal-prescription answers explicitly call OCR output unverified. Regression tests cover this patient filter and warning. No change to the general-chat provider was made; the available evidence does not establish that its earlier generic error shared the document OCR failure.
+5. No change was made to the four working ASR models, their request formats, or the turbo audio-format fix. `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` remain because they are used by ASR; `CLOUDFLARE_VISION_MODEL` was removed from Render blueprint and backend example configuration. No secrets were read or changed.
+
+## Why this OCR option; rejected alternatives
+
+The known production symptom was an HTTP 403 from the former Cloudflare Vision route. The prior implementation did not retain the provider's numeric error code, so the exact 403 subtype (account/model access, terms, token permissions, or plan) cannot be established from the available sanitized log. Instead of continuing that dependency, this implementation removes the Vision call entirely.
+
+The chosen engine is Tesseract because it is a local, permissively licensed OCR engine with published command-line input/output, and its language data includes English and Kannada. It has no hosted-inference price or API quota; the incremental cost is container image size and Render CPU/RAM. Render's published Free web-service limit is 0.1 CPU and 512 MB RAM, so a sequential classical OCR engine is materially more suitable than loading a multi-billion-parameter vision-language model. Actual Render memory and latency have **not** been measured. Tesseract is intended for printed text and is not dependable for handwritten prescriptions; medical names, doses, decimals, units, tables, and handwriting must remain explicitly unverified.
+
+Candidate review:
+
+| Candidate | Evidence and fit | Decision |
+|---|---|---|
+| Tesseract 5 + Pillow + pypdfium2 | Local OCR on image bytes; local PDF page rendering; no remote inference fee/quota. English + Kannada training data. Low-complexity CPU path, sequential and bounded. | Selected for the first zero-hosted-inference implementation. Needs live OCR-quality and memory tests before claiming production reliability. |
+| `microsoft/trocr-base-printed` | Hugging Face marks it Image-to-Text, but its card says it is not deployed by an Inference Provider; it is a 0.3B-parameter line-image recognizer, not a PDF processor. Hosted route/free pricing therefore is not available to verify; local model weights add runtime and memory beyond the selected classical OCR path. | Not selected. |
+| PaddleOCR | A dedicated OCR family and plausible local alternative, but it adds another model/runtime stack and CPU/memory footprint. No deployment or medical-document benchmark was run in this task. | Not selected for the constrained first version; may be benchmarked later using synthetic/authorized data. |
+| Qwen / DeepSeek VLMs | Suitable families for image understanding/OCR, but hosted availability and free inference are account/provider-specific; public weights do not establish a zero-cost hosted endpoint. Local large VLM inference does not fit the known Render Free 512 MB plan. | Not selected; no hidden paid inference or fallback. |
+
+The implementation is local OCR only. Thus “availability” means that the container build must install the OS Tesseract executable, English/Kannada data, and pinned Python renderer/image packages; local host availability is **not verified** here. The OCR API uses PNG bytes on stdin and reads plain UTF-8 text from stdout. PDFium renders one PDF page to a Pillow image before the same OCR request. There is no model response JSON to parse and no external endpoint to authenticate.
+
+Official references:
+
+- [Tesseract User Manual](https://tesseract-ocr.github.io/tessdoc/) and [Tesseract language/script support](https://tesseract-ocr.github.io/tessdoc/Data-Files-in-different-versions)
+- [Tesseract license and dependencies](https://github.com/tesseract-ocr/tesseract)
+- [`pypdfium2` official Python API](https://pypdfium2.readthedocs.io/en/stable/python_api.html) and [PyPI license/package metadata](https://pypi.org/project/pypdfium2/)
+- [Pillow `ImageOps.exif_transpose`](https://pillow.readthedocs.io/en/latest/reference/ImageOps.html)
+- [TrOCR model card](https://huggingface.co/microsoft/trocr-base-printed) and [Transformers TrOCR OCR API](https://huggingface.co/docs/transformers/model_doc/trocr)
+- [Render compute plans](https://render.com/docs/compute-plans)
+- [Supabase private bucket access](https://supabase.com/docs/guides/storage/buckets/fundamentals)
+
+## Current files and verification
+
+- `backend/app/services/document_ocr.py`: local image preprocessing, bounded Tesseract execution, PDFium scanned-page rendering, mixed-page text preservation, and no-readable-page failure.
+- `backend/app/services/ai_service.py`: document image extraction now calls only the local OCR service; Cloudflare Vision and Hugging Face VLM document requests were removed. Chat/ASR providers otherwise unchanged.
+- `backend/app/routers/integration.py`: local async-thread extraction; upload size/type/page/dimension validation; uploaded documents are merged into patient `/me/reports` as unverified drafts; the chatbot continues to retrieve only patient-filtered text.
+- `backend/Dockerfile`, `backend/requirements.txt`, `backend/.env.example`, `render.yaml`: install local OCR/render dependencies and remove Vision-only configuration. Cloudflare account/token remain for ASR, not document processing.
+- `lib/features/live_clinical_screen.dart`, `lib/features/ai_screen.dart`: identify uploaded extraction as unverified in the Reports page and refresh that list after upload.
+- `backend/tests/test_document_ocr.py`, `backend/tests/test_patient_document_integration.py`: mocked image OCR, image bounds/errors, OCR timeout, text/scanned/mixed PDF behavior, patient-scoped retrieval, and unverified Reports-list presentation.
+- `python -m unittest discover -s tests -v` from `backend`: **38 tests passed**. OCR and Supabase integration tests are mocks/unit tests, not proof of production inference or storage.
+- Docker build/live OCR: **not run**; Docker engine unavailable (`dockerDesktopLinuxEngine` pipe missing) and host Tesseract absent. No real OCR transcript, private Storage write, app refresh against Supabase, doctor review, or cross-patient live authorization was verified.
+- Read-only Render inspection confirmed both services live on `b70a675...`, not the local OCR implementation. Read-only Supabase audit of the three failed request IDs found no document metadata or extracted-text rows. The Storage object was uploaded then removed after the provider failure.
+- No push, deployment, Render environment change, Supabase migration, RLS change, or production data modification was performed.
+
+## Remaining blockers before completion
+
+1. Build the Render Docker image and verify installation of `tesseract-ocr-eng`, `tesseract-ocr-kan`, `Pillow==12.2.0`, and `pypdfium2==5.14.0`. Then run a real OCR test on a synthetic printed English/Kannada report and synthetic scanned/mixed PDF. Do not upload real patient material to external inference.
+2. Measure latency, peak memory, and timeout behavior under the actual Render plan. The 35-second per-page timeout and serial page processing limit worst-case work but do not make OCR fast on 0.1 CPU; users may see longer latency for multi-page scans.
+3. Tesseract can fail on handwriting. For prescriptions, display the source and require a clinician/pharmacist check; do not transcribe uncertain medicines/doses into an authoritative prescription. No structured LLM extraction was added because a zero-cost hosted model route was not verified and no paid inference was authorized.
+4. A clinician review queue/approval flow is still absent. Chat uploads have no chosen `consultation_id` or assigned doctor in the existing schema; exposing all patient uploads to all doctors or fabricating a clinical `reports` row would violate patient scope. Add an explicit patient/consultation assignment and doctor-owned review workflow before turning draft text into clinical records.
+5. **Exact next action:** authorize a scoped commit/push and deployment of the local OCR changes. Both Render services currently auto-deploy from `master`, so a push to that branch will deploy both services; do not include unrelated dirty working-tree changes. After authorization and deployment, run a synthetic printed image and scanned-PDF acceptance flow through private Storage, OCR, `medical_documents`/`patient_embeddings`, `/me/reports`, and patient-scoped chatbot retrieval. Verify another patient cannot retrieve it. The task forbids deploying or pushing without that authorization, so neither was done in this pass.
+
+---
+
+## Historical findings (before the latest 2026-10-26 production trace)
+
 **Date:** 2026-10-26  
 **Verdict: PARTIALLY VERIFIED** — the production failure is localized and code-level validation, retry, and diagnostic fixes are covered by automated tests. Real Cloudflare inference and the complete patient/doctor review workflow remain unverified and require account activation plus application work described below. No production credentials, schema, environment variables, deployment, or Git remote were changed.
 
@@ -74,4 +167,12 @@ Read-only inspection of live project `lsfhluvsrucwmbjvqwsr` confirmed:
 5. Add a uniqueness/transaction strategy for `patient_embeddings.source_document_id` after checking existing duplicate data; current app-level retry recovery cannot guarantee race-free deduplication across concurrent identical requests without a database constraint/transaction.
 6. Test patient and doctor ownership boundaries, signed private-source viewing, and chatbot exclusion/labeling of unreviewed drafts after the review workflow is designed.
 
-**Final verdict: PARTIALLY VERIFIED.** The production failure is confirmed to be at Cloudflare Vision (HTTP 403); the exact 403 subtype is still unknown. Code-level failure classification, bounded validation, and incomplete-retry behavior are covered by automated tests. Live inference, scanned-PDF OCR, structured draft/review persistence, and complete UI-to-chat end-to-end behavior remain unverified.
+**Historical verdict (superseded by the live trace above): PARTIALLY VERIFIED.** At the time of that earlier investigation, the Cloudflare 403 subtype was unknown. The newer Render evidence above identifies provider code `5016` and the current request's first failing stage.
+
+## Updated conclusion (2026-10-26, this investigation)
+
+**The user-visible production failure is precisely localized but not fixed:** the two Render services are still executing commit `b70a675c8886f30dcf7fa3899651cbd6ec023cee`; `POST /api/v1/chat/reports` uploads the file to private Supabase Storage successfully, then the legacy Cloudflare Vision request fails with HTTP 403/code `5016` (`vision_model_terms_required`). The handler returns 503 and retains the uploaded object. The matching `medical_documents` and `patient_embeddings` records are absent because text extraction never succeeded. This failure is not a Tesseract/PDFium failure: those dependencies and code are not in the live commit.
+
+The smallest route out of the **observed** failure is to deploy the already-present local OCR change set, not to speculate about more Cloudflare settings. That change set itself still requires runtime verification: on this workstation, searchable PDF extraction passed, PDFium rendered a scanned PDF, but both image/scanned OCR stopped at missing Tesseract. Render MCP could not execute commands in either live container, and no authenticated production synthetic upload was run. Therefore OCR installation/recognition, production persistence, and Reports retrieval remain unverified; do not call the feature fixed yet. Automated checks this pass: `python -m unittest discover -s tests -q` — 38 passed; `python -m compileall -q app tests` — passed; `git diff --check` — passed. These are local checks, not a production integration test.
+
+**Exact remaining blocker / next action:** authorize and perform a scoped commit/deployment of only the OCR work (excluding unrelated dirty files), then run a real synthetic upload using an authorized test patient and inspect the returned extraction plus read-only Storage, metadata, text, and `/me/reports` state. Both Render services are configured to auto-deploy from `master`; a push there would deploy both. This investigation made no deploy, push, credential update, or production data mutation.

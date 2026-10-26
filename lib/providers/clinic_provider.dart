@@ -69,6 +69,10 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
   final HealthRepository _health;
   final ApiClient _api;
   final SupabaseAuthService _auth;
+  // Reuse the upload ID when the same attachment is retried. The backend
+  // stores the private object before inference and resumes it by this ID.
+  String? _pendingReportUploadId;
+  String? _pendingReportFingerprint;
   Future<void> load() async {
     try {
       final results =
@@ -159,8 +163,13 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       uploadStage = 'preparing the secure upload';
       // Avoid `1 << 32` here: the Dart-to-JavaScript web compiler can lower
       // that bit shift to zero, causing Random.nextInt(0) to throw RangeError.
-      final uploadId =
-          '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${Random.secure().nextInt(0x7fffffff).toRadixString(36)}';
+      final fingerprint = '$reportType:$filename:${bytes.length}';
+      final uploadId = _pendingReportFingerprint == fingerprint &&
+              _pendingReportUploadId != null
+          ? _pendingReportUploadId!
+          : '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${Random.secure().nextInt(0x7fffffff).toRadixString(36)}';
+      _pendingReportFingerprint = fingerprint;
+      _pendingReportUploadId = uploadId;
       Future<http.StreamedResponse> send() {
         uploadStage = 'building the multipart request';
         final request = http.MultipartRequest(
@@ -200,6 +209,8 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
         ),
         ChatMessage(text: confirmation, isUser: false, sentAt: DateTime.now()),
       ], chatLoading: false);
+      _pendingReportUploadId = null;
+      _pendingReportFingerprint = null;
     } on TimeoutException {
       state = state.copyWith(
         chatLoading: false,
@@ -222,6 +233,10 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           'The report service returned an unreadable response. Please retry.',
         ),
       );
+    } on ApiException catch (error) {
+      // Keep server-side details instead of replacing them with a generic
+      // client parse error, especially for retryable inference-capacity 503s.
+      state = state.copyWith(chatLoading: false, chatError: error);
     } catch (error, stackTrace) {
       debugPrint(
           'Report upload failed while $uploadStage (${error.runtimeType}): $error');

@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 
 import '../core/services/api_service.dart';
 import '../providers/clinic_provider.dart';
+import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 
 class AiScreen extends ConsumerStatefulWidget {
@@ -67,6 +68,9 @@ class _AiScreenState extends ConsumerState<AiScreen> {
       filename: file.name,
       bytes: fileBytes,
     );
+    if (ref.read(clinicProvider).chatError == null) {
+      ref.invalidate(patientReportsProvider);
+    }
     _scrollToLatest();
     if (!mounted) return;
     final error = ref.read(clinicProvider).chatError;

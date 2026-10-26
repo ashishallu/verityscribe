@@ -1,5 +1,4 @@
 from datetime import date
-from io import BytesIO
 import json
 import logging
 import os
@@ -11,13 +10,17 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 import httpx
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
 from starlette.concurrency import run_in_threadpool
 from supabase import Client, create_client
 
 from ..core.config import settings
 from ..core.security import current_claims, get_current_doctor, get_current_patient, get_current_profile, require_roles
-from ..services.ai_service import DocumentProviderError, ai_provider
+from ..services.ai_service import ai_provider
+from ..services.document_ocr import (
+    DocumentOCRUnavailable,
+    extract_pdf_text,
+    validate_image_dimensions,
+)
 
 router = APIRouter(tags=["integration"])
 logger = logging.getLogger(__name__)
@@ -464,26 +467,20 @@ def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
 
 def _extract_pdf_text(content: bytes) -> str:
     try:
-        reader = PdfReader(BytesIO(content))
-        if reader.is_encrypted:
-            raise ReportValidationError("pdf_password_protected", "This PDF is password-protected. Upload an unlocked copy.")
-        page_count = len(reader.pages)
-        if page_count > MAX_CHAT_PDF_PAGES:
-            raise ReportValidationError(
-                "pdf_page_limit_exceeded",
-                f"This PDF has {page_count} pages; the current limit is {MAX_CHAT_PDF_PAGES}.",
-            )
-        page_text = [(page.extract_text() or "").strip() for page in reader.pages]
-        if any(not text for text in page_text):
-            raise ReportValidationError(
-                "pdf_ocr_required",
-                "This PDF includes scanned pages that need OCR. Save those pages as images and upload them separately, or upload a text-based PDF.",
-            )
-        return "\n".join(
-            f"[Page {index + 1}]\n{text}" for index, text in enumerate(page_text)
-        )[:30000].strip()
+        return extract_pdf_text(content, MAX_CHAT_PDF_PAGES)
+    except DocumentOCRUnavailable:
+        raise
     except ReportValidationError:
         raise
+    except ValueError as exc:
+        message = str(exc)
+        category = (
+            "pdf_password_protected" if "password-protected" in message else
+            "pdf_page_limit_exceeded" if "current limit" in message else
+            "pdf_page_unreadable" if "page " in message.lower() and "readable text" in message.lower() else
+            "pdf_extraction_failed"
+        )
+        raise ReportValidationError(category, message) from exc
     except Exception as exc:
         raise ReportValidationError(
             "pdf_extraction_failed",
@@ -636,6 +633,14 @@ async def upload_patient_chat_report(
     content_type = _report_content_type(document, content)
     if not content_type:
         raise HTTPException(status_code=422, detail="Upload a valid PDF, PNG, JPEG, or WEBP report")
+    if content_type != "application/pdf":
+        try:
+            validate_image_dimensions(content)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="The image is invalid or exceeds the supported dimensions.",
+            ) from exc
     logger.info(
         "Chat report upload received: request_id=%s type=%s bytes=%d content_type=%s",
         diagnostic_id,
@@ -688,12 +693,19 @@ async def upload_patient_chat_report(
         raise HTTPException(status_code=503, detail="Secure report file upload is currently unavailable") from exc
     try:
         if content_type == "application/pdf":
-            extracted = _extract_pdf_text(content)
+            extracted = await run_in_threadpool(_extract_pdf_text, content)
         else:
-            # The configured server-side vision provider (Cloudflare when its
-            # credentials exist, otherwise Hugging Face) receives the image;
-            # bytes are never exposed to Flutter or a public Storage URL.
-            extracted = ai_provider.extract_document_text(content, content_type)
+            # OCR runs locally in a worker thread; image bytes never go to a
+            # hosted vision provider or a public Storage URL.
+            try:
+                extracted = await run_in_threadpool(
+                    ai_provider.extract_document_text, content, content_type
+                )
+            except ValueError as exc:
+                raise ReportValidationError(
+                    "image_unreadable",
+                    "No readable text was found in this image. Try a clearer, upright image.",
+                ) from exc
         logger.info(
             "Chat report extraction completed: request_id=%s elapsed_ms=%d chars=%d",
             diagnostic_id,
@@ -723,39 +735,18 @@ async def upload_patient_chat_report(
             diagnostic_id, exc.category, round((time.perf_counter() - started_at) * 1000),
         )
         raise HTTPException(status_code=422, detail=exc.detail) from exc
-    except DocumentProviderError as exc:
-        retain = exc.category in {
-            "vision_model_terms_required", "vision_model_access_denied",
-            "vision_model_paid_plan_required", "vision_account_blocked",
-            "vision_quota_exhausted", "vision_capacity_exhausted",
-            "vision_provider_unavailable",
-        }
-        if not retain:
-            try:
-                client.storage.from_(bucket).remove([path])
-            except Exception:
-                pass
+    except DocumentOCRUnavailable as exc:
         logger.error(
-            "Report provider failed: request_id=%s category=%s http_status=%d provider_code=%s retained=%s elapsed_ms=%d",
-            diagnostic_id, exc.category, exc.status_code, exc.provider_code, retain,
-            round((time.perf_counter() - started_at) * 1000),
+            "Local report OCR failed: request_id=%s category=%s retained=true elapsed_ms=%d",
+            diagnostic_id, exc.category, round((time.perf_counter() - started_at) * 1000),
         )
-        if exc.category == "vision_model_terms_required":
-            detail = "Document processing needs one-time model activation by the service owner. Your private file was retained; retry after activation."
-        elif exc.category == "vision_model_paid_plan_required":
-            detail = "The configured document model requires a paid Cloudflare plan. No paid fallback was attempted; ask the service owner to configure an eligible model."
-        elif exc.category == "vision_quota_exhausted":
-            detail = "The free document-processing allowance has been reached. Your private file was retained; try again after the daily reset."
-        elif exc.category == "vision_model_configuration_error":
-            detail = "The configured document model rejected this request. Ask the service owner to correct its model configuration, then upload the file again."
-        elif exc.category in {"vision_capacity_exhausted", "vision_provider_unavailable"}:
-            detail = "Document processing is temporarily unavailable. Your private file was retained; please retry shortly."
-        elif retain:
-            detail = "The document service could not access its configured model. Your private file was retained; please contact support."
+        if exc.category in {"engine_not_installed", "pdf_renderer_not_installed"}:
+            detail = "Local document processing is not configured on the server yet. Your private file was retained; contact support."
+        elif exc.category in {"ocr_timeout", "document_timeout"}:
+            detail = "This document took too long to process. Your private file was retained; try a clearer image or fewer PDF pages."
         else:
-            detail = "The document service rejected the upload. Please contact support and upload again after the issue is resolved."
-        headers = {"Retry-After": "5"} if exc.category in {"vision_capacity_exhausted", "vision_provider_unavailable"} else None
-        raise HTTPException(status_code=503, detail=detail, headers=headers) from exc
+            detail = "Local document processing is temporarily unavailable. Your private file was retained; please retry shortly."
+        raise HTTPException(status_code=503, detail=detail, headers={"Retry-After": "5"}) from exc
     except RuntimeError as exc:
         try:
             client.storage.from_(bucket).remove([path])
@@ -817,11 +808,14 @@ async def upload_patient_chat_report(
         )
         raise HTTPException(status_code=503, detail="Secure report metadata is currently unavailable") from exc
     if content_type == "application/pdf":
-        message = "Report saved privately. Extracted text:\n" + extracted[:1800]
+        message = (
+            "Report saved privately. Automated text extraction (not clinician-reviewed):\n"
+            + extracted[:1800]
+        )
     else:
         message = (
-            "Report saved privately. Text read from the image (verify medicine names and doses; "
-            "handwriting recognition can be inaccurate):\n" + extracted[:1800]
+            "Report saved privately. Automated OCR text (not clinician-reviewed; verify names and doses, "
+            "especially handwriting):\n" + extracted[:1800]
         )
     return {"data": {"document": record, "report_type": normalized_type,
                       "text_available": bool(extracted), "message": message}}
@@ -1564,7 +1558,44 @@ def my_reports(claims: dict = Depends(current_claims)):
     client = db(); role = claims.get("app_metadata", {}).get("role")
     column = "patient_id" if role == "patient" else "doctor_id" if role == "doctor" else None
     if not column: raise HTTPException(status_code=403, detail="Report scope is not available for this role")
-    return {"data": client.table("reports").select("*").eq(column, claims["sub"]).order("report_date", desc=True).execute().data or []}
+    reports = client.table("reports").select("*").eq(column, claims["sub"]).order("report_date", desc=True).execute().data or []
+    if role == "patient":
+        # Chat uploads stay in the private document/draft tables until a
+        # clinician reviews them; never fabricate authoritative reports rows.
+        try:
+            documents = client.table("medical_documents").select(
+                "id,patient_id,document_type,created_at"
+            ).eq("patient_id", claims["sub"]).order(
+                "created_at", desc=True
+            ).limit(100).execute().data or []
+            document_ids = [row["id"] for row in documents if row.get("id")]
+            extracted = client.table("patient_embeddings").select(
+                "source_document_id,content"
+            ).eq("patient_id", claims["sub"]).in_(
+                "source_document_id", document_ids
+            ).execute().data or [] if document_ids else []
+            text_by_document = {
+                row.get("source_document_id"): row.get("content", "")
+                for row in extracted
+            }
+            for document in documents:
+                content = str(text_by_document.get(document.get("id"), "")).strip()
+                reports.append({
+                    "id": document["id"],
+                    "patient_id": claims["sub"],
+                    "report_type": f"Uploaded {str(document.get('document_type') or 'medical document').replace('_', ' ')}",
+                    "report_date": document.get("created_at"),
+                    "findings": content or "No readable text was saved for this document.",
+                    "recommendations": "Automated text extraction is not clinician-reviewed and must not be treated as a verified medical record.",
+                    "review_status": "pending_clinician_review",
+                    "source_type": "private_chat_upload",
+                })
+        except Exception as exc:
+            # Keep existing clinical Reports available if this optional draft
+            # listing encounters a legacy schema or temporary query issue.
+            logger.warning("Unable to list private uploaded report drafts: error=%s", type(exc).__name__)
+    reports.sort(key=lambda row: str(row.get("report_date") or row.get("created_at") or ""), reverse=True)
+    return {"data": reports}
 
 
 def _clinical_relationships(client: Client, rows: list[dict]) -> None:

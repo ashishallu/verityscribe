@@ -117,8 +117,10 @@ class LiveReportsScreen extends ConsumerWidget {
       builder: (row) => _DetailCard(
               icon: Icons.description_outlined,
               title: (row['report_type'] ?? 'Report').toString(),
-              subtitle: (row['report_date'] ?? 'Date unavailable').toString(),
+              subtitle: '${row['report_date'] ?? 'Date unavailable'}${row['review_status'] == 'pending_clinician_review' ? ' • Unverified OCR draft' : ''}',
               details: {
+                if (row['review_status'] == 'pending_clinician_review')
+                  'Review status': 'Automated extraction — not clinician-reviewed',
                 'Findings': row['findings'],
                 'Recommendations': row['recommendations']
               }));

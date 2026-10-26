@@ -17,6 +17,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from huggingface_hub import InferenceClient
+from .document_ocr import extract_image_text
 
 
 logger = logging.getLogger(__name__)
@@ -73,54 +74,6 @@ class ASRRetryError(RuntimeError):
     def __init__(self, retry_count: int):
         self.retry_count = retry_count
         super().__init__("ASR provider request failed after bounded retries")
-
-
-class DocumentProviderError(RuntimeError):
-    """Safe, structured provider failure for the document pipeline."""
-
-    def __init__(self, category: str, status_code: int, provider_code: int | None = None):
-        self.category = category
-        self.status_code = status_code
-        self.provider_code = provider_code
-        super().__init__(f"Cloudflare document provider failed ({category}, HTTP {status_code})")
-
-
-def _cloudflare_document_error_code(error: HTTPError) -> int | None:
-    """Extract only Cloudflare's numeric error code; never retain/log its body."""
-    try:
-        payload = json.loads(error.read(8192).decode("utf-8"))
-        errors = payload.get("errors", []) if isinstance(payload, dict) else []
-        for item in errors:
-            code = item.get("code") if isinstance(item, dict) else None
-            if isinstance(code, int):
-                return code
-    except Exception:
-        pass
-    return None
-
-
-def _cloudflare_document_error_category(status_code: int, provider_code: int | None) -> str:
-    if provider_code == 5016:
-        return "vision_model_terms_required"
-    if provider_code in {5018, 3041}:
-        return "vision_model_access_denied"
-    if provider_code == 5035:
-        return "vision_model_paid_plan_required"
-    if provider_code == 3023:
-        return "vision_account_blocked"
-    if provider_code == 3036:
-        return "vision_quota_exhausted"
-    if provider_code == 3040:
-        return "vision_capacity_exhausted"
-    if provider_code in {5007, 3042}:
-        return "vision_model_configuration_error"
-    if status_code == 429:
-        return "vision_capacity_exhausted"
-    if status_code == 403:
-        return "vision_provider_access_denied"
-    if status_code >= 500:
-        return "vision_provider_unavailable"
-    return "vision_provider_request_rejected"
 
 
 class AIProvider:
@@ -197,146 +150,13 @@ class AIProvider:
             for model, provider, weight in self.DEFAULT_ASR_MODELS
         ]
     def extract_document_text(self, image: bytes, content_type: str) -> str:
-        """Extract image evidence using Cloudflare when configured, otherwise HF."""
-        cloudflare_account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-        cloudflare_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-        if cloudflare_account_id or cloudflare_token:
-            if not cloudflare_account_id or not cloudflare_token:
-                raise RuntimeError(
-                    "Cloudflare document extraction requires both CLOUDFLARE_ACCOUNT_ID "
-                    "and CLOUDFLARE_API_TOKEN"
-                )
-            return self._extract_document_text_cloudflare(
-                image, content_type, cloudflare_account_id, cloudflare_token
-            )
-
-        return self._extract_document_text_huggingface(image, content_type)
-
-    def _extract_document_text_cloudflare(
-        self, image: bytes, content_type: str, account_id: str, token: str
-    ) -> str:
-        """Send an uploaded image directly to Cloudflare Workers AI, never to the client."""
-        model = os.getenv(
-            "CLOUDFLARE_VISION_MODEL", "@cf/meta/llama-3.2-11b-vision-instruct"
-        ).strip()
-        if not model or not re.fullmatch(r"@[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+", model):
-            raise RuntimeError("Cloudflare vision model configuration is invalid")
-        image_data_url = (
-            f"data:{content_type};base64,{base64.b64encode(image).decode('ascii')}"
-        )
-        payload = {
-            "image": image_data_url,
-            "messages": [{
-                "role": "user",
-                "content": (
-                    "Transcribe this medical document. Extract only clearly legible text, "
-                    "including medicine names, doses, instructions, diagnoses, and measured "
-                    "values. Preserve the document's wording. Mark uncertain handwriting "
-                    "as [unclear]. Never guess, infer, or add missing facts. Return concise "
-                    "plain text only."
-                ),
-            }],
-            "temperature": 0,
-            "max_tokens": 420,
-        }
-        url = (
-            "https://api.cloudflare.com/client/v4/accounts/"
-            f"{account_id}/ai/run/{model}"
-        )
-        request = Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=45) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            # Read only an integer provider error code. Never log or propagate
-            # the response message/body, which could contain user content.
-            provider_code = _cloudflare_document_error_code(exc)
-            category = _cloudflare_document_error_category(exc.code, provider_code)
-            raise DocumentProviderError(category, exc.code, provider_code) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"Cloudflare vision document extraction failed ({type(exc).__name__})"
-            ) from exc
-
-        if not isinstance(body, dict) or body.get("success") is False:
-            raise RuntimeError("Cloudflare vision provider returned an unsuccessful response")
-        result = body.get("result")
-        text = result.get("response") if isinstance(result, dict) else result
-        if not isinstance(text, str) or not text.strip():
-            raise RuntimeError("Cloudflare vision provider returned no readable text")
-        return "Extracted from uploaded document: " + text.strip()[:30000]
-
-    def _extract_document_text_huggingface(
-        self, image: bytes, content_type: str
-    ) -> str:
-        """Existing Hugging Face fallback, kept unchanged for deployments without CF keys."""
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        if not token:
-            raise RuntimeError("Hugging Face token is not configured")
-        preferred_model = os.getenv("HF_DOCUMENT_VLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
-        # Use models listed for HF Inference Providers' VLM chat task. SmolVLM
-        # is not consistently exposed by the router; a rejected fallback must
-        # never hide an earlier capacity error from the upload retry handler.
-        fallback_model = os.getenv("HF_DOCUMENT_VLM_FALLBACK_MODEL", "zai-org/GLM-4.5V")
-        models = list(dict.fromkeys((preferred_model, fallback_model)))
-        image_url = (
-            f"data:{content_type};base64,"
-            f"{base64.b64encode(image).decode('ascii')}"
-        )
-        last_error: Exception | None = None
-        capacity_error: Exception | None = None
-        for model in models:
-            try:
-                # hf-inference no longer hosts the document-QA and BLIP
-                # models returned by its task defaults. Use Hugging Face's
-                # automatic provider routing with a vision-language model.
-                response = InferenceClient(api_key=token, timeout=20).chat_completion(
-                    model=model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Read this medical document. Return a concise transcription of only clearly "
-                                    "visible names, medicine/dose/instructions, diagnoses, and measurements. "
-                                    "Mark uncertain handwriting as [unclear]. Never guess or add facts."
-                                ),
-                            },
-                            {"type": "image_url", "image_url": {"url": image_url}},
-                        ],
-                    }],
-                    temperature=0,
-                    max_tokens=420,
-                )
-                text = response.choices[0].message.content
-                if not isinstance(text, str) or not text.strip():
-                    raise RuntimeError("Vision model returned no readable text")
-                return "Extracted from uploaded document: " + text.strip()[:30000]
-            except Exception as exc:
-                last_error = exc
-                message = str(exc).lower()
-                if any(marker in message for marker in ("capacity", "503", "429", "temporarily unavailable")):
-                    capacity_error = exc
-                # Move to the alternate model immediately; another request to
-                # the same saturated provider only increases upload latency.
-        # Preserve transient status across provider/model fallbacks. If Qwen
-        # reports capacity and the second model is unsupported, the upload is
-        # still retryable; returning the last exception would make the router
-        # delete the securely stored file and report a permanent failure.
-        final_error = capacity_error or last_error
-        reason = "capacity_exhausted" if capacity_error else type(final_error).__name__
-        raise RuntimeError(
-            f"Hugging Face vision document extraction failed ({reason})"
-        ) from final_error
+        """Run local OCR only; document images are never sent to hosted models."""
+        if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise ValueError("Unsupported image content type for OCR")
+        text = extract_image_text(image)
+        if not text:
+            raise ValueError("No readable text was found in this image")
+        return "Extracted from uploaded document: " + text[:30000]
 
     def generate_draft(self, transcript_text: str) -> AIDraft:
         if not transcript_text.strip():
