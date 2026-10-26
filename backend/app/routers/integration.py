@@ -86,7 +86,7 @@ class ReportCreate(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     consultation_id: str | None = None
-    session_id: str | None = None
+    session_id: uuid.UUID
 
 
 class ChatSessionCreate(BaseModel):
@@ -683,7 +683,7 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
         raise HTTPException(status_code=403, detail="Patient chat is not available for this role")
     client: Client | None = None
     patient: dict | None = None
-    session_id = payload.session_id
+    session_id = str(payload.session_id)
     session_documents: list[dict[str, Any]] = []
     history: list[dict[str, str]] = []
     if session_id:

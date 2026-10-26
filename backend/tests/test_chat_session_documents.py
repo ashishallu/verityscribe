@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app.routers.integration import (
     ChatRequest,
@@ -11,6 +12,10 @@ from app.routers.integration import (
     remove_chat_session_document,
     secure_chat,
 )
+
+
+SESSION_A = "00000000-0000-4000-8000-000000000001"
+SESSION_B = "00000000-0000-4000-8000-000000000002"
 
 
 class _Response:
@@ -68,11 +73,11 @@ class _Query:
 class _Client:
     def __init__(self):
         self.queries = []
-        self.sessions = [{"id": "session-a", "patient_id": "patient-a", "ended_at": None}]
+        self.sessions = [{"id": SESSION_A, "patient_id": "patient-a", "ended_at": None}]
         self.documents = [
-            {"id": "doc-a", "patient_id": "patient-a", "session_id": "session-a", "document_type": "prescription"},
-            {"id": "doc-b", "patient_id": "patient-a", "session_id": "session-b", "document_type": "prescription"},
-            {"id": "doc-c", "patient_id": "patient-b", "session_id": "session-a", "document_type": "prescription"},
+            {"id": "doc-a", "patient_id": "patient-a", "session_id": SESSION_A, "document_type": "prescription"},
+            {"id": "doc-b", "patient_id": "patient-a", "session_id": SESSION_B, "document_type": "prescription"},
+            {"id": "doc-c", "patient_id": "patient-b", "session_id": SESSION_A, "document_type": "prescription"},
         ]
         self.texts = [
             {"source_document_id": "doc-a", "patient_id": "patient-a", "content": "[Page 1]\nRx: Drug A 10 mg, take once daily.\nDuration: unclear."},
@@ -88,21 +93,21 @@ class SessionScopedDocumentTests(unittest.TestCase):
     def test_session_lookup_requires_patient_ownership_and_active_state(self):
         client = _Client()
         with self.assertRaises(HTTPException) as denied:
-            _owned_chat_session(client, "session-a", "patient-b")
+            _owned_chat_session(client, SESSION_A, "patient-b")
         self.assertEqual(denied.exception.status_code, 404)
         client.sessions[0]["ended_at"] = "2026-10-26T10:00:00Z"
         with self.assertRaises(HTTPException) as ended:
-            _owned_chat_session(client, "session-a", "patient-a")
+            _owned_chat_session(client, SESSION_A, "patient-a")
         self.assertEqual(ended.exception.status_code, 410)
 
     def test_document_retrieval_is_patient_and_session_scoped(self):
         client = _Client()
-        documents = _session_documents(client, "patient-a", "session-a")
+        documents = _session_documents(client, "patient-a", SESSION_A)
         self.assertEqual([item["id"] for item in documents], ["doc-a"])
         self.assertIn("Drug A 10 mg", documents[0]["extracted_text"])
         document_query = next(query for query in client.queries if query.table == "medical_documents")
         self.assertEqual(document_query.filters["patient_id"], "patient-a")
-        self.assertEqual(document_query.filters["session_id"], "session-a")
+        self.assertEqual(document_query.filters["session_id"], SESSION_A)
         text_query = next(query for query in client.queries if query.table == "patient_embeddings")
         self.assertEqual(text_query.filters["patient_id"], "patient-a")
         self.assertEqual(text_query.ids, {"doc-a"})
@@ -130,7 +135,7 @@ class SessionScopedDocumentTests(unittest.TestCase):
              patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
              patch("app.routers.integration.ai_provider.answer", side_effect=answer):
             result = secure_chat(
-                ChatRequest(message="What medicine does my uploaded prescription list?", session_id="session-a"),
+                ChatRequest(message="What medicine does my uploaded prescription list?", session_id=SESSION_A),
                 {"sub": "patient-a", "app_metadata": {"role": "patient"}},
             )
         self.assertIn("Drug A 10 mg", captured["prompt"])
@@ -150,7 +155,7 @@ class SessionScopedDocumentTests(unittest.TestCase):
              patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
              patch("app.routers.integration.ai_provider.answer", side_effect=answer):
             secure_chat(
-                ChatRequest(message="What is a balanced diet?", session_id="session-a"),
+                ChatRequest(message="What is a balanced diet?", session_id=SESSION_A),
                 {"sub": "patient-a", "app_metadata": {"role": "patient"}},
             )
         self.assertIn("MODE: GENERAL", captured["prompt"])
@@ -161,7 +166,7 @@ class SessionScopedDocumentTests(unittest.TestCase):
         client = _Client()
         with patch("app.routers.integration.db", return_value=client), \
              patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}):
-            result = remove_chat_session_document("session-a", "doc-a", {
+            result = remove_chat_session_document(SESSION_A, "doc-a", {
                 "sub": "patient-a", "app_metadata": {"role": "patient"},
             })
         self.assertFalse(result["data"]["attached"])
@@ -174,11 +179,22 @@ class SessionScopedDocumentTests(unittest.TestCase):
         with patch("app.routers.integration.db", return_value=client), \
              patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}):
             with self.assertRaises(HTTPException) as denied:
-                remove_chat_session_document("session-a", "doc-b", {
+                remove_chat_session_document(SESSION_A, "doc-b", {
                     "sub": "patient-a", "app_metadata": {"role": "patient"},
                 })
         self.assertEqual(denied.exception.status_code, 404)
-        self.assertEqual(next(row for row in client.documents if row["id"] == "doc-b")["session_id"], "session-b")
+        self.assertEqual(next(row for row in client.documents if row["id"] == "doc-b")["session_id"], SESSION_B)
+
+    def test_chat_request_requires_a_valid_session_uuid(self):
+        with self.assertRaises(ValidationError) as missing:
+            ChatRequest(message="What is a balanced diet?")
+        self.assertIn("session_id", str(missing.exception))
+
+        with self.assertRaises(ValidationError):
+            ChatRequest(message="What is a balanced diet?", session_id="not-a-session")
+
+        request = ChatRequest(message="What is a balanced diet?", session_id=SESSION_A)
+        self.assertEqual(str(request.session_id), SESSION_A)
 
 
 if __name__ == "__main__":

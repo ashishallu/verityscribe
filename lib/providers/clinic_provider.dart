@@ -40,6 +40,7 @@ class ClinicState {
   final String? chatSessionId;
   final List<ChatSessionDocument> sessionDocuments;
   final bool chatLoading;
+  final bool chatSessionLoading;
   final Object? chatError;
   const ClinicState(
       {required this.selectedDate,
@@ -49,6 +50,7 @@ class ClinicState {
       this.chatSessionId,
       this.sessionDocuments = const [],
       this.chatLoading = false,
+      this.chatSessionLoading = false,
       this.chatError});
   ClinicState copyWith(
           {DateTime? selectedDate,
@@ -59,6 +61,7 @@ class ClinicState {
           bool clearChatSession = false,
           List<ChatSessionDocument>? sessionDocuments,
           bool? chatLoading,
+          bool? chatSessionLoading,
           Object? chatError,
           bool clearChatError = false}) =>
       ClinicState(
@@ -66,15 +69,19 @@ class ClinicState {
           medicines: medicines ?? this.medicines,
           consultations: consultations ?? this.consultations,
           messages: messages ?? this.messages,
-          chatSessionId: clearChatSession ? null : (chatSessionId ?? this.chatSessionId),
+          chatSessionId:
+              clearChatSession ? null : (chatSessionId ?? this.chatSessionId),
           sessionDocuments: sessionDocuments ?? this.sessionDocuments,
           chatLoading: chatLoading ?? this.chatLoading,
+          chatSessionLoading: chatSessionLoading ?? this.chatSessionLoading,
           chatError: clearChatError ? null : (chatError ?? this.chatError));
 }
 
 class ClinicNotifier extends StateNotifier<ClinicState> {
-  ClinicNotifier(this._health, this._api, this._auth)
-      : super(ClinicState(
+  ClinicNotifier(this._health, this._api, this._auth,
+      {http.Client? uploadClient})
+      : _uploadClient = uploadClient ?? http.Client(),
+        super(ClinicState(
             selectedDate: DateTime.now(),
             medicines: const [],
             consultations: const [],
@@ -84,23 +91,91 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
   final HealthRepository _health;
   final ApiClient _api;
   final SupabaseAuthService _auth;
+  final http.Client _uploadClient;
   // Reuse the upload ID when the same attachment is retried. The backend
   // stores the private object before inference and resumes it by this ID.
   String? _pendingReportUploadId;
   String? _pendingReportFingerprint;
+  Future<String>? _chatSessionInitialization;
+  int _chatSessionGeneration = 0;
+
+  @override
+  void dispose() {
+    _uploadClient.close();
+    super.dispose();
+  }
+
+  static final RegExp _uuidPattern = RegExp(
+      r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$');
 
   Future<String> _ensureChatSession() async {
     final existing = state.chatSessionId;
-    if (existing != null) return existing;
-    final response = await _api.post<dynamic>('/chat/sessions', const {});
-    final body = Map<String, dynamic>.from(response.data as Map);
-    final data = Map<String, dynamic>.from((body['data'] as Map?) ?? body);
-    final id = data['session_id']?.toString();
-    if (id == null || id.isEmpty) {
-      throw const ApiException('Could not start a secure chat session. Please retry.');
+    if (existing != null && _uuidPattern.hasMatch(existing)) return existing;
+    final pending = _chatSessionInitialization;
+    if (pending != null) return pending;
+
+    final generation = _chatSessionGeneration;
+    final creation = _createChatSession(generation);
+    _chatSessionInitialization = creation;
+    try {
+      return await creation;
+    } finally {
+      if (identical(_chatSessionInitialization, creation)) {
+        _chatSessionInitialization = null;
+      }
     }
-    state = state.copyWith(chatSessionId: id);
-    return id;
+  }
+
+  Future<String> _createChatSession(int generation) async {
+    state = state.copyWith(chatSessionLoading: true, clearChatError: true);
+    try {
+      final response = await _api.post<dynamic>('/chat/sessions', const {});
+      final body = Map<String, dynamic>.from(response.data as Map);
+      final data = Map<String, dynamic>.from((body['data'] as Map?) ?? body);
+      final id = data['session_id']?.toString();
+      if (id == null || !_uuidPattern.hasMatch(id)) {
+        throw const ApiException(
+            'The secure chat service returned an invalid session. Please retry.');
+      }
+      if (generation != _chatSessionGeneration) {
+        unawaited(_endChatSession(id));
+        throw const ApiException(
+            'This conversation was cleared. Please send your message again.');
+      }
+      state = state.copyWith(
+          chatSessionId: id, chatSessionLoading: false, clearChatError: true);
+      return id;
+    } catch (error) {
+      if (generation == _chatSessionGeneration) {
+        final safeError = error is ApiException && error.statusCode == 422
+            ? const ApiException(
+                'The secure chat session could not be verified. Please clear the conversation and retry.')
+            : error is ApiException &&
+                    error.message.startsWith('The secure chat')
+                ? error
+                : const ApiException(
+                    'Could not start a secure chat session. Check your connection and retry.');
+        state = state.copyWith(chatSessionLoading: false, chatError: safeError);
+        throw safeError;
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> initializeChatSession() async {
+    try {
+      await _ensureChatSession();
+    } catch (_) {
+      // _createChatSession stores a safe, user-visible error in state.
+    }
+  }
+
+  Future<void> _endChatSession(String sessionId) async {
+    try {
+      await _api.post<dynamic>('/chat/sessions/$sessionId/end', const {});
+    } catch (_) {
+      // Ending an old session is best effort; it cannot grant access to it.
+    }
   }
 
   Future<void> load() async {
@@ -135,6 +210,8 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
               : medicine)
           .toList());
   Future<void> sendMessage(String text, {String? attachment}) async {
+    if (state.chatLoading) return;
+    final generation = _chatSessionGeneration;
     final now = DateTime.now();
     final updated = [
       ...state.messages,
@@ -153,6 +230,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
             .toList(),
         if (attachment != null) 'attachment': attachment
       });
+      if (generation != _chatSessionGeneration) return;
       final body = Map<String, dynamic>.from(response.data as Map);
       final data = body['data'] is Map
           ? Map<String, dynamic>.from(body['data'] as Map)
@@ -168,7 +246,16 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
             text: answer, isUser: false, sentAt: DateTime.now(), action: action)
       ], chatLoading: false);
     } catch (e) {
-      state = state.copyWith(chatLoading: false, chatError: e);
+      if (generation == _chatSessionGeneration) {
+        final visibleError = e is ApiException && e.statusCode == 422
+            ? const ApiException(
+                'The chat could not verify its secure session. Clear the conversation and retry.')
+            : e is ApiException && e.statusCode == 410
+                ? const ApiException(
+                    'This chat session has ended. Clear the conversation to start a new one.')
+                : e;
+        state = state.copyWith(chatLoading: false, chatError: visibleError);
+      }
     }
   }
 
@@ -181,6 +268,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     // is still in progress.  This prevents duplicate attachment bubbles and
     // duplicate processing requests.
     if (state.chatLoading) return;
+    final generation = _chatSessionGeneration;
 
     final now = DateTime.now();
     final label = 'Uploaded $filename';
@@ -205,16 +293,19 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       _pendingReportUploadId = uploadId;
       Future<http.StreamedResponse> send() {
         uploadStage = 'building the multipart request';
-        final request = http.MultipartRequest(
-            'POST', Uri.parse('$apiBaseUrl/chat/reports'))
-          ..headers['Authorization'] = 'Bearer $token'
-          ..headers['X-Upload-Id'] = uploadId
-          ..fields['report_type'] = reportType
-          ..fields['session_id'] = sessionId
-          ..files.add(http.MultipartFile.fromBytes('document', bytes,
-              filename: filename, contentType: _reportMimeType(filename)));
-        return request.send().timeout(const Duration(seconds: 120));
+        final request =
+            http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/chat/reports'))
+              ..headers['Authorization'] = 'Bearer $token'
+              ..headers['X-Upload-Id'] = uploadId
+              ..fields['report_type'] = reportType
+              ..fields['session_id'] = sessionId
+              ..files.add(http.MultipartFile.fromBytes('document', bytes,
+                  filename: filename, contentType: _reportMimeType(filename)));
+        return _uploadClient
+            .send(request)
+            .timeout(const Duration(seconds: 120));
       }
+
       // The API already performs model fallback. Do not send the full image a
       // second time after a model-capacity response or browser network error:
       // that adds latency and cannot make an unreachable/CORS-blocked API work.
@@ -222,6 +313,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       final response = await send();
       uploadStage = 'reading the API response';
       final text = await response.stream.bytesToString();
+      if (generation != _chatSessionGeneration) return;
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(_uploadError(text), statusCode: response.statusCode);
@@ -230,16 +322,17 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       final data = decoded['data'] is Map
           ? Map<String, dynamic>.from(decoded['data'] as Map)
           : decoded;
-      final confirmation = (data['message'] ??
-              'Your report was saved privately.')
-          .toString();
+      final confirmation =
+          (data['message'] ?? 'Your report was saved privately.').toString();
       final document = data['document'] is Map
           ? Map<String, dynamic>.from(data['document'] as Map)
           : <String, dynamic>{};
       final documentId = document['id']?.toString();
       final sessionDocuments = [...state.sessionDocuments];
-      if (documentId != null && !sessionDocuments.any((item) => item.id == documentId)) {
-        sessionDocuments.add(ChatSessionDocument(id: documentId, name: filename));
+      if (documentId != null &&
+          !sessionDocuments.any((item) => item.id == documentId)) {
+        sessionDocuments
+            .add(ChatSessionDocument(id: documentId, name: filename));
       }
       state = state.copyWith(messages: [
         ...existingMessages,
@@ -254,6 +347,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       _pendingReportUploadId = null;
       _pendingReportFingerprint = null;
     } on TimeoutException {
+      if (generation != _chatSessionGeneration) return;
       state = state.copyWith(
         chatLoading: false,
         chatError: const ApiException(
@@ -261,6 +355,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
         ),
       );
     } on http.ClientException catch (error) {
+      if (generation != _chatSessionGeneration) return;
       final host = Uri.tryParse(apiBaseUrl)?.host ?? 'the configured API';
       state = state.copyWith(
         chatLoading: false,
@@ -269,6 +364,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
         ),
       );
     } on FormatException {
+      if (generation != _chatSessionGeneration) return;
       state = state.copyWith(
         chatLoading: false,
         chatError: const ApiException(
@@ -276,10 +372,12 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
         ),
       );
     } on ApiException catch (error) {
+      if (generation != _chatSessionGeneration) return;
       // Keep server-side details instead of replacing them with a generic
       // client parse error, especially for retryable inference-capacity 503s.
       state = state.copyWith(chatLoading: false, chatError: error);
     } catch (error, stackTrace) {
+      if (generation != _chatSessionGeneration) return;
       debugPrint(
           'Report upload failed while $uploadStage (${error.runtimeType}): $error');
       debugPrintStack(stackTrace: stackTrace);
@@ -318,25 +416,40 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     try {
       await _api.post<dynamic>(
           '/chat/sessions/$sessionId/documents/$documentId/remove', const {});
-      state = state.copyWith(sessionDocuments: state.sessionDocuments
-          .where((document) => document.id != documentId).toList());
+      if (state.chatSessionId != sessionId) return;
+      state = state.copyWith(
+          sessionDocuments: state.sessionDocuments
+              .where((document) => document.id != documentId)
+              .toList());
     } catch (error) {
-      state = state.copyWith(chatError: error);
+      if (state.chatSessionId == sessionId) {
+        state = state.copyWith(chatError: error);
+      }
     }
   }
 
   void clearChat() {
     final sessionId = state.chatSessionId;
-    state = state.copyWith(messages: [], chatSessionId: null,
-        clearChatSession: true, sessionDocuments: const [], clearChatError: true);
+    _chatSessionGeneration++;
+    _chatSessionInitialization = null;
+    state = state.copyWith(
+        messages: [],
+        chatSessionId: null,
+        clearChatSession: true,
+        sessionDocuments: const [],
+        chatLoading: false,
+        chatSessionLoading: false,
+        clearChatError: true);
     if (sessionId != null) {
-      unawaited(_api.post<dynamic>('/chat/sessions/$sessionId/end', const {}).catchError((_) => const ApiResponse<dynamic>({})));
+      unawaited(_endChatSession(sessionId));
     }
+    // Start the new conversation now; send/upload also await the shared future.
+    unawaited(initializeChatSession());
   }
+
   void clearChatError() => state = state.copyWith(clearChatError: true);
 }
 
 final clinicProvider = StateNotifierProvider<ClinicNotifier, ClinicState>(
-    (ref) => ClinicNotifier(
-        ref.read(healthRepositoryProvider), ref.read(apiClientProvider),
-        ref.read(supabaseAuthProvider)));
+    (ref) => ClinicNotifier(ref.read(healthRepositoryProvider),
+        ref.read(apiClientProvider), ref.read(supabaseAuthProvider)));
