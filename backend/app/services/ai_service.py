@@ -80,6 +80,9 @@ class AIProvider:
     ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "@cf/deepgram/nova-3")
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "@cf/openai/whisper-large-v3-turbo")
     LLM_MODEL = "Qwen/Qwen3-8B"
+    # Patient chat and attached-report Q&A use the existing Cloudflare account.
+    # Keep chatbot inference off the exhausted Hugging Face paid route.
+    CHAT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
     DEFAULT_ASR_MODELS = (
         # Four user-verified working Cloudflare routes. Keep their weights and
         # wire formats stable; Flux was removed after repeated Gateway 401s.
@@ -672,30 +675,50 @@ class AIProvider:
         return self.transcribe_consensus(audio, filename).final_text
 
     def answer(self, prompt: str) -> str:
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-        provider_url = os.getenv("AI_LLM_BASE_URL")
-        if not token and not provider_url:
-            raise RuntimeError("AI provider is not configured")
-        if provider_url:
-            payload = self._request(provider_url, {"inputs": prompt, "parameters": {"return_full_text": False}}, token)
-            if isinstance(payload, dict) and isinstance(payload.get("generated_text"), str):
-                return payload["generated_text"].strip()
-            raise RuntimeError("AI provider returned an invalid answer")
+        timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
+        return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=260)
+
+    def _cloudflare_chat(self, prompt: str, *, timeout: float, max_tokens: int) -> str:
+        """Generate patient-chat text with Workers AI, without a paid fallback."""
+        account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        if not account_id or not token:
+            raise RuntimeError("Cloudflare Workers AI is not configured")
+
+        url = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{account_id}/ai/run/{self.CHAT_MODEL}"
+        )
+        request = Request(
+            url,
+            data=json.dumps({
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": max(64, min(1000, max_tokens)),
+            }).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
         try:
-            response = InferenceClient(api_key=token).chat_completion(
-                model=self.LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                # Chat answers are intentionally brief.  Reducing completion
-                # length cuts hosted inference time as well as token usage.
-                max_tokens=260,
-            )
-            answer = response.choices[0].message.content
-            if not isinstance(answer, str) or not answer.strip():
-                raise RuntimeError("AI provider returned an empty answer")
-            return answer.strip()
+            with urlopen(request, timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            # Status is useful for quota/permission diagnosis; never propagate
+            # provider response text, which might contain request data.
+            raise RuntimeError(f"Cloudflare Workers AI request failed (HTTP {exc.code})") from exc
         except Exception as exc:
-            raise RuntimeError(f"Hugging Face chat request failed ({type(exc).__name__})") from exc
+            raise RuntimeError(f"Cloudflare Workers AI request failed ({type(exc).__name__})") from exc
+
+        if not isinstance(body, dict) or body.get("success") is False:
+            raise RuntimeError("Cloudflare Workers AI returned an unsuccessful response")
+        result = body.get("result")
+        answer = result.get("response") if isinstance(result, dict) else None
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError("Cloudflare Workers AI returned an empty answer")
+        return answer.strip()
 
 
 ai_provider = AIProvider()
