@@ -6,9 +6,11 @@ from pydantic import ValidationError
 
 from app.routers.integration import (
     ChatRequest,
+    ChatSessionCreate,
     _document_evidence,
     _owned_chat_session,
     _session_documents,
+    create_chat_session,
     remove_chat_session_document,
     secure_chat,
 )
@@ -89,7 +91,42 @@ class _Client:
     def table(self, name): return _Query(self, name)
 
 
+class _InsertOnlyQuery:
+    """Match Supabase 2.13 insert builders, which do not expose select()."""
+    def __init__(self, row):
+        self.row = row
+
+    def insert(self, row):
+        self.row.update(row)
+        return self
+
+    def execute(self):
+        self.row["id"] = SESSION_A
+        return _Response([self.row])
+
+
+class _InsertOnlyClient:
+    def __init__(self):
+        self.inserted = {}
+
+    def table(self, name):
+        if name != "ai_chat_sessions":
+            raise AssertionError(f"unexpected table: {name}")
+        return _InsertOnlyQuery(self.inserted)
+
+
 class SessionScopedDocumentTests(unittest.TestCase):
+    def test_session_creation_uses_supported_insert_execute_response(self):
+        client = _InsertOnlyClient()
+        claims = {"sub": "user-a", "app_metadata": {"role": "patient"}}
+        with patch("app.routers.integration.db", return_value=client), \
+             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}):
+            result = create_chat_session(ChatSessionCreate(title="New chat"), claims)
+
+        self.assertEqual(result["data"]["session_id"], SESSION_A)
+        self.assertEqual(result["data"]["status"], "active")
+        self.assertEqual(client.inserted, {"patient_id": "patient-a", "session_title": "New chat", "id": SESSION_A})
+
     def test_session_lookup_requires_patient_ownership_and_active_state(self):
         client = _Client()
         with self.assertRaises(HTTPException) as denied:

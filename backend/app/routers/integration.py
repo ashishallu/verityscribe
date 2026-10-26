@@ -791,7 +791,7 @@ def create_chat_session(payload: ChatSessionCreate, claims: dict = Depends(curre
     try:
         result = client.table("ai_chat_sessions").insert({
             "patient_id": patient["id"], "session_title": payload.title,
-        }).select("id").execute()
+        }).execute()
         rows = getattr(result, "data", None) or []
         if not rows or not rows[0].get("id"):
             raise RuntimeError("session insert returned no identifier")
