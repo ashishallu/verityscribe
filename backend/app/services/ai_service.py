@@ -75,6 +75,54 @@ class ASRRetryError(RuntimeError):
         super().__init__("ASR provider request failed after bounded retries")
 
 
+class DocumentProviderError(RuntimeError):
+    """Safe, structured provider failure for the document pipeline."""
+
+    def __init__(self, category: str, status_code: int, provider_code: int | None = None):
+        self.category = category
+        self.status_code = status_code
+        self.provider_code = provider_code
+        super().__init__(f"Cloudflare document provider failed ({category}, HTTP {status_code})")
+
+
+def _cloudflare_document_error_code(error: HTTPError) -> int | None:
+    """Extract only Cloudflare's numeric error code; never retain/log its body."""
+    try:
+        payload = json.loads(error.read(8192).decode("utf-8"))
+        errors = payload.get("errors", []) if isinstance(payload, dict) else []
+        for item in errors:
+            code = item.get("code") if isinstance(item, dict) else None
+            if isinstance(code, int):
+                return code
+    except Exception:
+        pass
+    return None
+
+
+def _cloudflare_document_error_category(status_code: int, provider_code: int | None) -> str:
+    if provider_code == 5016:
+        return "vision_model_terms_required"
+    if provider_code in {5018, 3041}:
+        return "vision_model_access_denied"
+    if provider_code == 5035:
+        return "vision_model_paid_plan_required"
+    if provider_code == 3023:
+        return "vision_account_blocked"
+    if provider_code == 3036:
+        return "vision_quota_exhausted"
+    if provider_code == 3040:
+        return "vision_capacity_exhausted"
+    if provider_code in {5007, 3042}:
+        return "vision_model_configuration_error"
+    if status_code == 429:
+        return "vision_capacity_exhausted"
+    if status_code == 403:
+        return "vision_provider_access_denied"
+    if status_code >= 500:
+        return "vision_provider_unavailable"
+    return "vision_provider_request_rejected"
+
+
 class AIProvider:
     ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "@cf/deepgram/nova-3")
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "@cf/openai/whisper-large-v3-turbo")
@@ -208,15 +256,11 @@ class AIProvider:
             with urlopen(request, timeout=45) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            # Do not include or log provider response bodies: they may echo
-            # private prompt or patient-document content.
-            if exc.code == 429 or exc.code >= 500:
-                raise RuntimeError(
-                    f"Cloudflare vision provider capacity error (HTTP {exc.code})"
-                ) from exc
-            raise RuntimeError(
-                f"Cloudflare vision document extraction failed (HTTP {exc.code})"
-            ) from exc
+            # Read only an integer provider error code. Never log or propagate
+            # the response message/body, which could contain user content.
+            provider_code = _cloudflare_document_error_code(exc)
+            category = _cloudflare_document_error_category(exc.code, provider_code)
+            raise DocumentProviderError(category, exc.code, provider_code) from exc
         except Exception as exc:
             raise RuntimeError(
                 f"Cloudflare vision document extraction failed ({type(exc).__name__})"

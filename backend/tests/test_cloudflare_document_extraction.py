@@ -45,12 +45,31 @@ class CloudflareDocumentExtractionTests(unittest.TestCase):
             "https://api.cloudflare.com/test", 429, "rate limited", {}, io.BytesIO(b"private")
         )
 
-        with self.assertRaisesRegex(RuntimeError, r"capacity error \(HTTP 429\)") as error:
+        with self.assertRaises(RuntimeError) as error:
             self.provider._extract_document_text_cloudflare(
                 b"sample-image", "image/jpeg", "account-123", "secret-token"
             )
 
+        self.assertEqual(error.exception.category, "vision_capacity_exhausted")
+        self.assertEqual(error.exception.status_code, 429)
         self.assertNotIn("private", str(error.exception))
+
+    @patch("app.services.ai_service.urlopen")
+    def test_model_terms_failure_is_classified_without_logging_provider_message(self, mock_urlopen):
+        mock_urlopen.side_effect = HTTPError(
+            "https://api.cloudflare.com/test", 403, "forbidden", {},
+            io.BytesIO(json.dumps({"errors": [{"code": 5016, "message": "secret details"}]}).encode()),
+        )
+
+        with self.assertRaises(RuntimeError) as error:
+            self.provider._extract_document_text_cloudflare(
+                b"sample-image", "image/jpeg", "account-123", "secret-token"
+            )
+
+        self.assertEqual(error.exception.category, "vision_model_terms_required")
+        self.assertEqual(error.exception.provider_code, 5016)
+        self.assertNotIn("secret details", str(error.exception))
+        self.assertNotIn("secret-token", str(error.exception))
 
     def test_empty_model_response_is_rejected(self):
         with patch(

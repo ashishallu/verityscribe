@@ -17,7 +17,7 @@ from supabase import Client, create_client
 
 from ..core.config import settings
 from ..core.security import current_claims, get_current_doctor, get_current_patient, get_current_profile, require_roles
-from ..services.ai_service import ai_provider
+from ..services.ai_service import DocumentProviderError, ai_provider
 
 router = APIRouter(tags=["integration"])
 logger = logging.getLogger(__name__)
@@ -92,6 +92,27 @@ CHAT_REPORT_TYPES = {
 CHAT_UPLOAD_TYPES = {
     "application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp",
 }
+
+
+def _bounded_environment_limit(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+MAX_CHAT_REPORT_BYTES = _bounded_environment_limit(
+    "CHAT_REPORT_MAX_BYTES", 10 * 1024 * 1024, 64 * 1024, 25 * 1024 * 1024
+)
+MAX_CHAT_PDF_PAGES = _bounded_environment_limit("CHAT_REPORT_MAX_PDF_PAGES", 25, 1, 100)
+
+
+class ReportValidationError(ValueError):
+    def __init__(self, category: str, detail: str):
+        self.category = category
+        self.detail = detail
+        super().__init__(detail)
 
 class PatientProvisionRequest(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
@@ -174,12 +195,23 @@ def _chat_document_bucket(client: Client) -> str:
         client.storage.get_bucket(bucket)
     except Exception:
         try:
-            client.storage.create_bucket(bucket, options={"public": False})
+            client.storage.create_bucket(bucket, options={
+                "public": False,
+                "file_size_limit": MAX_CHAT_REPORT_BYTES,
+                "allowed_mime_types": sorted(CHAT_UPLOAD_TYPES),
+            })
         except Exception:
             # A concurrent request may create it first. Verify that before
             # treating the initialization as unavailable.
             client.storage.get_bucket(bucket)
     return bucket
+
+
+def _report_text_is_persisted(client: Client, document_id: str, patient_id: str) -> bool:
+    result = client.table("patient_embeddings").select("id").eq(
+        "source_document_id", document_id
+    ).eq("patient_id", patient_id).limit(1).execute()
+    return bool(getattr(result, "data", None))
 
 
 def _is_personal_health_question(message: str) -> bool:
@@ -433,17 +465,35 @@ def _safe_personal_record_answer(question: str, context: dict[str, Any]) -> str:
 def _extract_pdf_text(content: bytes) -> str:
     try:
         reader = PdfReader(BytesIO(content))
-        return "\n".join((page.extract_text() or "") for page in reader.pages)[:30000].strip()
-    except Exception:
-        return ""
+        if reader.is_encrypted:
+            raise ReportValidationError("pdf_password_protected", "This PDF is password-protected. Upload an unlocked copy.")
+        page_count = len(reader.pages)
+        if page_count > MAX_CHAT_PDF_PAGES:
+            raise ReportValidationError(
+                "pdf_page_limit_exceeded",
+                f"This PDF has {page_count} pages; the current limit is {MAX_CHAT_PDF_PAGES}.",
+            )
+        page_text = [(page.extract_text() or "").strip() for page in reader.pages]
+        if any(not text for text in page_text):
+            raise ReportValidationError(
+                "pdf_ocr_required",
+                "This PDF includes scanned pages that need OCR. Save those pages as images and upload them separately, or upload a text-based PDF.",
+            )
+        return "\n".join(
+            f"[Page {index + 1}]\n{text}" for index, text in enumerate(page_text)
+        )[:30000].strip()
+    except ReportValidationError:
+        raise
+    except Exception as exc:
+        raise ReportValidationError(
+            "pdf_extraction_failed",
+            "This PDF is damaged or could not be read. Please export or scan it again.",
+        ) from exc
 
 
 def _report_content_type(document: UploadFile, content: bytes) -> str | None:
-    """Normalise browser uploads which often arrive as octet-stream."""
-    claimed = (document.content_type or "").lower().split(";", 1)[0]
-    if claimed in CHAT_UPLOAD_TYPES:
-        return claimed
-    if content.startswith(b"%PDF-"):
+    """Identify the real format from its signature, not the browser MIME label."""
+    if content[:1024].find(b"%PDF-") >= 0:
         return "application/pdf"
     if content.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -452,6 +502,18 @@ def _report_content_type(document: UploadFile, content: bytes) -> str | None:
     if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _validate_report_size(content: bytes) -> None:
+    if len(content) > MAX_CHAT_REPORT_BYTES:
+        raise ReportValidationError("file_too_large", "Report exceeds the 10 MB limit")
+
+
+async def _read_report_upload(document: UploadFile) -> bytes:
+    """Read at most the allowed size plus one byte, avoiding unbounded reads."""
+    content = await document.read(MAX_CHAT_REPORT_BYTES + 1)
+    _validate_report_size(content)
+    return content
 
 
 def _storage_error_detail(exc: Exception) -> str:
@@ -565,11 +627,12 @@ async def upload_patient_chat_report(
     normalized_type = report_type.strip().lower().replace(" ", "_")
     if normalized_type not in CHAT_REPORT_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported report type")
-    content = await document.read()
+    try:
+        content = await _read_report_upload(document)
+    except ReportValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     if not content:
         raise HTTPException(status_code=422, detail="Report file is empty")
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=422, detail="Report exceeds the 10 MB limit")
     content_type = _report_content_type(document, content)
     if not content_type:
         raise HTTPException(status_code=422, detail="Upload a valid PDF, PNG, JPEG, or WEBP report")
@@ -604,11 +667,15 @@ async def upload_patient_chat_report(
     existing_rows = getattr(existing_result, "data", None) or []
     existing = existing_rows[0] if existing_rows else None
     if existing:
-        return {"data": {"document": existing, "report_type": normalized_type,
-                         "text_available": True,
-                         "message": "Your report was already saved privately and is available to Verity."}}
+        # A previous attempt may have written document metadata but failed
+        # before persisting its extracted text. Do not claim success unless
+        # the patient-scoped extraction is present too; fall through and heal.
+        if _report_text_is_persisted(client, document_id, patient["id"]):
+            return {"data": {"document": existing, "report_type": normalized_type,
+                             "text_available": True,
+                             "message": "Your report was already saved privately and is available to Verity."}}
     suffix = (document.filename or "report").replace("/", "_").replace("\\", "_")
-    path = f"{patient['id']}/{document_id}-{suffix}"
+    path = (existing.get("bucket_path") if existing else None) or f"{patient['id']}/{document_id}-{suffix}"
     try:
         client.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": "true"})
         logger.info("Chat report stored privately: request_id=%s", diagnostic_id)
@@ -646,29 +713,57 @@ async def upload_patient_chat_report(
         except Exception:
             pass
         raise
-    except RuntimeError as exc:
-        is_temporary_capacity_error = "capacity" in str(exc).lower() or "503" in str(exc).lower()
-        if is_temporary_capacity_error:
-            # Keep the object private and retain it for the idempotent retry.
-            # It has not been added to chat context until extraction succeeds.
-            logger.warning(
-                "Report vision provider is temporarily at capacity: request_id=%s elapsed_ms=%d",
-                diagnostic_id,
-                round((time.perf_counter() - started_at) * 1000),
-            )
-            raise HTTPException(
-                status_code=503,
-                detail="Report processing is temporarily busy. Your private file was retained; retry shortly.",
-                headers={"Retry-After": "5"},
-            ) from exc
+    except ReportValidationError as exc:
         try:
             client.storage.from_(bucket).remove([path])
         except Exception:
             pass
-        logger.exception(
-            "Private report image extraction failed: request_id=%s error=%s",
-            diagnostic_id,
-            exc,
+        logger.warning(
+            "Report validation failed: request_id=%s category=%s elapsed_ms=%d",
+            diagnostic_id, exc.category, round((time.perf_counter() - started_at) * 1000),
+        )
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    except DocumentProviderError as exc:
+        retain = exc.category in {
+            "vision_model_terms_required", "vision_model_access_denied",
+            "vision_model_paid_plan_required", "vision_account_blocked",
+            "vision_quota_exhausted", "vision_capacity_exhausted",
+            "vision_provider_unavailable",
+        }
+        if not retain:
+            try:
+                client.storage.from_(bucket).remove([path])
+            except Exception:
+                pass
+        logger.error(
+            "Report provider failed: request_id=%s category=%s http_status=%d provider_code=%s retained=%s elapsed_ms=%d",
+            diagnostic_id, exc.category, exc.status_code, exc.provider_code, retain,
+            round((time.perf_counter() - started_at) * 1000),
+        )
+        if exc.category == "vision_model_terms_required":
+            detail = "Document processing needs one-time model activation by the service owner. Your private file was retained; retry after activation."
+        elif exc.category == "vision_model_paid_plan_required":
+            detail = "The configured document model requires a paid Cloudflare plan. No paid fallback was attempted; ask the service owner to configure an eligible model."
+        elif exc.category == "vision_quota_exhausted":
+            detail = "The free document-processing allowance has been reached. Your private file was retained; try again after the daily reset."
+        elif exc.category == "vision_model_configuration_error":
+            detail = "The configured document model rejected this request. Ask the service owner to correct its model configuration, then upload the file again."
+        elif exc.category in {"vision_capacity_exhausted", "vision_provider_unavailable"}:
+            detail = "Document processing is temporarily unavailable. Your private file was retained; please retry shortly."
+        elif retain:
+            detail = "The document service could not access its configured model. Your private file was retained; please contact support."
+        else:
+            detail = "The document service rejected the upload. Please contact support and upload again after the issue is resolved."
+        headers = {"Retry-After": "5"} if exc.category in {"vision_capacity_exhausted", "vision_provider_unavailable"} else None
+        raise HTTPException(status_code=503, detail=detail, headers=headers) from exc
+    except RuntimeError as exc:
+        try:
+            client.storage.from_(bucket).remove([path])
+        except Exception:
+            pass
+        logger.error(
+            "Private report extraction failed: request_id=%s exception=%s elapsed_ms=%d",
+            diagnostic_id, type(exc).__name__, round((time.perf_counter() - started_at) * 1000),
         )
         raise HTTPException(
             status_code=503,
@@ -680,12 +775,12 @@ async def upload_patient_chat_report(
             "document_type": normalized_type,
         }).execute()
         record_rows = getattr(record_result, "data", None) or []
-        record = record_rows[0] if record_rows else {
-            "id": document_id,
-            "patient_id": patient["id"],
-            "bucket_path": path,
-            "document_type": normalized_type,
-        }
+        verified_record = client.table("medical_documents").select("id,patient_id,bucket_path,document_type").eq(
+            "id", document_id
+        ).eq("patient_id", patient["id"]).limit(1).execute()
+        record = (getattr(verified_record, "data", None) or record_rows or [None])[0]
+        if not record:
+            raise RuntimeError("Document metadata write could not be verified")
         if extracted:
             embedding_result = client.table("patient_embeddings").select("id").eq(
                 "source_document_id", document_id
@@ -695,11 +790,26 @@ async def upload_patient_chat_report(
                 client.table("patient_embeddings").insert({
                     "patient_id": patient["id"], "source_document_id": document_id, "content": extracted,
                 }).execute()
+            verified_embedding = client.table("patient_embeddings").select("id").eq(
+                "source_document_id", document_id
+            ).eq("patient_id", patient["id"]).limit(1).execute()
+            if not getattr(verified_embedding, "data", None):
+                raise RuntimeError("Document text write could not be verified")
     except Exception as exc:
-        try:
-            client.storage.from_(bucket).remove([path])
-        except Exception:
-            pass
+        if not existing:
+            # Roll back only the rows created by this attempt. If this is a
+            # recovery retry, preserve its private object/metadata for another
+            # retry instead of creating an orphan or falsely succeeding.
+            try:
+                client.table("medical_documents").delete().eq("id", document_id).eq(
+                    "patient_id", patient["id"]
+                ).execute()
+            except Exception:
+                pass
+            try:
+                client.storage.from_(bucket).remove([path])
+            except Exception:
+                pass
         logger.exception(
             "Private report metadata save failed: request_id=%s error=%s",
             diagnostic_id,
