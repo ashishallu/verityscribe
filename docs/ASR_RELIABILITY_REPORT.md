@@ -18,7 +18,7 @@ The failure evidence supplied by the user reports a 400-style `invalid_audio_or_
 | `@cf/deepgram/nova-3` | Cloudflare Workers AI batch REST | Existing raw WAV bytes with `audio/wav`; unchanged | Existing fast baseline | Mock regression passed; live not tested |
 | `@cf/openai/whisper-large-v3-turbo` | Cloudflare Workers AI batch REST | Base64-encoded audio JSON, matching Cloudflare's published example | Batch ASR | User reports usable live transcript; mocked request/response regression is retained |
 
-The failed Hugging Face `openai/whisper-large-v3-turbo` route and Cloudflare Flux route have been removed. ASR configuration accepts only the four allowlisted Cloudflare model IDs; custom endpoints and non-Cloudflare providers are rejected so the ensemble cannot silently route to a paid external provider. An override containing Flux is rejected as unapproved; clear any stale `AI_ASR_MODELS_JSON` override in Render to use the four-model default.
+The failed Hugging Face `openai/whisper-large-v3-turbo` route and Cloudflare Flux route have been removed. ASR configuration accepts only the four allowlisted Cloudflare model IDs; custom endpoints and non-Cloudflare providers are rejected so the ensemble cannot silently route to a paid external provider. A legacy `AI_ASR_MODELS_JSON` override that lists Flux now drops that retired entry and preserves the remaining supported models, avoiding a break from stale Render configuration.
 
 ## B. Replacement rationale and limitations
 
@@ -42,7 +42,7 @@ Automated tests validate the four-model configuration, request/response adapters
 
 ## E. Regression and test results
 
-Command: `python -m unittest discover -s tests -q` from `backend/`. **23 tests passed.** Coverage includes the four-model configuration, explicit Flux rejection, rejection of oversized custom configurations, Cloudflare request formats including Turbo Base64 payload/response parsing, four-model parallel consensus, one/all model failures, external/paid-provider rejection, and one-shot handling of Cloudflare quota 429; existing document extraction tests also passed.
+Command: `python -m unittest discover -s tests -q` from `backend/`. **23 tests passed.** Coverage includes the four-model configuration, migration of legacy overrides that still include Flux, rejection of oversized custom configurations, Cloudflare request formats including Turbo Base64 payload/response parsing, four-model parallel consensus, one/all model failures, external/paid-provider rejection, and one-shot handling of Cloudflare quota 429; existing document extraction tests also passed.
 
 These are unit tests with mocked provider responses, not real inference or a deployed end-to-end test. Live regression of the three existing models was not possible here, so they are preserved in source and their adapter contracts are regression-tested but not freshly verified against Cloudflare.
 
@@ -67,9 +67,8 @@ No Flutter app, doctor app, admin portal, Supabase schema/RLS, recording storage
 
 ## H. Remaining blockers and next verification
 
-1. Clear any stale Render `AI_ASR_MODELS_JSON` override that still lists Flux; otherwise config validation will reject the custom list and defaults will not be selected.
-2. Confirm that the Cloudflare account remains on Workers Free. The repository cannot enforce account-plan selection; on Workers Paid, Cloudflare can bill beyond the daily free allocation.
-3. After deployment, verify all four predictions appear in the UI and that each returns a usable transcript. Compare against synthetic/consented audio with known words, numbers, and negations.
+1. Confirm that the Cloudflare account remains on Workers Free. The repository cannot enforce account-plan selection; on Workers Paid, Cloudflare can bill beyond the daily free allocation.
+2. After deployment, verify all four predictions appear in the UI and that each returns a usable transcript. Compare against synthetic/consented audio with known words, numbers, and negations.
 
 ## I. Final verdict
 

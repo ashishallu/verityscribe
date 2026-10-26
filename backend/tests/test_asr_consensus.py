@@ -93,11 +93,15 @@ class TranscriptConsensusTests(unittest.TestCase):
             "@cf/openai/whisper", "@cf/openai/whisper-tiny-en", "@cf/deepgram/nova-3"
         ])
 
-    def test_flux_is_rejected_from_custom_asr_configuration(self):
-        config = json.dumps([{"model": "@cf/deepgram/flux", "provider": "cloudflare"}])
+    def test_legacy_custom_configuration_drops_flux_and_keeps_supported_models(self):
+        config = json.dumps([
+            {"model": model, "provider": "cloudflare"}
+            for model, _provider, weight in self.provider.DEFAULT_ASR_MODELS
+        ] + [{"model": "@cf/deepgram/flux", "provider": "cloudflare", "weight": 1.0}])
         with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": config}):
-            with self.assertRaisesRegex(RuntimeError, "not on the approved"):
-                self.provider._asr_model_configs()
+            configs = self.provider._asr_model_configs()
+        self.assertEqual(len(configs), 4)
+        self.assertNotIn("@cf/deepgram/flux", {entry["model"] for entry in configs})
 
     def test_custom_asr_configuration_cannot_exceed_four_models(self):
         config = json.dumps([
@@ -105,7 +109,7 @@ class TranscriptConsensusTests(unittest.TestCase):
             for model, _provider, _weight in self.provider.DEFAULT_ASR_MODELS
         ] + [{"model": "@cf/openai/whisper", "provider": "cloudflare"}])
         with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": config}):
-            with self.assertRaisesRegex(RuntimeError, "between one and four"):
+            with self.assertRaisesRegex(RuntimeError, "between one and four supported"):
                 self.provider._asr_model_configs()
 
     def test_three_existing_cloudflare_model_wire_formats_are_preserved(self):

@@ -95,8 +95,17 @@ class AIProvider:
                 models = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("AI_ASR_MODELS_JSON must contain a JSON array") from exc
-            if not isinstance(models, list) or not 1 <= len(models) <= 4:
-                raise RuntimeError("AI_ASR_MODELS_JSON must define between one and four models")
+            if not isinstance(models, list) or not 1 <= len(models) <= 5:
+                raise RuntimeError("AI_ASR_MODELS_JSON must define between one and five entries")
+            # Older Render overrides may still list Flux. Drop that retired
+            # model so its stale setting cannot break the four working routes.
+            models = [
+                item for item in models
+                if not isinstance(item, dict)
+                or str(item.get("model", "")).strip() != "@cf/deepgram/flux"
+            ]
+            if not 1 <= len(models) <= 4:
+                raise RuntimeError("AI_ASR_MODELS_JSON must define between one and four supported models")
             configs = []
             for item in models:
                 if not isinstance(item, dict):
