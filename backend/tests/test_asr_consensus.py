@@ -1,8 +1,11 @@
 import os
 import json
+import base64
+from io import BytesIO
 import sys
 import types
 import unittest
+import wave
 from unittest.mock import patch
 
 # These tests exercise only the provider-agnostic consensus logic. Keep them
@@ -22,18 +25,19 @@ class TranscriptConsensusTests(unittest.TestCase):
         credentials = patch.dict(os.environ, {
             "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
             "CLOUDFLARE_API_TOKEN": "cf-token-test",
+            "CLOUDFLARE_AI_GATEWAY": "test-gateway",
         })
         credentials.start()
         self.addCleanup(credentials.stop)
 
     TWO_MODEL_CONFIG = json.dumps([
-        {"model": "openai/whisper-large-v3-turbo", "endpoint": "https://asr-primary.test", "weight": 1.1},
-        {"model": "openai/whisper-large-v3", "endpoint": "https://asr-secondary.test", "weight": 1.15},
+        {"model": "@cf/openai/whisper-large-v3-turbo", "provider": "cloudflare", "weight": 1.1},
+        {"model": "@cf/deepgram/flux", "provider": "cloudflare", "weight": 1.15},
     ])
 
     def test_single_provider_result_is_not_duplicated_as_two_drafts(self):
-        def transcribe(_audio, _filename, url, _model, _provider="auto"):
-            if url.endswith("primary.test"):
+        def transcribe(_audio, _filename, _url, model, _provider="auto"):
+            if model == "@cf/openai/whisper-large-v3-turbo":
                 raise RuntimeError("provider unavailable")
             return "Patient reports cough."
 
@@ -49,8 +53,8 @@ class TranscriptConsensusTests(unittest.TestCase):
         self.assertTrue(result.conflicts)
 
     def test_two_drafts_are_reconciled_and_labeled(self):
-        def transcribe(_audio, _filename, url, _model, _provider="auto"):
-            return "I have a cough." if url.endswith("primary.test") else "I have cough."
+        def transcribe(_audio, _filename, _url, model, _provider="auto"):
+            return "I have a cough." if model == "@cf/openai/whisper-large-v3-turbo" else "I have cough."
 
         with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": self.TWO_MODEL_CONFIG, "HF_TOKEN": "test-token"}), patch.object(self.provider, "_transcribe_with", side_effect=transcribe), patch.object(
             self.provider,
@@ -64,8 +68,8 @@ class TranscriptConsensusTests(unittest.TestCase):
         self.assertEqual(result.reconciliation_status, "reconciled")
 
     def test_equivalent_drafts_skip_llm_reconciliation(self):
-        def transcribe(_audio, _filename, url, _model, _provider="auto"):
-            return "Patient has a cough." if url.endswith("primary.test") else "patient has a cough"
+        def transcribe(_audio, _filename, _url, model, _provider="auto"):
+            return "Patient has a cough." if model == "@cf/openai/whisper-large-v3-turbo" else "patient has a cough"
 
         with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": self.TWO_MODEL_CONFIG, "HF_TOKEN": "test-token"}), patch.object(self.provider, "_transcribe_with", side_effect=transcribe), patch.object(
             self.provider, "_hf_chat", side_effect=AssertionError("should skip LLM")
@@ -75,20 +79,106 @@ class TranscriptConsensusTests(unittest.TestCase):
         self.assertEqual(result.reconciliation_status, "identical")
         self.assertEqual(result.final_text, "patient has a cough")
 
-    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
-    def test_default_setup_configures_four_cloudflare_models_and_working_hf_model(self):
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": ""})
+    def test_default_setup_preserves_three_working_models_and_has_two_replacements(self):
         configs = self.provider._asr_model_configs()
 
         self.assertEqual(len(configs), 5)
         self.assertEqual(len({entry["model"] for entry in configs}), 5)
         providers = {entry["model"]: entry["provider"] for entry in configs}
-        cloudflare_models = {model for model, provider in providers.items() if provider == "cloudflare"}
-        self.assertEqual(len(cloudflare_models), 4)
-        self.assertIn("@cf/openai/whisper-large-v3-turbo", cloudflare_models)
-        self.assertIn("@cf/openai/whisper", cloudflare_models)
-        self.assertIn("@cf/openai/whisper-tiny-en", cloudflare_models)
-        self.assertIn("@cf/deepgram/nova-3", cloudflare_models)
-        self.assertEqual(providers["openai/whisper-large-v3-turbo"], "auto")
+        self.assertEqual(set(providers), {
+            "@cf/openai/whisper", "@cf/openai/whisper-tiny-en",
+            "@cf/deepgram/nova-3", "@cf/deepgram/flux",
+            "@cf/openai/whisper-large-v3-turbo",
+        })
+        self.assertEqual(set(providers.values()), {"cloudflare"})
+        self.assertEqual([entry["model"] for entry in configs[:3]], [
+            "@cf/openai/whisper", "@cf/openai/whisper-tiny-en", "@cf/deepgram/nova-3"
+        ])
+
+    def test_three_existing_cloudflare_model_wire_formats_are_preserved(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self): return b'{"success":true,"result":{"text":"baseline transcript"}}'
+
+        with patch.object(ai_service, "urlopen", return_value=Response()) as post:
+            for model in ("@cf/openai/whisper", "@cf/openai/whisper-tiny-en"):
+                with self.subTest(model=model):
+                    self.assertEqual(
+                        self.provider._transcribe_with(b"wav-bytes", "visit.wav", None, model, "cloudflare"),
+                        "baseline transcript",
+                    )
+                    request = post.call_args.args[0]
+                    self.assertEqual(json.loads(request.data), {"audio": list(b"wav-bytes")})
+                    self.assertEqual(request.get_header("Content-type"), "application/json")
+
+            self.provider._transcribe_with(
+                b"wav-bytes", "visit.wav", None, "@cf/deepgram/nova-3", "cloudflare"
+            )
+            request = post.call_args.args[0]
+            self.assertEqual(request.data, b"wav-bytes")
+            self.assertEqual(request.get_header("Content-type"), "audio/wav")
+
+    def test_cloudflare_turbo_uses_documented_base64_audio_shape(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def read(self): return b'{"success":true,"result":{"transcription_info":{"text":"turbo transcript"}}}'
+
+        audio = b"sample-wav-payload"
+        with patch.object(ai_service, "urlopen", return_value=Response()) as post:
+            text = self.provider._transcribe_with(
+                audio, "visit.wav", None,
+                "@cf/openai/whisper-large-v3-turbo", "cloudflare",
+            )
+        self.assertEqual(text, "turbo transcript")
+        request = post.call_args.args[0]
+        self.assertEqual(json.loads(request.data), {"audio": base64.b64encode(audio).decode("ascii")})
+        self.assertIn("/ai/run/@cf/openai/whisper-large-v3-turbo", request.full_url)
+
+    def test_flux_websocket_replays_pcm_and_collects_final_turn_transcript(self):
+        import websockets.sync.client
+
+        pcm = b"\x01\x00" * 160
+        wav_buffer = BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(pcm)
+        sent = []
+
+        class Socket:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def send(self, message): sent.append(message)
+            def recv(self, timeout=None):
+                if not hasattr(self, "received"):
+                    self.received = True
+                    return json.dumps({
+                        "type": "TurnInfo",
+                        "event": "EndOfTurn",
+                        "transcript": "Flux transcript",
+                    })
+                raise TimeoutError("done")
+
+        with patch.object(websockets.sync.client, "connect", return_value=Socket()) as connect:
+            transcript = self.provider._transcribe_with(
+                wav_buffer.getvalue(), "visit.wav", None, "@cf/deepgram/flux", "cloudflare"
+            )
+        self.assertEqual(transcript, "Flux transcript")
+        self.assertEqual(sent[0], pcm)
+        self.assertEqual(json.loads(sent[-1]), {"type": "CloseStream"})
+        self.assertIn("model=%40cf%2Fdeepgram%2Fflux", connect.call_args.args[0])
+        self.assertEqual(
+            connect.call_args.kwargs["additional_headers"]["cf-aig-authorization"],
+            "cf-token-test",
+        )
+
+    def test_flux_requires_valid_pcm_wav(self):
+        with self.assertRaisesRegex(RuntimeError, "valid PCM WAV"):
+            self.provider._transcribe_flux(b"not-wav", "acct", "token", 10)
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
     def test_all_provider_failures_report_safe_actionable_codes(self):
@@ -107,7 +197,7 @@ class TranscriptConsensusTests(unittest.TestCase):
             side_effect=fail_provider,
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "inference_provider_permission_or_billing"
+                RuntimeError, "provider_permission_denied"
             ):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
 
@@ -123,7 +213,7 @@ class TranscriptConsensusTests(unittest.TestCase):
                 raise RuntimeError("Hugging Face ASR request failed") from exc
 
         with patch.object(self.provider, "_transcribe_with", side_effect=fail_provider):
-            with self.assertRaisesRegex(RuntimeError, "gated_model_access_required"):
+            with self.assertRaisesRegex(RuntimeError, "model_access_denied"):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
@@ -138,7 +228,7 @@ class TranscriptConsensusTests(unittest.TestCase):
                 raise RuntimeError("Hugging Face ASR request failed (HTTPError)") from exc
 
         with patch.object(self.provider, "_transcribe_with", side_effect=fail_provider):
-            with self.assertRaisesRegex(RuntimeError, "authentication_failed") as error:
+            with self.assertRaisesRegex(RuntimeError, "provider_authentication_failed") as error:
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
         self.assertNotIn("private body", str(error.exception))
 
@@ -151,7 +241,7 @@ class TranscriptConsensusTests(unittest.TestCase):
                 raise RuntimeError("Hugging Face ASR request failed (ValueError)") from exc
 
         with patch.object(self.provider, "_transcribe_with", side_effect=fail_provider):
-            with self.assertRaisesRegex(RuntimeError, "model_provider_unsupported"):
+            with self.assertRaisesRegex(RuntimeError, "model_unsupported"):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
 
     @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
@@ -168,105 +258,85 @@ class TranscriptConsensusTests(unittest.TestCase):
                 self.provider.transcribe_consensus(b"audio", "visit.wav")
         self.assertNotIn("private request content", str(error.exception))
 
+    def test_paid_external_asr_route_is_rejected_without_network_access(self):
+        with patch.object(ai_service, "InferenceClient", side_effect=AssertionError("no provider call allowed")):
+            with self.assertRaisesRegex(RuntimeError, "restricted to the approved Cloudflare"):
+                self.provider._transcribe_with(
+                    b"audio", "visit.wav", None, "Qwen/Qwen3-ASR-1.7B", "deepinfra"
+                )
+
+    def test_transient_provider_failure_retries_once_and_reports_retry_count(self):
+        with patch.dict(os.environ, {"AI_ASR_MAX_RETRIES": "1"}), patch.object(
+            self.provider, "_transcribe_with", side_effect=[TimeoutError("timeout"), "usable text"]
+        ) as request, patch.object(ai_service, "sleep"):
+            text, retries = self.provider._transcribe_with_retries(
+                b"audio", "visit.wav", None, "openai/whisper-large-v3-turbo", "auto"
+            )
+        self.assertEqual(text, "usable text")
+        self.assertEqual(retries, 1)
+        self.assertEqual(request.call_count, 2)
+
+    def test_permanent_provider_failure_is_not_retried(self):
+        with patch.dict(os.environ, {"AI_ASR_MAX_RETRIES": "2"}), patch.object(
+            self.provider, "_transcribe_with", side_effect=ValueError("invalid request")
+        ) as request:
+            with self.assertRaises(ai_service.ASRRetryError) as caught:
+                self.provider._transcribe_with_retries(
+                    b"audio", "visit.wav", None, "openai/whisper-large-v3-turbo", "auto"
+                )
+        self.assertEqual(caught.exception.retry_count, 0)
+        self.assertEqual(request.call_count, 1)
+
+    @patch.dict(os.environ, {"AI_ASR_MODELS_JSON": "", "HF_TOKEN": "test-token"})
+    def test_all_failed_result_retains_model_states_and_request_id(self):
+        with patch.object(self.provider, "_transcribe_with", side_effect=TimeoutError("provider timed out")):
+            with self.assertRaises(ai_service.ASRAllModelsFailed) as caught:
+                self.provider.transcribe_consensus(b"audio", "visit.wav", "correlation-test")
+        self.assertEqual(caught.exception.request_id, "correlation-test")
+        self.assertEqual(len(caught.exception.predictions), 5)
+        self.assertTrue(all(item.status == "TIMEOUT" for item in caught.exception.predictions))
+        payload = self.provider.failed_consensus_payload(caught.exception.predictions)
+        self.assertEqual(payload["execution_status"], "all_failed")
+        self.assertTrue(all(item["text"] == "" for item in payload["predictions"]))
+
+    def test_external_or_hugging_face_routes_are_rejected_to_prevent_paid_asr(self):
+        config = json.dumps([{"model": "openai/whisper-large-v3-turbo", "provider": "auto"}])
+        with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": config}):
+            with self.assertRaisesRegex(RuntimeError, "paid/external routes are disabled"):
+                self.provider._asr_model_configs()
+
     @patch.dict(os.environ, {"HF_TOKEN": "test-token"})
-    def test_provider_routed_model_uses_its_configured_provider(self):
-        client_kwargs = []
-
-        class FakeResponse:
-            text = "clinical transcription"
-
-        class FakeClient:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                client_kwargs.append(kwargs)
-
-            def automatic_speech_recognition(self, audio, model):
-                self.audio = audio
-                self.model = model
-                return FakeResponse()
-
-        with patch.object(ai_service, "InferenceClient", FakeClient):
-            text = self.provider._transcribe_with(
-                b"audio", "visit.wav", None, "Qwen/Qwen3-ASR-0.6B", "deepinfra"
-            )
-
-        self.assertEqual(text, "clinical transcription")
-        self.assertEqual(client_kwargs[0]["provider"], "deepinfra")
-
-    @patch.dict(os.environ, {
-        "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
-        "CLOUDFLARE_API_TOKEN": "cf-token-test",
-        "AI_ASR_TIMEOUT_SECONDS": "11",
-    })
-    def test_cloudflare_whisper_uses_json_audio_bytes_and_parses_transcript(self):
-        class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_args): pass
-            def read(self): return b'{"success":true,"result":{"text":"whisper text"}}'
-
-        seen = {}
-
-        def fake_urlopen(request, timeout):
-            seen["url"] = request.full_url
-            seen["headers"] = request.headers
-            seen["body"] = json.loads(request.data.decode())
-            seen["timeout"] = timeout
-            return Response()
-
-        with patch.object(ai_service, "urlopen", side_effect=fake_urlopen):
-            text = self.provider._transcribe_with(
-                b"wav-bytes", "visit.wav", None, "@cf/openai/whisper", "cloudflare"
-            )
-
-        self.assertEqual(text, "whisper text")
-        self.assertTrue(seen["url"].endswith("/ai/run/@cf/openai/whisper"))
-        self.assertEqual(seen["body"], {"audio": list(b"wav-bytes")})
-        self.assertEqual(seen["headers"]["Authorization"], "Bearer cf-token-test")
-        self.assertEqual(seen["timeout"], 11)
-
-    @patch.dict(os.environ, {
-        "CLOUDFLARE_ACCOUNT_ID": "cf-account-test",
-        "CLOUDFLARE_API_TOKEN": "cf-token-test",
-    })
-    def test_cloudflare_nova3_uses_binary_wav_payload(self):
-        class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_args): pass
-            def read(self): return b'{"success":true,"result":{"results":{"channels":[{"alternatives":[{"transcript":"nova text"}]}]}}}'
-
-        seen = {}
-
-        def fake_urlopen(request, timeout):
-            seen["body"] = request.data
-            seen["headers"] = request.headers
-            return Response()
-
-        with patch.object(ai_service, "urlopen", side_effect=fake_urlopen):
-            text = self.provider._transcribe_with(
-                b"wav-bytes", "visit.wav", None, "@cf/deepgram/nova-3", "cloudflare"
-            )
-
-        self.assertEqual(text, "nova text")
-        self.assertEqual(seen["body"], b"wav-bytes")
-        self.assertEqual(seen["headers"]["Content-type"], "audio/wav")
-
-    @patch.dict(os.environ, {"HF_TOKEN": ""})
     def test_five_models_run_and_return_individual_predictions(self):
         configs = [
-            {"model": f"org/model-{index}", "endpoint": f"https://model-{index}.test", "weight": 1 + index / 10}
-            for index in range(5)
+            {"model": model, "provider": "cloudflare", "weight": weight}
+            for model, _provider, weight in self.provider.DEFAULT_ASR_MODELS
         ]
         with patch.dict(os.environ, {"AI_ASR_MODELS_JSON": json.dumps(configs)}), patch.object(
-            self.provider, "_transcribe_with", side_effect=lambda _a, _f, url, _m, _p="auto": url.rsplit("-", 1)[1].split(".", 1)[0]
+            self.provider, "_transcribe_with", side_effect=lambda _a, _f, _url, model, _p="auto": model
         ), patch.object(
             self.provider, "reconcile_ensemble", return_value=("curated text", [])
         ) as reconcile:
             result = self.provider.transcribe_consensus(b"audio", "visit.wav")
 
         self.assertEqual(len(result.predictions), 5)
-        self.assertTrue(all(item.status == "success" for item in result.predictions))
+        self.assertTrue(all(item.status == "SUCCESS" for item in result.predictions))
+        self.assertEqual(result.execution_status, "all_success")
         self.assertEqual(result.final_text, "curated text")
         reconcile.assert_called_once()
+
+    def test_cloudflare_quota_429_is_not_retried(self):
+        class QuotaExceeded(Exception):
+            status_code = 429
+
+        with patch.dict(os.environ, {"AI_ASR_MAX_RETRIES": "2"}), patch.object(
+            self.provider, "_transcribe_with", side_effect=QuotaExceeded("quota exhausted")
+        ) as request:
+            with self.assertRaises(ai_service.ASRRetryError) as caught:
+                self.provider._transcribe_with_retries(
+                    b"audio", "visit.wav", None, "@cf/openai/whisper", "cloudflare"
+                )
+        self.assertEqual(caught.exception.retry_count, 0)
+        self.assertEqual(request.call_count, 1)
 
 
 if __name__ == "__main__":

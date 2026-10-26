@@ -1,13 +1,21 @@
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import base64
+from io import BytesIO
+from urllib.parse import quote
+import wave
 from difflib import SequenceMatcher
+from datetime import datetime, timezone
 import json
 import logging
 import math
 import os
+import random
 import re
+import traceback
 from time import perf_counter
+from time import sleep
+from uuid import uuid4
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -15,6 +23,7 @@ from huggingface_hub import InferenceClient
 
 
 logger = logging.getLogger(__name__)
+_ASR_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="cloudflare-asr")
 
 
 @dataclass(frozen=True)
@@ -34,6 +43,10 @@ class ASRPrediction:
     text: str
     latency_ms: int
     error_code: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    retry_count: int = 0
+    diagnostic: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,21 +57,40 @@ class TranscriptConsensus:
     conflicts: list[str]
     reconciliation_status: str = "reconciled"
     predictions: list[ASRPrediction] | None = None
+    execution_status: str = "complete"
+
+
+class ASRAllModelsFailed(RuntimeError):
+    """All providers failed; keep safe per-model results for the API layer."""
+
+    def __init__(self, predictions: list[ASRPrediction], request_id: str):
+        self.predictions = predictions
+        self.request_id = request_id
+        failures = ", ".join(
+            f"{item.model}:{item.error_code or 'provider_error'}" for item in predictions
+        )
+        super().__init__(f"All configured ASR models failed ({failures})")
+
+
+class ASRRetryError(RuntimeError):
+    def __init__(self, retry_count: int):
+        self.retry_count = retry_count
+        super().__init__("ASR provider request failed after bounded retries")
 
 
 class AIProvider:
-    ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "openai/whisper-large-v3-turbo")
-    SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "openai/whisper-large-v3")
+    ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "@cf/deepgram/nova-3")
+    SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "@cf/openai/whisper-large-v3-turbo")
     LLM_MODEL = "Qwen/Qwen3-8B"
     DEFAULT_ASR_MODELS = (
-        # Four batch ASR models available through Workers AI plus the known-
-        # working Hugging Face route. The turbo model intentionally appears
-        # on both services so provider reliability can be compared.
-        ("@cf/openai/whisper-large-v3-turbo", "cloudflare", 1.20),
+        # Preserve the three reported-working Cloudflare routes and their
+        # existing weights. Replace the two failed Turbo routes with the
+        # Cloudflare batch Turbo adapter and the distinct real-time Flux model.
         ("@cf/openai/whisper", "cloudflare", 1.10),
         ("@cf/openai/whisper-tiny-en", "cloudflare", 0.80),
         ("@cf/deepgram/nova-3", "cloudflare", 1.10),
-        ("openai/whisper-large-v3-turbo", "auto", 1.15),
+        ("@cf/deepgram/flux", "cloudflare", 1.00),
+        ("@cf/openai/whisper-large-v3-turbo", "cloudflare", 1.15),
     )
 
     def _asr_model_configs(self) -> list[dict[str, str | float | None]]:
@@ -83,21 +115,17 @@ class AIProvider:
                 provider = str(item.get("provider", "auto")).strip().lower()
                 if not model or not math.isfinite(weight) or weight <= 0:
                     raise RuntimeError("Each ASR model requires a model id and positive weight")
-                if endpoint and not endpoint.startswith(("http://", "https://")):
-                    raise RuntimeError("Custom ASR endpoints must use HTTP or HTTPS")
-                if not endpoint and provider == "cloudflare":
-                    if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
-                        raise RuntimeError(
-                            "Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
-                        )
-                elif not endpoint:
-                    if provider not in {"auto", "hf-inference", "fal-ai", "deepinfra", "together"}:
-                        raise RuntimeError("Unsupported ASR provider")
-                    if not (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")):
-                        raise RuntimeError("HF_TOKEN is required for Hugging Face-routed ASR models")
+                if endpoint or provider != "cloudflare":
+                    raise RuntimeError(
+                        "ASR is restricted to the configured Cloudflare Workers AI models; paid/external routes are disabled"
+                    )
+                if model not in {entry[0] for entry in self.DEFAULT_ASR_MODELS}:
+                    raise RuntimeError("ASR model is not on the approved zero-cost Cloudflare allowlist")
+                if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
+                    raise RuntimeError("Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
                 configs.append({
                     "model": model,
-                    "endpoint": endpoint or None,
+                    "endpoint": None,
                     "provider": provider,
                     "weight": weight,
                 })
@@ -105,14 +133,8 @@ class AIProvider:
                 raise RuntimeError("ASR model ids must be unique")
             return configs
 
-        # Custom endpoints, providers, and weights can still be supplied
-        # explicitly through AI_ASR_MODELS_JSON.
         if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
-            raise RuntimeError(
-                "Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN"
-            )
-        if not (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")):
-            raise RuntimeError("HF_TOKEN is required for the Hugging Face ASR model")
+            raise RuntimeError("Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
         return [
             {
                 "model": model,
@@ -315,118 +337,298 @@ class AIProvider:
         model: str,
         provider: str = "auto",
     ) -> str:
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         # One stalled provider must not hold the complete ensemble for nearly
         # a minute. Keep an env override for longer recordings, but bound it.
-        timeout = max(10.0, min(45.0, float(os.getenv("AI_ASR_TIMEOUT_SECONDS", "30"))))
-        if provider == "cloudflare" and provider_url is None:
-            account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-            cloudflare_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-            if not account_id or not cloudflare_token:
-                raise RuntimeError("Cloudflare ASR credentials are not configured")
-            url = (
-                "https://api.cloudflare.com/client/v4/accounts/"
-                f"{account_id}/ai/run/{model}"
-            )
-            # Nova-3's Workers AI endpoint accepts raw audio bytes. Whisper
-            # routes use the documented JSON array-of-byte format.
-            if model == "@cf/deepgram/nova-3":
-                request = Request(
-                    url,
-                    data=audio,
-                    headers={
-                        "Authorization": f"Bearer {cloudflare_token}",
-                        "Content-Type": "audio/wav",
-                    },
-                    method="POST",
-                )
-            else:
-                request = Request(
-                    url,
-                    data=json.dumps({"audio": list(audio)}).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {cloudflare_token}",
-                        "Content-Type": "application/json",
-                    },
-                    method="POST",
-                )
-            try:
-                with urlopen(request, timeout=timeout) as response:
-                    body = json.loads(response.read().decode("utf-8"))
-                if not isinstance(body, dict) or body.get("success") is False:
-                    raise RuntimeError("Cloudflare ASR returned an unsuccessful response")
-                result = body.get("result")
-                text = result.get("text") if isinstance(result, dict) else None
-                if not text and isinstance(result, dict):
-                    # Deepgram Nova-3 returns the standard Deepgram `results`
-                    # envelope; Whisper returns a flat `text` field.
-                    channels = result.get("results", {}).get("channels", [])
-                    if channels and isinstance(channels[0], dict):
-                        alternatives = channels[0].get("alternatives", [])
-                        if alternatives and isinstance(alternatives[0], dict):
-                            text = alternatives[0].get("transcript")
-                if not isinstance(text, str) or not text.strip():
-                    raise RuntimeError("Cloudflare ASR returned no transcript")
-                return text.strip()
-            except HTTPError as exc:
-                raise RuntimeError(f"Cloudflare ASR request failed (HTTP {exc.code})") from exc
-            except Exception as exc:
-                if isinstance(exc, RuntimeError):
-                    raise
-                raise RuntimeError(f"Cloudflare ASR request failed ({type(exc).__name__})") from exc
+        timeout = max(10.0, min(90.0, float(os.getenv("AI_ASR_TIMEOUT_SECONDS", "45"))))
 
-        # Use the official client for Hugging Face's routed endpoint. It owns
-        # the provider-specific ASR serialization and avoids fragile manual
-        # HTTP payload construction.
-        if provider_url is None or provider_url.startswith("https://router.huggingface.co/"):
-            if not token:
-                raise RuntimeError("Hugging Face token is not configured")
-            try:
-                response = InferenceClient(
-                    provider=provider,
-                    api_key=token,
-                    timeout=timeout,
-                    # The SDK receives bytes rather than a filesystem path,
-                    # so it cannot infer their type. HF rejects a missing
-                    # content type even for a valid WAV container.
-                    headers={"Content-Type": "audio/wav"},
-                ).automatic_speech_recognition(audio, model=model)
-                text = getattr(response, "text", None)
-                if not isinstance(text, str) or not text.strip():
-                    raise RuntimeError("ASR provider returned no transcript")
-                return text.strip()
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Hugging Face ASR request failed ({type(exc).__name__})"
-                ) from exc
-        # Hugging Face's Inference Providers ASR API accepts an explicit JSON
-        # `inputs` base64 payload.  The previous raw-byte request was rejected
-        # by the router with HTTP 400 even though the stored WAV itself was
-        # valid, so keep this format independent of proxy MIME sniffing.
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        payload = {"inputs": base64.b64encode(audio).decode("ascii")}
-        request = Request(
-            provider_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+        if provider != "cloudflare" or provider_url is not None:
+            raise RuntimeError("ASR is restricted to the approved Cloudflare Workers AI routes")
+        return self._transcribe_with_cloudflare(audio, model, timeout)
+
+    def _transcribe_with_cloudflare(self, audio: bytes, model: str, timeout: float) -> str:
+        account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        if not account_id or not token:
+            raise RuntimeError("Cloudflare ASR credentials are not configured")
+
+        if model == "@cf/deepgram/flux":
+            return self._transcribe_flux(audio, account_id, token, timeout)
+
+        url = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{account_id}/ai/run/{model}"
         )
+        # Keep the request formats of the three known-working models exactly
+        # as they were. Cloudflare's published Turbo example specifically uses
+        # Base64 audio, which fixes the previous byte-array request rejection.
+        headers = {"Authorization": f"Bearer {token}"}
+        if model == "@cf/deepgram/nova-3":
+            # Preserve the original, user-reported-working Nova-3 wire format.
+            headers["Content-Type"] = "audio/wav"
+            request_body = audio
+        else:
+            headers["Content-Type"] = "application/json"
+            payload = (
+                {"audio": base64.b64encode(audio).decode("ascii")}
+                if model == "@cf/openai/whisper-large-v3-turbo"
+                else {"audio": list(audio)}
+            )
+            request_body = json.dumps(payload).encode("utf-8")
+        request = Request(url, data=request_body, headers=headers, method="POST")
         try:
             with urlopen(request, timeout=timeout) as response:
-                body = json.loads(response.read().decode())
-            text = body.get("text") if isinstance(body, dict) else None
-            if not text: raise RuntimeError("ASR provider returned no transcript")
-            return str(text)
+                body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            # Keep the response body out of logs because it may contain
-            # provider diagnostics related to patient audio.
-            raise RuntimeError(f"ASR provider request failed (HTTP {exc.code})") from exc
+            raise RuntimeError(f"Cloudflare ASR request failed (HTTP {exc.code})") from exc
         except Exception as exc:
-            raise RuntimeError(
-                f"ASR provider request failed ({type(exc).__name__})"
-            ) from exc
+            raise RuntimeError(f"Cloudflare ASR request failed ({type(exc).__name__})") from exc
+        if not isinstance(body, dict) or body.get("success") is False:
+            raise RuntimeError("Cloudflare ASR returned an unsuccessful response")
+        result = body.get("result")
+        text = result.get("text") if isinstance(result, dict) else None
+        if not text and isinstance(result, dict):
+            transcript_info = result.get("transcription_info")
+            text = transcript_info.get("text") if isinstance(transcript_info, dict) else None
+        if not text and isinstance(result, dict):
+            channels = result.get("results", {}).get("channels", [])
+            if channels and isinstance(channels[0], dict):
+                alternatives = channels[0].get("alternatives", [])
+                if alternatives and isinstance(alternatives[0], dict):
+                    text = alternatives[0].get("transcript")
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError("Cloudflare ASR returned no transcript")
+        return text.strip()
+
+    @staticmethod
+    def _wav_pcm16_mono_16khz(audio: bytes) -> bytes:
+        """Extract the app's documented PCM WAV format for Deepgram streaming."""
+        try:
+            with wave.open(BytesIO(audio), "rb") as wav_file:
+                if (wav_file.getnchannels(), wav_file.getsampwidth(), wav_file.getframerate()) != (1, 2, 16000):
+                    raise RuntimeError("Flux requires mono 16-bit PCM WAV audio at 16 kHz")
+                return wav_file.readframes(wav_file.getnframes())
+        except (wave.Error, EOFError) as exc:
+            raise RuntimeError("Flux requires a valid PCM WAV recording") from exc
+
+    def _transcribe_flux(self, audio: bytes, account_id: str, token: str, timeout: float) -> str:
+        gateway = os.getenv("CLOUDFLARE_AI_GATEWAY", "default").strip() or "default"
+        try:
+            from websockets.sync.client import connect
+        except ImportError as exc:
+            raise RuntimeError("Cloudflare Flux requires the websockets runtime") from exc
+
+        pcm = self._wav_pcm16_mono_16khz(audio)
+        url = (
+            "wss://gateway.ai.cloudflare.com/v1/"
+            f"{quote(account_id, safe='')}/{quote(gateway, safe='')}/workers-ai"
+            "?model=%40cf%2Fdeepgram%2Fflux&encoding=linear16&sample_rate=16000"
+            "&eot_timeout_ms=1000&eot_threshold=0.5"
+        )
+        transcripts: list[str] = []
+        try:
+            with connect(
+                url,
+                # AI Gateway's provider-native WebSocket auth expects the raw
+                # Cloudflare API token in this header (unlike REST Bearer auth).
+                additional_headers={"cf-aig-authorization": token},
+                open_timeout=min(timeout, 15.0),
+                close_timeout=2.0,
+            ) as socket:
+                # 100 ms PCM chunks keep the live-stream framing modest while
+                # allowing buffered recordings to be replayed without storing
+                # or re-encoding additional copies of patient audio.
+                chunk_bytes = 16000 * 2 // 10
+                for offset in range(0, len(pcm), chunk_bytes):
+                    socket.send(pcm[offset:offset + chunk_bytes])
+                socket.send(json.dumps({"type": "CloseStream"}))
+                deadline = perf_counter() + timeout
+                while perf_counter() < deadline:
+                    try:
+                        raw_message = socket.recv(timeout=max(0.1, deadline - perf_counter()))
+                    except TimeoutError:
+                        break
+                    except Exception:
+                        if transcripts:
+                            break
+                        raise
+                    if isinstance(raw_message, bytes):
+                        raw_message = raw_message.decode("utf-8", errors="replace")
+                    try:
+                        message = json.loads(raw_message)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    event = str(message.get("event") or message.get("type") or "")
+                    transcript = message.get("transcript")
+                    if not transcript:
+                        transcript = (
+                            message.get("channel", {})
+                            .get("alternatives", [{}])[0]
+                            .get("transcript")
+                        )
+                    if isinstance(transcript, str) and transcript.strip() and event in {
+                        "EndOfTurn", "Results", "result"
+                    }:
+                        transcripts.append(transcript.strip())
+                    if event in {"CloseStream", "closed"}:
+                        break
+        except Exception as exc:
+            raise RuntimeError(f"Cloudflare Flux request failed ({type(exc).__name__})") from exc
+        text = " ".join(dict.fromkeys(transcripts)).strip()
+        if not text:
+            raise RuntimeError("Cloudflare Flux returned no final transcript")
+        return text
+
+    @staticmethod
+    def _exception_chain(exc: Exception) -> list[Exception]:
+        chain: list[Exception] = []
+        current: Exception | None = exc
+        while current is not None and current not in chain:
+            chain.append(current)
+            current = current.__cause__ or current.__context__
+        return chain
+
+    @classmethod
+    def _provider_status(cls, exc: Exception) -> int | None:
+        for item in cls._exception_chain(exc):
+            response = getattr(item, "response", None)
+            status = (
+                getattr(item, "status_code", None)
+                or getattr(item, "status", None)
+                or getattr(response, "status_code", None)
+                or getattr(response, "status", None)
+            )
+            if isinstance(status, int):
+                return status
+            match = re.search(r"\b([45]\d\d)\s+(?:client|server) error\b|\bhttp\s+([45]\d\d)\b", str(item), re.I)
+            if match:
+                return int(next(group for group in match.groups() if group))
+        return None
+
+    @classmethod
+    def _provider_error_code(cls, exc: Exception) -> str:
+        chain = cls._exception_chain(exc)
+        diagnostic_parts = [str(item).lower() for item in chain]
+        for item in chain:
+            response = getattr(item, "response", None)
+            response_text = getattr(response, "text", None) if response is not None else None
+            if isinstance(response_text, str):
+                diagnostic_parts.append(response_text.lower())
+        diagnostic = " ".join(diagnostic_parts)
+        status = cls._provider_status(exc)
+        if "requires cloudflare_ai_gateway" in diagnostic:
+            return "provider_configuration_missing"
+        if any(term in diagnostic for term in (
+            "gated", "agree to share", "contact information", "accept the conditions",
+        )):
+            return "model_access_denied"
+        if any(term in diagnostic for term in (
+            "model not supported", "not supported by any provider", "unsupported model",
+            "provider does not support", "unsupported task",
+        )):
+            return "model_unsupported"
+        if any(term in diagnostic for term in (
+            "invalid token", "invalid credentials", "unauthorized", "authentication failed",
+        )) or status == 401:
+            return "provider_authentication_failed"
+        if any(term in diagnostic for term in (
+            "insufficient credits", "insufficient balance", "payment required",
+            "billing is required", "billing limit", "out of credits",
+        )) or status == 402:
+            return "provider_billing_required"
+        if any(term in diagnostic for term in (
+            "rate limit", "rate_limit", "too many requests", "quota exceeded",
+        )) or status == 429:
+            return "provider_rate_limited"
+        if status in {408, 425, 504} or any(
+            "timeout" in type(item).__name__.lower() for item in chain
+        ):
+            return "provider_timeout"
+        if status in {400, 413, 415, 422}:
+            return "invalid_audio_or_model_request"
+        if status in {403}:
+            return "provider_permission_denied"
+        if status in {404}:
+            return "model_or_provider_unavailable"
+        if status and status >= 500:
+            return "provider_server_error"
+        if any(isinstance(item, ValueError) for item in chain):
+            return "provider_value_error_unresolved"
+        root = type(chain[-1]).__name__.lower() if chain else "unknown"
+        return f"provider_{re.sub(r'[^a-z0-9]+', '_', root).strip('_')}"
+
+    @classmethod
+    def _exception_origin(cls, exc: Exception) -> str:
+        """Return source location metadata only; omit exception messages/locals."""
+        root = cls._exception_chain(exc)[-1]
+        frames = traceback.extract_tb(root.__traceback__) if root.__traceback__ else []
+        if not frames:
+            return "unknown"
+        frame = frames[-1]
+        return f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
+
+    @classmethod
+    def _safe_provider_excerpt(cls, exc: Exception) -> str:
+        """Return only a known-safe provider error clue, never arbitrary response text."""
+        status = cls._provider_status(exc)
+        candidates: list[str] = []
+        for item in cls._exception_chain(exc):
+            response = getattr(item, "response", None)
+            response_text = getattr(response, "text", None) if response is not None else None
+            if isinstance(response_text, str) and response_text.strip():
+                # Prefer common structured provider error fields; discard the
+                # rest of the body because it could echo submitted content.
+                try:
+                    parsed = json.loads(response_text)
+                    if isinstance(parsed, dict):
+                        error = parsed.get("error")
+                        if isinstance(error, dict):
+                            candidates.extend(str(error.get(key, "")) for key in ("code", "type", "message"))
+                        elif isinstance(error, str):
+                            candidates.append(error)
+                        candidates.extend(str(parsed.get(key, "")) for key in ("code", "message"))
+                except (ValueError, TypeError):
+                    pass
+            message = str(item)
+            if re.search(r"model not supported|unsupported (?:model|provider|task)|gated|rate limit|invalid token", message, re.I):
+                candidates.append(message)
+        source = " ".join(part for part in candidates if part).strip()
+        safe_clues = (
+            (r"model not supported(?: by provider)?", "model not supported by selected provider"),
+            (r"unsupported (?:model|provider|task)", "unsupported model/provider/task"),
+            (r"gated", "model is gated"),
+            (r"agree to share", "model access terms not accepted"),
+            (r"invalid token", "token rejected"),
+            (r"rate.?limit|too many requests", "provider rate limit reached"),
+            (r"insufficient (?:credits|balance)|billing required|payment required", "provider billing/credits required"),
+            (r"invalid (?:audio|request|payload)", "provider rejected request format"),
+        )
+        clue = next((label for pattern, label in safe_clues if re.search(pattern, source, re.I)), "provider response detail omitted")
+        return f"{clue}; HTTP {status}" if status else clue
+
+    def _transcribe_with_retries(
+        self, audio: bytes, filename: str, provider_url: str | None,
+        model: str, provider: str,
+    ) -> tuple[str, int]:
+        maximum_retries = max(0, min(2, int(os.getenv("AI_ASR_MAX_RETRIES", "1"))))
+        for attempt in range(maximum_retries + 1):
+            try:
+                return self._transcribe_with(audio, filename, provider_url, model, provider), attempt
+            except Exception as exc:
+                status = self._provider_status(exc)
+                # A Cloudflare 429 includes exhausted free neurons; retrying
+                # cannot help before quota reset and would duplicate spend on
+                # accounts that are not on Workers Free.
+                transient = (status in {408, 425, 500, 502, 503, 504}
+                             or (status == 429 and provider != "cloudflare")) or any(
+                    "timeout" in type(item).__name__.lower()
+                    or isinstance(item, (ConnectionError, TimeoutError))
+                    for item in self._exception_chain(exc)
+                )
+                if not transient or attempt >= maximum_retries:
+                    raise ASRRetryError(attempt) from exc
+                delay = min(4.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+                sleep(delay)
+        raise RuntimeError("ASR retry loop ended unexpectedly")
 
     def _hf_chat(self, prompt: str, token: str, timeout: float = 120) -> str:
         """Call Hugging Face's OpenAI-compatible chat endpoint server-side."""
@@ -455,160 +657,95 @@ class AIProvider:
         except Exception as exc:
             raise RuntimeError("Transcript reconciler request failed") from exc
 
-    def transcribe_consensus(self, audio: bytes, filename: str = "recording.wav") -> TranscriptConsensus:
+    def transcribe_consensus(
+        self, audio: bytes, filename: str = "recording.wav", request_id: str | None = None
+    ) -> TranscriptConsensus:
         configs = self._asr_model_configs()
-
-        def provider_error_details(exc: Exception) -> tuple[str, str, str]:
-            """Return safe provider diagnostics without logging request/audio data."""
-            chain: list[Exception] = []
-            current: Exception | None = exc
-            while current is not None and current not in chain:
-                chain.append(current)
-                current = current.__cause__ or current.__context__
-            statuses: list[int] = []
-            names = []
-            details = []
-            for item in chain:
-                names.append(type(item).__name__.lower())
-                message = str(item).lower()
-                details.append(message)
-                status = getattr(item, "status_code", None) or getattr(item, "status", None) or getattr(item, "code", None)
-                response = getattr(item, "response", None)
-                status = status or getattr(response, "status_code", None) or getattr(response, "status", None)
-                if response is not None:
-                    # Use response text only for classification. Never log or
-                    # return it because provider bodies can contain request data.
-                    details.append(str(getattr(response, "text", "")).lower())
-                if isinstance(status, int):
-                    statuses.append(status)
-                # huggingface_hub sometimes wraps requests.HTTPError without
-                # preserving the response object. Recover only the numeric
-                # status from the exception text (never its body).
-                if not isinstance(status, int):
-                    match = re.search(r"\b([45]\d\d)\s+(?:client|server) error\b|\bhttp\s+([45]\d\d)\b", message)
-                    if match:
-                        statuses.append(int(next(group for group in match.groups() if group)))
-            diagnostic = " ".join(details)
-            if any(term in diagnostic for term in (
-                "gated", "agree to share", "contact information", "accept the conditions"
-            )):
-                code = "gated_model_access_required"
-            elif any(term in diagnostic for term in (
-                "model not supported by provider", "not supported by any provider",
-                "provider does not support", "unsupported provider",
-            )):
-                code = "model_provider_unsupported"
-            elif any(term in diagnostic for term in (
-                "insufficient credits", "insufficient balance", "payment required",
-                "billing is required", "billing limit", "out of credits",
-            )):
-                code = "provider_billing_required"
-            elif any(term in diagnostic for term in (
-                "invalid token", "invalid credentials", "unauthorized", "authentication failed",
-            )):
-                code = "authentication_failed"
-            elif any(term in diagnostic for term in (
-                "rate limit", "rate_limit", "too many requests", "quota exceeded",
-            )):
-                code = "provider_rate_limited"
-            else:
-                code = ""
-            status = next((code for code in statuses if code in {400, 401, 402, 403, 404, 408, 429} or code >= 500), None)
-            if not code:
-                code = {
-                    401: "authentication_failed",
-                    402: "provider_billing_required",
-                    403: "inference_provider_permission_or_billing",
-                    404: "model_provider_unavailable",
-                    408: "provider_timeout",
-                    400: "invalid_audio_or_model_request",
-                    429: "provider_rate_limited",
-                }.get(status, "provider_unavailable" if status and status >= 500 else "")
-            if not code and any("timeout" in name for name in names):
-                code = "provider_timeout"
-            if not code:
-                # Preserve the innermost exception class as a safe clue. The
-                # wrapped message/body is deliberately excluded: it may contain
-                # private request metadata and is not needed for diagnosis.
-                root_name = next(
-                    (name for name in reversed(names)
-                     if name not in {"runtimeerror", "exception", "error"}),
-                    "unknown",
-                )
-                safe_name = re.sub(r"[^a-z0-9]+", "_", root_name).strip("_")
-                code = f"provider_{safe_name}" if safe_name != "unknown" else "provider_error"
-            chain_label = ">".join(names[:5])
-            return code, chain_label, str(status) if status is not None else "none"
+        correlation_id = request_id or str(uuid4())
 
         def run_model(config: dict[str, str | float | None]) -> ASRPrediction:
+            started_clock = datetime.now(timezone.utc)
             started = perf_counter()
             model = str(config["model"])
+            provider = str(config.get("provider", "auto"))
+            retry_count = 0
             try:
-                endpoint = config.get("endpoint")
-                text = self._transcribe_with(
-                    audio,
-                    filename,
-                    str(endpoint) if endpoint else None,
-                    model,
-                    str(config.get("provider", "auto")),
-                ).strip()
-                if not text:
-                    raise RuntimeError("empty_transcript")
-                return ASRPrediction(model, float(config["weight"]), "success", text,
-                                     int((perf_counter() - started) * 1000))
-            except Exception as exc:
-                error_code, exception_chain, http_status = provider_error_details(exc)
-                logger.warning(
-                    "ASR model unavailable model=%s provider=%s error_code=%s exception_chain=%s http_status=%s latency_ms=%d",
-                    model,
-                    config.get("provider", "auto"),
-                    error_code,
-                    exception_chain,
-                    http_status,
-                    int((perf_counter() - started) * 1000),
+                text, retry_count = self._transcribe_with_retries(
+                    audio, filename,
+                    str(config["endpoint"]) if config.get("endpoint") else None,
+                    model, provider,
                 )
-                return ASRPrediction(model, float(config["weight"]), "unavailable", "",
-                                     int((perf_counter() - started) * 1000),
-                                     "empty_transcript" if str(exc) == "empty_transcript" else error_code)
+                text = text.strip()
+                if not text:
+                    raise RuntimeError("ASR provider returned no usable transcript")
+                elapsed = round((perf_counter() - started) * 1000)
+                completed = datetime.now(timezone.utc)
+                logger.info(
+                    "ASR model complete request_id=%s model=%s provider=%s status=SUCCESS latency_ms=%d retries=%d",
+                    correlation_id, model, provider, elapsed, retry_count,
+                )
+                return ASRPrediction(
+                    model, float(config["weight"]), "SUCCESS", text, elapsed,
+                    started_at=started_clock.isoformat(), completed_at=completed.isoformat(),
+                    retry_count=retry_count,
+                )
+            except Exception as exc:
+                retry_count = getattr(exc, "retry_count", retry_count)
+                elapsed = round((perf_counter() - started) * 1000)
+                completed = datetime.now(timezone.utc)
+                code = self._provider_error_code(exc)
+                status = self._provider_status(exc)
+                state = "TIMEOUT" if code == "provider_timeout" else (
+                    "ACCESS_DENIED" if code in {"model_access_denied", "provider_authentication_failed", "provider_permission_denied"}
+                    else "UNSUPPORTED" if code == "model_unsupported"
+                    else "FAILED"
+                )
+                diagnostic = self._safe_provider_excerpt(exc)
+                origin = self._exception_origin(exc)
+                logger.warning(
+                    "ASR model failed request_id=%s model=%s provider=%s status=%s error_code=%s http_status=%s latency_ms=%d retries=%d origin=%s diagnostic=%s",
+                    correlation_id, model, provider, state, code, status, elapsed,
+                    retry_count, origin, diagnostic,
+                )
+                return ASRPrediction(
+                    model, float(config["weight"]), state, "", elapsed, code,
+                    started_clock.isoformat(), completed.isoformat(), retry_count, diagnostic,
+                )
 
-        # Submit every configured recognizer before waiting, so wall time is
-        # bounded by the slowest provider rather than the sum of all providers.
-        with ThreadPoolExecutor(max_workers=len(configs)) as pool:
-            predictions = list(pool.map(run_model, configs))
-        successful = [item for item in predictions if item.status == "success"]
+        # Bound in-flight calls while still starting all four/five models in parallel.
+        predictions = list(_ASR_EXECUTOR.map(run_model, configs))
+        successful = [item for item in predictions if item.status == "SUCCESS"]
         if not successful:
-            failures = ", ".join(
-                f"{item.model}:{item.error_code or 'unknown'}" for item in predictions
-            )
-            raise RuntimeError(f"All configured ASR models were unavailable ({failures})")
+            raise ASRAllModelsFailed(predictions, correlation_id)
 
         conflicts = [
-            f"{item.model} did not return a transcript ({item.error_code})."
-            for item in predictions if item.status != "success"
+            f"{item.model} did not return a transcript ({item.error_code or item.status})."
+            for item in predictions if item.status != "SUCCESS"
         ]
         if len(successful) == 1:
             final_text = successful[0].text
-            status = "single_provider"
+            reconciliation_status = "single_provider"
         elif len({self._normalized_transcript(item.text) for item in successful}) == 1:
             final_text = max(successful, key=lambda item: item.weight).text
-            status = "identical"
+            reconciliation_status = "identical"
         else:
             try:
                 final_text, reconciliation_conflicts = self.reconcile_ensemble(successful)
                 conflicts.extend(reconciliation_conflicts)
-                status = "reconciled"
+                reconciliation_status = "reconciled"
             except RuntimeError:
                 final_text = self._weighted_medoid(successful)
-                conflicts.append("Automated reconciliation was unavailable; weighted model agreement selected a draft for clinician review.")
-                status = "fallback_selected"
+                conflicts.append(
+                    "Automated reconciliation was unavailable; model differences require clinician review."
+                )
+                reconciliation_status = "fallback_selected"
 
         return TranscriptConsensus(
-            primary=predictions[0].text if predictions[0].status == "success" else "",
-            secondary=(predictions[1].text if len(predictions) > 1 and predictions[1].status == "success" else ""),
-            final_text=final_text,
-            conflicts=conflicts,
-            reconciliation_status=status,
-            predictions=predictions,
+            primary=predictions[0].text if predictions[0].status == "SUCCESS" else "",
+            secondary=(predictions[1].text if len(predictions) > 1 and predictions[1].status == "SUCCESS" else ""),
+            final_text=final_text, conflicts=conflicts,
+            reconciliation_status=reconciliation_status, predictions=predictions,
+            execution_status="all_success" if len(successful) == len(predictions) else "partial_success",
         )
 
     def reconcile_ensemble(self, predictions: list[ASRPrediction]) -> tuple[str, list[str]]:
@@ -680,6 +817,7 @@ class AIProvider:
             "primary_transcript": consensus.primary,
             "secondary_transcript": consensus.secondary,
             "reconciliation_status": consensus.reconciliation_status,
+            "execution_status": consensus.execution_status,
             "conflicts": consensus.conflicts,
             "predictions": [
                 {
@@ -689,6 +827,30 @@ class AIProvider:
                     "text": item.text,
                     "latency_ms": item.latency_ms,
                     "error_code": item.error_code,
+                    "started_at": item.started_at,
+                    "completed_at": item.completed_at,
+                    "retry_count": item.retry_count,
+                }
+                for item in predictions
+            ],
+        }
+
+    @staticmethod
+    def failed_consensus_payload(predictions: list[ASRPrediction]) -> dict:
+        """Safe operational summary for an all-model failure; no transcript/body data."""
+        return {
+            "execution_status": "all_failed",
+            "predictions": [
+                {
+                    "model": item.model,
+                    "weight": item.weight,
+                    "status": item.status,
+                    "text": "",
+                    "latency_ms": item.latency_ms,
+                    "error_code": item.error_code,
+                    "started_at": item.started_at,
+                    "completed_at": item.completed_at,
+                    "retry_count": item.retry_count,
                 }
                 for item in predictions
             ],

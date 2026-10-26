@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 import httpx
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -1220,7 +1220,7 @@ def my_voice_records(patient: dict = Depends(get_current_patient)):
 
 
 @router.post("/consultations/{consultation_id}/voice", status_code=status.HTTP_201_CREATED)
-async def upload_consultation_voice(consultation_id: str, audio: UploadFile = File(...), doctor: dict = Depends(get_current_doctor)):
+async def upload_consultation_voice(consultation_id: str, request: Request, audio: UploadFile = File(...), doctor: dict = Depends(get_current_doctor)):
     client = db()
     consultation = _owned_consultation(client, consultation_id, doctor["id"])
     content = await audio.read()
@@ -1247,16 +1247,28 @@ async def upload_consultation_voice(consultation_id: str, audio: UploadFile = Fi
         raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
     try:
         consensus = await run_in_threadpool(
-            ai_provider.transcribe_consensus, content, audio.filename or "recording.bin"
+            ai_provider.transcribe_consensus, content, audio.filename or "recording.bin", request.state.request_id
         )
+    except Exception as exc:
+        from ..services.ai_service import ASRAllModelsFailed
+        if isinstance(exc, ASRAllModelsFailed):
+            logger.error("Consultation ASR failed request_id=%s models=%s", request.state.request_id,
+                         [(item.model, item.status, item.error_code) for item in exc.predictions])
+            return {"data": {"recording": recording, "transcript": None,
+                             "status": "transcription_unavailable", "request_id": request.state.request_id,
+                             "asr": ai_provider.failed_consensus_payload(exc.predictions)}}
+        logger.exception("Consultation ASR setup failed request_id=%s", request.state.request_id)
+        raise HTTPException(status_code=503, detail={"message": "Transcription could not start. The recording was saved securely.", "request_id": request.state.request_id}) from exc
+    try:
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
-        return {"data": {"recording": recording, "transcript": transcript, "asr": ai_provider.consensus_payload(consensus), "status": "transcribed"}}
-    except Exception:
-        return {"data": {"recording": recording, "transcript": None, "status": "transcription_unavailable"}}
+    except Exception as exc:
+        logger.exception("Consultation transcript persistence failed request_id=%s", request.state.request_id)
+        raise HTTPException(status_code=502, detail={"message": "Transcript could not be saved; the secure recording remains available.", "request_id": request.state.request_id}) from exc
+    return {"data": {"recording": recording, "transcript": transcript, "asr": ai_provider.consensus_payload(consensus), "status": "transcribed", "request_id": request.state.request_id}}
 
 
 @router.post("/appointments/{appointment_id}/voice", status_code=status.HTTP_201_CREATED)
-async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = File(...), patient: dict = Depends(get_current_patient)):
+async def upload_patient_voice_draft(appointment_id: str, request: Request, audio: UploadFile = File(...), patient: dict = Depends(get_current_patient)):
     """Create an appointment-scoped transcript draft; it never creates clinical records."""
     client = db()
     appointment = client.table("appointments").select("id,patient_id,doctor_id,status").eq("id", appointment_id).maybe_single().execute().data
@@ -1290,35 +1302,46 @@ async def upload_patient_voice_draft(appointment_id: str, audio: UploadFile = Fi
         raise HTTPException(status_code=502, detail="Unable to persist voice recording metadata") from exc
     try:
         consensus = await run_in_threadpool(
-            ai_provider.transcribe_consensus, content, audio.filename or "recording.bin"
+            ai_provider.transcribe_consensus, content, audio.filename or "recording.bin", request.state.request_id
         )
         transcript = client.table("voice_transcripts").insert({"voice_recording_id": str(recording_id), "transcript_text": consensus.final_text}).execute().data[0]
     except RuntimeError as exc:
-        # Do not log a traceback from a third-party SDK here: exception chains
-        # can include provider response bodies. transcribe_consensus emits
-        # per-model status codes without audio or transcript data.
-        logger.error("Patient voice transcription provider failed: %s", exc)
-        reason = str(exc)
-        if "inference_provider_permission_or_billing" in reason:
+        from ..services.ai_service import ASRAllModelsFailed
+        if isinstance(exc, ASRAllModelsFailed):
+            logger.error("Patient ASR failed request_id=%s models=%s", request.state.request_id,
+                         [(item.model, item.status, item.error_code) for item in exc.predictions])
+            raise HTTPException(status_code=503, detail={
+                "message": "Voice transcription is unavailable. Your recording was saved securely; retry later.",
+                "request_id": request.state.request_id,
+                "asr": ai_provider.failed_consensus_payload(exc.predictions),
+            }) from exc
+        logger.error("Patient voice transcription setup failed request_id=%s error_code=%s",
+                     request.state.request_id, ai_provider._provider_error_code(exc))
+        reason = ai_provider._provider_error_code(exc)
+        if reason == "provider_permission_denied":
             detail = (
-                "Hugging Face rejected ASR access. The HF token in Render needs "
-                "Inference Providers permission, and provider billing/credits must be enabled. "
-                "Your recording was saved securely; retry after updating the token."
+                "Cloudflare denied Workers AI access. Check the server-side Cloudflare token permissions. "
+                "Your recording was saved securely; retry after correcting the token."
             )
-        elif "authentication_failed" in reason:
+        elif reason == "provider_authentication_failed":
             detail = (
-                "The Hugging Face token configured in Render was rejected. "
-                "Your recording was saved securely; replace the token and retry."
+                "The Cloudflare token configured on the backend was rejected. "
+                "Your recording was saved securely; check the token and retry."
             )
-        elif "provider_billing_required" in reason:
+        elif reason == "provider_billing_required":
             detail = (
-                "Hugging Face Inference Providers require billing or available credits. "
-                "Your recording was saved securely; retry after resolving billing."
+                "Cloudflare reported an account plan or billing restriction. No paid ASR fallback was used. "
+                "Your recording was saved securely; check that Workers AI is available on your plan."
+            )
+        elif reason == "provider_rate_limited":
+            detail = (
+                "Cloudflare Workers AI is rate-limited or its daily free allocation is exhausted. "
+                "No paid fallback was used; your recording was saved securely. Try again after the quota resets."
             )
         else:
             detail = (
                 "Voice transcription is temporarily unavailable. Your recording was saved securely; "
-                "please retry shortly."
+                f"please retry shortly. Request ID: {request.state.request_id}."
             )
         raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as exc:
