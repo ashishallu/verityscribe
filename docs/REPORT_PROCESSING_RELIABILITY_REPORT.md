@@ -219,3 +219,16 @@ The migration source recreates the observed session/message table definitions an
 2. Reconcile repository migration history with the live project before applying the additive migration; then verify `session_id` and RLS policies read-only.
 3. Obtain an authorized, synthetic mixed printed/handwritten test set with ground truth in the required languages. Evaluate candidate handwriting models against it, including endpoint accessibility, actual access/payment settings, latency and memory. Until then, do not claim prescription handwriting accuracy.
 4. After the owner separately authorizes release, apply the migration, deploy, and perform authenticated synthetic upload, follow-up Q&A, detach/new-session, backend-restart, and cross-patient/cross-session tests. This local code change is not yet live.
+
+## Deployment addendum (2026-10-26)
+
+The owner subsequently authorized deployment. This addendum supersedes the pre-deployment status above:
+
+- Applied `202610260001_chat_session_document_context.sql` to Supabase project `lsfhluvsrucwmbjvqwsr` before the application push.
+- Read-only post-migration verification confirmed `medical_documents.session_id` is nullable UUID, the FK `medical_documents_session_id_fkey` uses `ON DELETE SET NULL`, RLS remains enabled on `ai_chat_sessions`, `ai_chat_messages`, and `medical_documents`, and the existing patient-owner policies remain in effect. No records were changed by the migration.
+- Commit `261849c63ac93768c08407d5dc5e64f68363537b` (`Scope report chat documents to sessions`) was pushed to `master`; only the six scoped session-chat, migration, UI/provider, test, and report files were committed. Other pre-existing working-tree edits were left untouched.
+- Both Render services deployed that exact commit successfully: `verityscribe-1` deploy `dep-dbfnrl0u01pc73cas1tg`; `verityscribe` deploy `dep-dbfnrkou01pc73cas1rg`. Both `/health` endpoints returned HTTP 200 and release `261849c63ac9`.
+- Verification: backend suite **45 tests passed**; `python -m compileall -q app tests` passed; `git diff --check` passed. A fresh targeted Flutter analyzer invocation did not produce output and was interrupted after a 30-second stall, so this deployment does not claim a fresh Flutter-analysis pass (the earlier pre-deployment report records a prior pass).
+- Still not end-to-end verified: no authenticated synthetic report was uploaded through the deployed app/API, queried in a chat, detached, or retrieved after restart. No real OCR inference was exercised. Handwriting recognition remains unchanged and not improved; do not treat deployment of session isolation as resolution of OCR accuracy.
+
+**Next action:** sign in through the app and test the synthetic document workflow, then share its timestamp/request ID for sanitized server-log and read-only persistence verification. Do not use real patient records for this test.
