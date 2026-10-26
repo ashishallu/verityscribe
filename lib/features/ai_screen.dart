@@ -132,6 +132,11 @@ class _AiScreenState extends ConsumerState<AiScreen> {
         constraints: const BoxConstraints(maxWidth: 1100),
         child: Column(children: [
           const _ChatHeader(),
+          if (clinic.sessionDocuments.isNotEmpty)
+            _AttachedDocuments(
+              documents: clinic.sessionDocuments,
+              onRemove: (id) => ref.read(clinicProvider.notifier).removeSessionDocument(id),
+            ),
           if (clinic.chatError != null) _ErrorBanner(onDismiss: () => ref.read(clinicProvider.notifier).clearChatError()),
           Expanded(child: clinic.messages.isEmpty ? const _EmptyChat() : ListView.builder(
             controller: _scroll,
@@ -145,6 +150,35 @@ class _AiScreenState extends ConsumerState<AiScreen> {
       ))),
     );
   }
+}
+
+class _AttachedDocuments extends StatelessWidget {
+  final List<ChatSessionDocument> documents;
+  final ValueChanged<String> onRemove;
+  const _AttachedDocuments({required this.documents, required this.onRemove});
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 2,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(right: 2),
+              child: Text('Available in this chat:', style: TextStyle(fontSize: 12, color: AppTheme.muted)),
+            ),
+            ...documents.map((document) => InputChip(
+                  avatar: const Icon(Icons.lock_outline_rounded, size: 15),
+                  label: Text(document.name, overflow: TextOverflow.ellipsis),
+                  onDeleted: () => onRemove(document.id),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                )),
+          ],
+        ),
+      );
 }
 
 class _ChatHeader extends ConsumerWidget {

@@ -26,11 +26,19 @@ class ChatMessage {
       this.action});
 }
 
+class ChatSessionDocument {
+  final String id;
+  final String name;
+  const ChatSessionDocument({required this.id, required this.name});
+}
+
 class ClinicState {
   final DateTime selectedDate;
   final List<Medicine> medicines;
   final List<Consultation> consultations;
   final List<ChatMessage> messages;
+  final String? chatSessionId;
+  final List<ChatSessionDocument> sessionDocuments;
   final bool chatLoading;
   final Object? chatError;
   const ClinicState(
@@ -38,6 +46,8 @@ class ClinicState {
       required this.medicines,
       required this.consultations,
       required this.messages,
+      this.chatSessionId,
+      this.sessionDocuments = const [],
       this.chatLoading = false,
       this.chatError});
   ClinicState copyWith(
@@ -45,6 +55,9 @@ class ClinicState {
           List<Medicine>? medicines,
           List<Consultation>? consultations,
           List<ChatMessage>? messages,
+          String? chatSessionId,
+          bool clearChatSession = false,
+          List<ChatSessionDocument>? sessionDocuments,
           bool? chatLoading,
           Object? chatError,
           bool clearChatError = false}) =>
@@ -53,6 +66,8 @@ class ClinicState {
           medicines: medicines ?? this.medicines,
           consultations: consultations ?? this.consultations,
           messages: messages ?? this.messages,
+          chatSessionId: clearChatSession ? null : (chatSessionId ?? this.chatSessionId),
+          sessionDocuments: sessionDocuments ?? this.sessionDocuments,
           chatLoading: chatLoading ?? this.chatLoading,
           chatError: clearChatError ? null : (chatError ?? this.chatError));
 }
@@ -73,6 +88,21 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
   // stores the private object before inference and resumes it by this ID.
   String? _pendingReportUploadId;
   String? _pendingReportFingerprint;
+
+  Future<String> _ensureChatSession() async {
+    final existing = state.chatSessionId;
+    if (existing != null) return existing;
+    final response = await _api.post<dynamic>('/chat/sessions', const {});
+    final body = Map<String, dynamic>.from(response.data as Map);
+    final data = Map<String, dynamic>.from((body['data'] as Map?) ?? body);
+    final id = data['session_id']?.toString();
+    if (id == null || id.isEmpty) {
+      throw const ApiException('Could not start a secure chat session. Please retry.');
+    }
+    state = state.copyWith(chatSessionId: id);
+    return id;
+  }
+
   Future<void> load() async {
     try {
       final results =
@@ -113,8 +143,10 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     state = state.copyWith(
         messages: updated, chatLoading: true, clearChatError: true);
     try {
+      final sessionId = await _ensureChatSession();
       final response = await _api.post<dynamic>('/chat', {
         'message': text,
+        'session_id': sessionId,
         'history': updated
             .map((m) =>
                 {'text': m.text, 'role': m.isUser ? 'user' : 'assistant'})
@@ -164,6 +196,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       // Avoid `1 << 32` here: the Dart-to-JavaScript web compiler can lower
       // that bit shift to zero, causing Random.nextInt(0) to throw RangeError.
       final fingerprint = '$reportType:$filename:${bytes.length}';
+      final sessionId = await _ensureChatSession();
       final uploadId = _pendingReportFingerprint == fingerprint &&
               _pendingReportUploadId != null
           ? _pendingReportUploadId!
@@ -177,6 +210,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           ..headers['Authorization'] = 'Bearer $token'
           ..headers['X-Upload-Id'] = uploadId
           ..fields['report_type'] = reportType
+          ..fields['session_id'] = sessionId
           ..files.add(http.MultipartFile.fromBytes('document', bytes,
               filename: filename, contentType: _reportMimeType(filename)));
         return request.send().timeout(const Duration(seconds: 120));
@@ -199,6 +233,14 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
       final confirmation = (data['message'] ??
               'Your report was saved privately.')
           .toString();
+      final document = data['document'] is Map
+          ? Map<String, dynamic>.from(data['document'] as Map)
+          : <String, dynamic>{};
+      final documentId = document['id']?.toString();
+      final sessionDocuments = [...state.sessionDocuments];
+      if (documentId != null && !sessionDocuments.any((item) => item.id == documentId)) {
+        sessionDocuments.add(ChatSessionDocument(id: documentId, name: filename));
+      }
       state = state.copyWith(messages: [
         ...existingMessages,
         ChatMessage(
@@ -208,7 +250,7 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           attachment: reportType,
         ),
         ChatMessage(text: confirmation, isUser: false, sentAt: DateTime.now()),
-      ], chatLoading: false);
+      ], sessionDocuments: sessionDocuments, chatLoading: false);
       _pendingReportUploadId = null;
       _pendingReportFingerprint = null;
     } on TimeoutException {
@@ -270,7 +312,27 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
     }
   }
 
-  void clearChat() => state = state.copyWith(messages: [], clearChatError: true);
+  Future<void> removeSessionDocument(String documentId) async {
+    final sessionId = state.chatSessionId;
+    if (sessionId == null) return;
+    try {
+      await _api.post<dynamic>(
+          '/chat/sessions/$sessionId/documents/$documentId/remove', const {});
+      state = state.copyWith(sessionDocuments: state.sessionDocuments
+          .where((document) => document.id != documentId).toList());
+    } catch (error) {
+      state = state.copyWith(chatError: error);
+    }
+  }
+
+  void clearChat() {
+    final sessionId = state.chatSessionId;
+    state = state.copyWith(messages: [], chatSessionId: null,
+        clearChatSession: true, sessionDocuments: const [], clearChatError: true);
+    if (sessionId != null) {
+      unawaited(_api.post<dynamic>('/chat/sessions/$sessionId/end', const {}).catchError((_) => const ApiResponse<dynamic>({})));
+    }
+  }
   void clearChatError() => state = state.copyWith(clearChatError: true);
 }
 
