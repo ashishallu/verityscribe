@@ -344,6 +344,8 @@ The exact structured-result lookup was also gated behind personal-question class
 - Added focused tests for summary parsing/source quote filtering, missing configuration, exact platelet lookup, and “in my report” follow-up behavior.
 - Focused tests: `test_document_summary.py` (3 passed), `test_chat_session_documents.py` (15 passed), `test_document_tables.py` (5 passed). Python compilation and `git diff --check` passed.
 - Local PDF parser check: the supplied sample's platelet row is found. This is a local parser check, not a deployed upload test.
-- Production post-fix smoke: not yet run. No authenticated patient session/token is available to perform a real upload and chat request. Deployment and health status alone do not prove end-to-end behavior.
+- Deployment: commit `dbcf42769f4bb81d15f7fed4800869f6ac55038a` is live on both Render services (`verityscribe-1` deploy `dep-dbg2ecrrjlhs73cna0hg`; `verityscribe` deploy `dep-dbg2ecrrjlhs73cna0ng`). Read-only `GET /health` requests returned 200 from both, with release `dbcf42769f4b`.
+- Database migration: `202610270001_add_structured_medical_results.sql` was confirmed applied to the configured Supabase project in the previous release; this chatbot follow-up did not change the schema.
+- Production post-fix synthetic upload/chat smoke: not run. No authenticated synthetic patient session/token is available to perform the protected upload and query. The health response and mocked tests do not prove end-to-end behavior.
 
-Deployment status and post-deploy smoke outcome are recorded below after release verification.
+The user can now retry the synthetic report in the application. The reported production smoke remains unverified until an authenticated document upload and exact-result query can be exercised.
