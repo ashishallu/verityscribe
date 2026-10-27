@@ -326,3 +326,24 @@ The HAR root page and generic Dart initiator do not reveal which local source ch
 - No production synthetic upload/chat request has been performed: a valid synthetic patient JWT and owned chat session are required to preserve the existing authorization boundary, and neither is available through the connected tools. An unauthenticated request would stop at authentication and would not test OCR, persistence, or retrieval. Scanned-image OCR also remains unverified on a real runtime.
 
 **Remaining limitations:** geometric grouping is heuristic and currently supports recognizable header rows and single visual-line result rows. It flags ambiguity rather than reconstructing complex merged cells or a table continuation with no repeated header. Handwritten or low-quality scanned values remain limited by the existing Tesseract recognition quality; the geometry feature does not establish clinical accuracy or a 90% accuracy claim. The production authenticated smoke test remains unverified for lack of a synthetic patient JWT/session; the deployed commit and additive database migration are live.
+
+# Deployed chatbot/table follow-up investigation — 2026-10-27
+
+## Screenshot regression
+
+The supplied synthetic `malaria_blood_report_sample.pdf` contains a platelet row. Local extraction found the row as `Platelet count | 72,000 /�L | 150,000 - 410,000 | Low`; the embedded PDF text has a replacement character in the unit, so this report preserves that source text rather than guessing a normalized unit.
+
+Render logs for the affected upload show `POST /api/v1/chat/reports` returned 201, followed by `Document summary unavailable` with `AttributeError` (request ID `hnlavz83pcttwncg`). The deployed integration invoked `AIProvider.summarize_medical_document(...).to_dict()`, but the deployed AI service did not implement that method. This explains the summary fallback despite successful text extraction and upload.
+
+The exact structured-result lookup was also gated behind personal-question classification. A question such as “what is the platelet count” was classified as general, so it bypassed the report table lookup. A subsequent “in my report” follow-up did not resolve the prior exact lab question. The focused patch restores the source-grounded document summary provider method and runs exact table lookup for current-chat documents regardless of possessive phrasing; short report follow-ups can reuse only a prior exact lab question from the same session.
+
+## Fix and verification
+
+- Added validated structured document-summary support using the existing configured Cloudflare chat provider; no OCR provider, ASR model, auth policy, RLS, or API response contract was changed.
+- Added exact result and same-session follow-up routing, preserving patient ownership and active-chat document scoping.
+- Added focused tests for summary parsing/source quote filtering, missing configuration, exact platelet lookup, and “in my report” follow-up behavior.
+- Focused tests: `test_document_summary.py` (3 passed), `test_chat_session_documents.py` (15 passed), `test_document_tables.py` (5 passed). Python compilation and `git diff --check` passed.
+- Local PDF parser check: the supplied sample's platelet row is found. This is a local parser check, not a deployed upload test.
+- Production post-fix smoke: not yet run. No authenticated patient session/token is available to perform a real upload and chat request. Deployment and health status alone do not prove end-to-end behavior.
+
+Deployment status and post-deploy smoke outcome are recorded below after release verification.

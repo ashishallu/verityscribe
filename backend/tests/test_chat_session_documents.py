@@ -57,6 +57,11 @@ class _Query:
         self.owner.queries.append(self)
         if self.table == "ai_chat_sessions":
             rows = self.owner.sessions
+        elif self.table == "ai_chat_messages":
+            rows = [row for row in self.owner.messages
+                    if row.get("session_id") == self.filters.get("session_id")]
+            if self.descending:
+                rows = list(reversed(rows))
         elif self.table == "medical_documents":
             rows = [row for row in self.owner.documents
                     if all(row.get(key) == value for key, value in self.filters.items())]
@@ -189,6 +194,39 @@ class SessionScopedDocumentTests(unittest.TestCase):
         self.assertIn("page 2", answer)
         self.assertTrue(result["data"]["uses_personal_health_data"])
         self.assertTrue(_is_personal_health_question("What is the patient's platelet count?"))
+
+    def test_bare_lab_lookup_uses_attached_report_even_without_personal_pronoun(self):
+        client = _Client()
+        with patch("app.routers.integration.db", return_value=client), \
+             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
+             patch("app.routers.integration.ai_provider.answer", side_effect=AssertionError("must not call model")):
+            result = secure_chat(
+                ChatRequest(message="What is the platelet count?", session_id=SESSION_A),
+                {"sub": "patient-a", "app_metadata": {"role": "patient"}},
+            )
+
+        answer = result["data"]["answer"]
+        self.assertIn("Platelet Count: 72,000 /uL", answer)
+        self.assertIn("150,000-450,000", answer)
+        self.assertTrue(result["data"]["uses_personal_health_data"])
+
+    def test_report_followup_resolves_previous_exact_lab_question(self):
+        client = _Client()
+        client.messages.extend([
+            {"session_id": SESSION_A, "sender_type": "user", "message_text": "What is the platelet count?"},
+            {"session_id": SESSION_A, "sender_type": "assistant", "message_text": "A platelet count measures platelets."},
+        ])
+        with patch("app.routers.integration.db", return_value=client), \
+             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
+             patch("app.routers.integration.ai_provider.answer", side_effect=AssertionError("must not call model")):
+            result = secure_chat(
+                ChatRequest(message="in my report", session_id=SESSION_A),
+                {"sub": "patient-a", "app_metadata": {"role": "patient"}},
+            )
+
+        answer = result["data"]["answer"]
+        self.assertIn("Platelet Count: 72,000 /uL", answer)
+        self.assertIn("150,000-450,000", answer)
 
     def test_reference_range_question_does_not_return_measured_value_as_range(self):
         docs = [{"id": "doc-a", "structured_results": [

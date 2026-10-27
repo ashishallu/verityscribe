@@ -534,6 +534,29 @@ def _structured_result_answer(question: str, documents: list[dict[str, Any]]) ->
     return answer
 
 
+def _structured_result_followup_question(
+    question: str, history: list[dict[str, str]], documents: list[dict[str, Any]],
+) -> str:
+    """Resolve short report follow-ups to the prior exact lab question in this session."""
+    if _structured_result_matches(question, documents) or not _references_attached_document(question):
+        return question
+
+    # The current user message is persisted before history is loaded. Exclude
+    # that last turn so only an earlier question can supply the test name.
+    prior_turns = history[:-1] if (
+        history
+        and history[-1].get("role") == "user"
+        and history[-1].get("content", "").strip() == question.strip()
+    ) else history
+    for turn in reversed(prior_turns):
+        previous_question = turn.get("content", "").strip()
+        if turn.get("role") != "user" or not _structured_result_matches(previous_question, documents):
+            continue
+        if _structured_result_answer(previous_question, documents):
+            return previous_question
+    return question
+
+
 def _document_evidence(question: str, documents: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Select bounded source lines; never rewrite, normalize, or infer OCR text."""
     terms = set(re.findall(r"[a-z0-9]+", question.lower())) - {
@@ -933,6 +956,13 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
         and not allergy_screening
         and not _explicit_wider_record_question(payload.message)
     )
+    if session_documents and not allergy_screening and not _explicit_wider_record_question(payload.message):
+        result_question = _structured_result_followup_question(
+            payload.message, history, session_documents,
+        )
+        exact_result = _structured_result_answer(result_question, session_documents)
+        if exact_result:
+            return response(exact_result, personal_data=True)
     if (personal or allergy_screening) and not use_session_documents:
         client = client or db()
         patient = patient or get_current_patient(claims)
@@ -951,9 +981,6 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
         # Session-uploaded evidence is preferred and explicitly labelled as
         # machine-extracted. It is never converted into an authoritative Rx.
         if use_session_documents:
-            exact_result = _structured_result_answer(payload.message, session_documents)
-            if exact_result:
-                return response(exact_result, personal_data=True)
             evidence = _document_evidence(payload.message, session_documents)
             if not evidence:
                 return response("I couldn't find readable text relevant to that question in a document attached to this conversation. Please verify it with your clinician or pharmacist.", personal_data=True)
