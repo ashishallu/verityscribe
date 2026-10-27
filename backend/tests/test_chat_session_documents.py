@@ -8,6 +8,8 @@ from app.routers.integration import (
     ChatRequest,
     ChatSessionCreate,
     _document_evidence,
+    _structured_result_answer,
+    _is_personal_health_question,
     _owned_chat_session,
     _session_documents,
     create_chat_session,
@@ -82,9 +84,19 @@ class _Client:
             {"id": "doc-c", "patient_id": "patient-b", "session_id": SESSION_A, "document_type": "prescription"},
         ]
         self.texts = [
-            {"source_document_id": "doc-a", "patient_id": "patient-a", "content": "[Page 1]\nRx: Drug A 10 mg, take once daily.\nDuration: unclear."},
-            {"source_document_id": "doc-b", "patient_id": "patient-a", "content": "secret from another session"},
-            {"source_document_id": "doc-c", "patient_id": "patient-b", "content": "another patient's private text"},
+            {"source_document_id": "doc-a", "patient_id": "patient-a", "content": "[Page 1]\nRx: Drug A 10 mg, take once daily.\nDuration: unclear.",
+             "structured_results": [
+                 {"test_name": "Platelet Count", "result_value": "72,000", "result_text": "72,000",
+                  "unit": "/uL", "reference_range": "150,000-450,000", "result_status": None,
+                  "specimen": "Blood", "collection_date": "2026-10-01", "report_date": None,
+                  "page_number": 2, "table_index": 1, "row_index": 3,
+                  "source_text": "Platelet Count | 72,000 | /uL | 150,000-450,000",
+                  "extraction_confidence": 0.98, "ambiguous": False},
+             ]},
+            {"source_document_id": "doc-b", "patient_id": "patient-a", "content": "secret from another session",
+             "structured_results": [{"test_name": "Platelet Count", "result_value": "999,999", "unit": "/uL"}]},
+            {"source_document_id": "doc-c", "patient_id": "patient-b", "content": "another patient's private text",
+             "structured_results": [{"test_name": "Platelet Count", "result_value": "888,888", "unit": "/uL"}]},
         ]
         self.messages = []
 
@@ -160,6 +172,57 @@ class SessionScopedDocumentTests(unittest.TestCase):
         self.assertIn("Drug A 10 mg", evidence[0]["source_text"])
         self.assertLessEqual(len(evidence[0]["source_text"]), 1800)
 
+    def test_exact_table_result_question_is_answered_without_model_and_has_source(self):
+        client = _Client()
+        with patch("app.routers.integration.db", return_value=client), \
+             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
+             patch("app.routers.integration.ai_provider.answer", side_effect=AssertionError("must not call model")):
+            result = secure_chat(
+                ChatRequest(message="What is the patient's platelet count?", session_id=SESSION_A),
+                {"sub": "patient-a", "app_metadata": {"role": "patient"}},
+            )
+        answer = result["data"]["answer"]
+        self.assertIn("Platelet Count: 72,000 /uL", answer)
+        self.assertNotIn("999,999", answer)
+        self.assertNotIn("888,888", answer)
+        self.assertIn("150,000-450,000", answer)
+        self.assertIn("page 2", answer)
+        self.assertTrue(result["data"]["uses_personal_health_data"])
+        self.assertTrue(_is_personal_health_question("What is the patient's platelet count?"))
+
+    def test_reference_range_question_does_not_return_measured_value_as_range(self):
+        docs = [{"id": "doc-a", "structured_results": [
+            {"test_name": "Platelet Count", "result_value": "72,000", "unit": "/uL",
+             "reference_range": "150,000-450,000", "page_number": 2,
+             "extraction_confidence": .98, "ambiguous": False},
+        ]}]
+        answer = _structured_result_answer("What is the reference range for my platelet count?", docs)
+        self.assertIn("Platelet Count: 150,000-450,000 /uL", answer)
+        self.assertNotIn("Platelet Count: 72,000", answer)
+
+    def test_broader_document_question_receives_result_and_range_as_one_row(self):
+        evidence = _document_evidence("Why is my platelet count low?", [{
+            "id": "doc-a", "document_type": "blood_report", "extracted_text": "[Page 2]\nPlatelet Count\n72,000",
+            "structured_results": [{"test_name": "Platelet Count", "result_value": "72,000",
+                                    "unit": "/uL", "reference_range": "150,000-450,000",
+                                    "page_number": 2, "source_text": "Platelet Count | 72,000 | /uL | 150,000-450,000"}],
+        }])
+        excerpt = evidence[0]["source_text"]
+        self.assertIn("Test: Platelet Count | Result: 72,000 | Unit: /uL | Reference range: 150,000-450,000", excerpt)
+
+    def test_absent_or_ambiguous_test_fails_closed(self):
+        absent = _structured_result_answer("What is my platelet count?", [{"id": "doc-a", "structured_results": []}])
+        self.assertIn("could not find a platelet result", absent)
+        ambiguous = _structured_result_answer("What is my platelet count?", [{"id": "doc-a", "structured_results": [
+            {"test_name": "Platelet Count", "result_value": "72,000", "page_number": 2,
+             "extraction_confidence": .1, "ambiguous": True},
+        ]}])
+        self.assertIn("unreadable or ambiguous", ambiguous)
+        legacy = _structured_result_answer("What is my platelet count?", [{
+            "id": "doc-old", "structured_results": [], "structured_results_available": False,
+        }])
+        self.assertIn("older attachment", legacy)
+
     def test_document_questions_send_only_attached_evidence_to_model(self):
         client = _Client()
         captured = {}
@@ -198,32 +261,6 @@ class SessionScopedDocumentTests(unittest.TestCase):
         self.assertIn("MODE: GENERAL", captured["prompt"])
         self.assertNotIn("Drug A 10 mg", captured["prompt"])
         self.assertNotIn("DOCUMENT EVIDENCE", captured["prompt"])
-
-    def test_patient_possessive_lab_question_uses_attached_report_context(self):
-        client = _Client()
-        client.texts[0]["content"] = (
-            "[Page 1]\nPlatelet count: 72,000/µL\nHemoglobin: 10.8 g/dL"
-        )
-        captured = {}
-
-        def answer(prompt):
-            captured["prompt"] = prompt
-            return "The attached report lists 72,000/µL; this is unverified extracted text."
-
-        with patch("app.routers.integration.db", return_value=client), \
-             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
-             patch("app.routers.integration.ai_provider.answer", side_effect=answer):
-            result = secure_chat(
-                ChatRequest(message="What is the patient’s platelet count?", session_id=SESSION_A),
-                {"sub": "patient-a", "app_metadata": {"role": "patient"}},
-            )
-
-        self.assertIn("Platelet count: 72,000/µL", captured["prompt"])
-        self.assertIn("answering a question about documents attached", captured["prompt"])
-        self.assertNotIn("MODE: GENERAL", captured["prompt"])
-        self.assertTrue(result["data"]["uses_personal_health_data"])
-        self.assertEqual(result["data"]["answer"],
-                         "The attached report lists 72,000/µL; this is unverified extracted text.")
 
     def test_remove_detaches_only_this_session_without_deleting_source_text(self):
         client = _Client()

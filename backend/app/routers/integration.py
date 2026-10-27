@@ -18,9 +18,12 @@ from ..core.security import current_claims, get_current_doctor, get_current_pati
 from ..services.ai_service import ai_provider
 from ..services.document_ocr import (
     DocumentOCRUnavailable,
+    extract_image_document,
+    extract_pdf_document,
     extract_pdf_text,
     validate_image_dimensions,
 )
+from ..services.document_tables import format_result_row
 
 router = APIRouter(tags=["integration"])
 logger = logging.getLogger(__name__)
@@ -222,6 +225,67 @@ def _report_text_is_persisted(client: Client, document_id: str, patient_id: str)
     return bool(getattr(result, "data", None))
 
 
+def _persisted_report_text(client: Client, document_id: str, patient_id: str) -> str | None:
+    result = client.table("patient_embeddings").select("content").eq(
+        "source_document_id", document_id
+    ).eq("patient_id", patient_id).limit(1).execute()
+    rows = getattr(result, "data", None) or []
+    return str(rows[0].get("content") or "").strip() if rows else None
+
+
+def _persisted_report_data(client: Client, document_id: str, patient_id: str) -> tuple[str | None, list[dict[str, Any]] | None]:
+    result = client.table("patient_embeddings").select("content,structured_results").eq(
+        "source_document_id", document_id
+    ).eq("patient_id", patient_id).limit(1).execute()
+    rows = getattr(result, "data", None) or []
+    if not rows:
+        return None, None
+    raw_results = rows[0].get("structured_results")
+    return (str(rows[0].get("content") or "").strip(),
+            _json_array(raw_results) if raw_results is not None else None)
+
+
+def _document_summary_result(document_type: str, source_text: str, request_id: str) -> dict[str, Any]:
+    """Create a structured response while preserving the original OCR text."""
+    try:
+        summary = ai_provider.summarize_medical_document(document_type, source_text).to_dict()
+        return {
+            "summary": summary,
+            "summary_status": "ready",
+            "message": "Document summary ready. This automated summary is not clinician-reviewed; verify details against the original.",
+        }
+    except Exception as exc:
+        # OCR/persistence success must not be lost when optional summarization is
+        # unavailable or the model returns invalid JSON. Keep the source text
+        # available to the patient and explicitly disclose the fallback.
+        logger.warning(
+            "Document summary unavailable: request_id=%s exception=%s",
+            request_id, type(exc).__name__,
+        )
+        label = document_type.replace("_", " ").strip().title() or "Medical document"
+        return {
+            "summary": {
+                "document_type": document_type,
+                "title": label,
+                "provider": "Not specified",
+                "document_date": "Not specified",
+                "reason": "Not specified",
+                "summary": "Text was extracted, but a structured summary could not be prepared. Review the extracted text and confirm it with your healthcare professional.",
+                "documented_diagnoses": [],
+                "clinical_findings": [],
+                "medications": [],
+                "test_results": [],
+                "recommended_tests": [],
+                "follow_up": [],
+                "warnings": ["Automated extraction may contain errors; check the original document."],
+                "missing_information": ["Structured summary unavailable"],
+                "source_references": [],
+            },
+            "summary_status": "fallback",
+            "message": "The report was saved and its text extracted, but a concise summary is temporarily unavailable. Open the extracted text below or retry later.",
+        }
+
+
 def _is_personal_health_question(message: str) -> bool:
     # Patient-specific values are often phrased with a possessive (“the
     # patient's platelet count”), not only as “my …”. Normalize curly quotes
@@ -300,7 +364,7 @@ def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
         for key in ("allergies", "chronic_conditions", "vitals", "consultations", "prescriptions")
     }
     try:
-        extracted = client.table("patient_embeddings").select("content,created_at").eq(
+        extracted = client.table("patient_embeddings").select("content,structured_results,created_at").eq(
             "patient_id", patient_id
         ).order("created_at", desc=True).limit(12).execute().data or []
     except Exception:
@@ -309,7 +373,9 @@ def _chat_context(client: Client, patient_id: str) -> dict[str, Any]:
         "id,height_cm,weight_kg,blood_group"
     ).eq("id", patient_id).maybe_single().execute().data or {}
     return {"patient": patient, "reports": reports[:25], "records": records,
-            "uploaded_report_text": extracted}
+            "uploaded_report_text": [{**row, "structured_results": _json_array(row.get("structured_results")),
+                                      "structured_results_available": row.get("structured_results") is not None}
+                                      for row in extracted]}
 
 
 def _owned_chat_session(client: Client, session_id: str, patient_id: str, *, active: bool = True) -> dict[str, Any]:
@@ -344,14 +410,128 @@ def _session_documents(client: Client, patient_id: str, session_id: str) -> list
     if not ids:
         return []
     texts_result = client.table("patient_embeddings").select(
-        "source_document_id,content,created_at"
+        "source_document_id,content,structured_results,created_at"
     ).eq("patient_id", patient_id).in_("source_document_id", ids).limit(12).execute()
     by_id = {str(row.get("source_document_id")): row for row in (getattr(texts_result, "data", None) or [])}
     return [
-        {**document, "extracted_text": str(by_id[str(document["id"])].get("content", ""))}
+        {**document,
+         "extracted_text": str(by_id[str(document["id"])].get("content", "")),
+         "structured_results": _json_array(by_id[str(document["id"])].get("structured_results")),
+         "structured_results_available": by_id[str(document["id"])].get("structured_results") is not None}
         for document in documents
         if str(document.get("id")) in by_id
     ]
+
+
+def _json_array(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+_TEST_SYNONYMS = {
+    "platelet": ("platelet", "platelets", "plt"),
+    "hemoglobin": ("hemoglobin", "haemoglobin", "hgb", "hb"),
+    "white blood cell": ("white blood cell", "wbc", "leukocyte", "leucocyte"),
+    "red blood cell": ("red blood cell", "rbc", "erythrocyte"),
+    "glucose": ("glucose", "blood sugar"),
+    "creatinine": ("creatinine",),
+}
+
+
+def _structured_result_matches(question: str, documents: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    lowered = question.lower()
+    aliases = [values for values in _TEST_SYNONYMS.values()
+               if any(alias in lowered for alias in values)]
+    if not aliases:
+        return []
+    matches = []
+    for document in documents:
+        for result in document.get("structured_results", []):
+            test = " ".join(str(result.get("test_name") or "").lower().split())
+            if test and any(alias in test for group in aliases for alias in group):
+                matches.append((document, result))
+    return matches
+
+
+def _structured_result_answer(question: str, documents: list[dict[str, Any]]) -> str | None:
+    """Answer exact lab-result lookups from this patient's attached session only."""
+    lowered = question.lower()
+    exact_intent = any(phrase in lowered for phrase in (
+        "what is", "what was", "tell me", "show me", "give me", "what's", "whats",
+    )) and any(term in lowered for term in (
+        "result", "value", "count", "level", "number", "reference range", "normal range",
+    ))
+    if not exact_intent:
+        return None
+    matches = _structured_result_matches(question, documents)
+    if not matches:
+        requested = [values[0] for values in _TEST_SYNONYMS.values()
+                     if any(alias in lowered for alias in values)]
+        if requested:
+            if any(not document.get("structured_results_available", True) for document in documents):
+                return ("I couldn't verify structured table results for this older attachment. "
+                        "Please re-upload it so the table can be processed, then ask again.")
+            return "I could not find a " + " or ".join(requested) + " result in the attached report."
+        return None
+    usable = [(doc, row) for doc, row in matches
+              if row.get("result_value") is not None and not row.get("ambiguous")
+              and float(row.get("extraction_confidence") or 0) >= 0.2]
+    if not usable:
+        pages = sorted({str(row.get("page_number")) for _doc, row in matches if row.get("page_number")})
+        page_text = f" on page {', '.join(pages)}" if pages else ""
+        return ("I found the requested test name in the attached report, but its measured result "
+                f"was unreadable or ambiguous{page_text}. Please verify the original document with your clinician.")
+
+    # Preserve multiple measurements, including different dates or documents.
+    details = []
+    seen = set()
+    report_ids = list(dict.fromkeys(str(document.get("id") or "") for document, _row in usable))
+    wants_range = any(term in question.lower() for term in ("reference range", "normal range", "usual range"))
+    wants_unit = any(term in question.lower() for term in ("unit", "units"))
+    for document, row in usable:
+        value = row.get("reference_range") if wants_range else row.get("result_value")
+        if value is None:
+            value = "not listed" if wants_range else row.get("result_value")
+        parts = [str(value)]
+        if not wants_range and row.get("unit"):
+            parts.append(str(row["unit"]))
+        if wants_range and row.get("unit"):
+            parts.append(str(row["unit"]))
+        if row.get("report_date") or row.get("collection_date"):
+            parts.append(str(row.get("collection_date") or row.get("report_date")))
+        parts.append(f"page {row['page_number']}" if row.get("page_number") else "attached report")
+        if len(report_ids) > 1:
+            report_index = report_ids.index(str(document.get("id") or "")) + 1
+            parts.append(f"report {report_index} ({document.get('document_type') or 'medical document'})")
+        if row.get("row_index"):
+            parts.append(f"row {row['row_index']}")
+        label = str(row.get("test_name"))
+        entry = f"{label}: {' '.join(parts)}"
+        if entry not in seen:
+            seen.add(entry)
+            details.append(entry)
+    if not wants_range:
+        extra_ranges = []
+        for _document, row in usable:
+            if row.get("reference_range"):
+                text = f"Reference range: {row['reference_range']}"
+                if row.get("unit"):
+                    text += f" {row['unit']}"
+                if text not in extra_ranges:
+                    extra_ranges.append(text)
+        details.extend(extra_ranges)
+    if wants_unit and all(not row.get("unit") for _doc, row in usable):
+        details.append("The report does not list a unit for this result.")
+    source_rows = [row.get("source_text") for _doc, row in usable if row.get("source_text")]
+    answer = "From the attached medical report: " + "; ".join(details) + "."
+    if source_rows:
+        answer += " Source row: " + " | ".join(dict.fromkeys(source_rows))[:500] + "."
+    answer += " Automated extraction can be imperfect; verify against the original report."
+    return answer
 
 
 def _document_evidence(question: str, documents: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -377,7 +557,15 @@ def _document_evidence(question: str, documents: list[dict[str, Any]]) -> list[d
         # longer documents remain line-selected to keep each inference bounded.
         matching = [line for score, line in ranked if score > 0 and line]
         chosen = matching[:6] if matching else lines[:6]
-        excerpt = "\n".join(chosen)[:1800]
+        structured = document.get("structured_results", [])
+        table_rows = [format_result_row(row) for row in structured
+                      if isinstance(row, dict) and row.get("test_name")]
+        # Row+header text stays together for semantic interpretation; exact
+        # numerical lookup is answered deterministically before this path.
+        table_terms = terms
+        relevant_rows = [row for row in table_rows
+                          if table_terms.intersection(re.findall(r"[a-z0-9]+", row.lower()))]
+        excerpt = "\n".join([*relevant_rows[:8], *chosen])[:3000]
         if excerpt:
             selected.append({"document_id": str(document["id"]),
                              "document_type": str(document.get("document_type", "medical document")),
@@ -616,6 +804,27 @@ def _extract_pdf_text(content: bytes) -> str:
         ) from exc
 
 
+def _extract_pdf_document(content: bytes) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        return extract_pdf_document(content, MAX_CHAT_PDF_PAGES)
+    except (DocumentOCRUnavailable, ReportValidationError):
+        raise
+    except ValueError as exc:
+        message = str(exc)
+        category = (
+            "pdf_password_protected" if "password-protected" in message else
+            "pdf_page_limit_exceeded" if "current limit" in message else
+            "pdf_page_unreadable" if "page " in message.lower() and "readable text" in message.lower() else
+            "pdf_extraction_failed"
+        )
+        raise ReportValidationError(category, message) from exc
+    except Exception as exc:
+        raise ReportValidationError(
+            "pdf_extraction_failed",
+            "This PDF is damaged or could not be read. Please export or scan it again.",
+        ) from exc
+
+
 def _report_content_type(document: UploadFile, content: bytes) -> str | None:
     """Identify the real format from its signature, not the browser MIME label."""
     if content[:1024].find(b"%PDF-") >= 0:
@@ -742,6 +951,9 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
         # Session-uploaded evidence is preferred and explicitly labelled as
         # machine-extracted. It is never converted into an authoritative Rx.
         if use_session_documents:
+            exact_result = _structured_result_answer(payload.message, session_documents)
+            if exact_result:
+                return response(exact_result, personal_data=True)
             evidence = _document_evidence(payload.message, session_documents)
             if not evidence:
                 return response("I couldn't find readable text relevant to that question in a document attached to this conversation. Please verify it with your clinician or pharmacist.", personal_data=True)
@@ -927,7 +1139,8 @@ async def upload_patient_chat_report(
         # A previous attempt may have written document metadata but failed
         # before persisting its extracted text. Do not claim success unless
         # the patient-scoped extraction is present too; fall through and heal.
-        if _report_text_is_persisted(client, document_id, patient["id"]):
+        persisted_text, persisted_results = _persisted_report_data(client, document_id, patient["id"])
+        if persisted_text and persisted_results is not None:
             if not existing.get("session_id"):
                 client.table("medical_documents").update({"session_id": session_id}).eq(
                     "id", document_id
@@ -939,9 +1152,15 @@ async def upload_patient_chat_report(
                 if not associated or associated[0].get("session_id") != session_id:
                     raise HTTPException(status_code=503, detail="Report could not be attached to this chat")
                 existing["session_id"] = session_id
-            return {"data": {"document": existing, "report_type": normalized_type,
-                             "text_available": True,
-                             "message": "Your report was already saved privately and is available in this chat."}}
+            summary_result = _document_summary_result(normalized_type, persisted_text, diagnostic_id)
+            return {"data": {
+                "document": existing,
+                "report_type": normalized_type,
+                "text_available": True,
+                "extracted_text": persisted_text.removeprefix("Extracted from uploaded document: ").strip(),
+                "structured_results": persisted_results,
+                **summary_result,
+            }}
     suffix = (document.filename or "report").replace("/", "_").replace("\\", "_")
     path = (existing.get("bucket_path") if existing else None) or f"{patient['id']}/{document_id}-{suffix}"
     try:
@@ -955,15 +1174,18 @@ async def upload_patient_chat_report(
         )
         raise HTTPException(status_code=503, detail="Secure report file upload is currently unavailable") from exc
     try:
+        structured_results: list[dict[str, Any]] = []
         if content_type == "application/pdf":
-            extracted = await run_in_threadpool(_extract_pdf_text, content)
+            raw_text, structured_results = await run_in_threadpool(_extract_pdf_document, content)
+            extracted = raw_text
         else:
             # OCR runs locally in a worker thread; image bytes never go to a
             # hosted vision provider or a public Storage URL.
             try:
-                extracted = await run_in_threadpool(
-                    ai_provider.extract_document_text, content, content_type
-                )
+                raw_text, structured_results = await run_in_threadpool(extract_image_document, content)
+                if not raw_text:
+                    raise ValueError("No readable text was found in this image")
+                extracted = "Extracted from uploaded document: " + raw_text[:30000]
             except ValueError as exc:
                 raise ReportValidationError(
                     "image_unreadable",
@@ -1038,16 +1260,22 @@ async def upload_patient_chat_report(
         if extracted:
             embedding_result = client.table("patient_embeddings").select("id").eq(
                 "source_document_id", document_id
-            ).limit(1).execute()
+            ).eq("patient_id", patient["id"]).limit(1).execute()
             embedding = getattr(embedding_result, "data", None) or []
             if not embedding:
                 client.table("patient_embeddings").insert({
-                    "patient_id": patient["id"], "source_document_id": document_id, "content": extracted,
+                    "patient_id": patient["id"], "source_document_id": document_id,
+                    "content": extracted, "structured_results": structured_results,
                 }).execute()
-            verified_embedding = client.table("patient_embeddings").select("id").eq(
+            else:
+                client.table("patient_embeddings").update({
+                    "content": extracted, "structured_results": structured_results,
+                }).eq("source_document_id", document_id).eq("patient_id", patient["id"]).execute()
+            verified_embedding = client.table("patient_embeddings").select("id,structured_results").eq(
                 "source_document_id", document_id
             ).eq("patient_id", patient["id"]).limit(1).execute()
-            if not getattr(verified_embedding, "data", None):
+            verified_rows = getattr(verified_embedding, "data", None) or []
+            if not verified_rows or "structured_results" not in verified_rows[0]:
                 raise RuntimeError("Document text write could not be verified")
     except Exception as exc:
         if not existing:
@@ -1070,18 +1298,16 @@ async def upload_patient_chat_report(
             _storage_error_detail(exc),
         )
         raise HTTPException(status_code=503, detail="Secure report metadata is currently unavailable") from exc
-    if content_type == "application/pdf":
-        message = (
-            "Report saved privately. Automated text extraction (not clinician-reviewed):\n"
-            + extracted[:1800]
-        )
-    else:
-        message = (
-            "Report saved privately. Automated OCR text (not clinician-reviewed; verify names and doses, "
-            "especially handwriting):\n" + extracted[:1800]
-        )
-    return {"data": {"document": record, "report_type": normalized_type,
-                      "text_available": bool(extracted), "message": message}}
+    summary_result = _document_summary_result(normalized_type, extracted, diagnostic_id)
+    display_text = extracted.removeprefix("Extracted from uploaded document: ").strip()
+    return {"data": {
+        "document": record,
+        "report_type": normalized_type,
+        "text_available": bool(extracted),
+        "extracted_text": display_text,
+        "structured_results": structured_results,
+        **summary_result,
+    }}
 
 
 def _admin_context(claims: dict) -> tuple[Client, dict]:
