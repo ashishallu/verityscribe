@@ -557,13 +557,28 @@ class _MessageBubble extends StatelessWidget {
                                                       ? Colors.white
                                                       : AppTheme.blue))
                                         ])),
-                              Text(message.text,
-                                  style: TextStyle(
-                                      color: isUser
-                                          ? Colors.white
-                                          : scheme.onSurface,
-                                      height: 1.5,
-                                      fontSize: 15)),
+                              if (message.reportTitle == null &&
+                                  message.reportSummary == null &&
+                                  message.extractedText == null)
+                                Text(message.text,
+                                    style: TextStyle(
+                                        color: isUser
+                                            ? Colors.white
+                                            : scheme.onSurface,
+                                        height: 1.5,
+                                        fontSize: 15)),
+                              if (!isUser &&
+                                  (message.reportTitle != null ||
+                                      message.reportSummary != null ||
+                                      message.extractedText != null))
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 12),
+                                  child: _ReportAnalyzedNotice(
+                                    title: message.reportTitle,
+                                    summary: message.reportSummary,
+                                    extractedText: message.extractedText,
+                                  ),
+                                ),
                               if (message.action == 'book_appointment')
                                 Padding(
                                   padding: const EdgeInsets.only(top: 12),
@@ -586,6 +601,118 @@ class _MessageBubble extends StatelessWidget {
                             ]))),
               ]),
         ));
+  }
+}
+
+class _ReportAnalyzedNotice extends StatelessWidget {
+  final String? title;
+  final String? summary;
+  final String? extractedText;
+
+  const _ReportAnalyzedNotice({this.title, this.summary, this.extractedText});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final cleanSummary = summary?.trim();
+    final hasSummary = cleanSummary != null &&
+        cleanSummary.isNotEmpty &&
+        !cleanSummary.toLowerCase().contains('could not be prepared') &&
+        !cleanSummary.toLowerCase().contains('temporarily unavailable');
+    final cleanText = extractedText?.trim();
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Container(
+          width: 32,
+          height: 32,
+          decoration: BoxDecoration(
+            color: scheme.primaryContainer,
+            shape: BoxShape.circle,
+          ),
+          child: Icon(Icons.check_rounded,
+              size: 18, color: scheme.onPrimaryContainer),
+        ),
+        const SizedBox(width: 9),
+        Expanded(
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Report analyzed',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleSmall
+                    ?.copyWith(fontWeight: FontWeight.w700)),
+            if (title != null && title!.trim().isNotEmpty)
+              Text(title!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      )),
+          ]),
+        ),
+      ]),
+      if (hasSummary)
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(cleanSummary,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodyMedium
+                  ?.copyWith(height: 1.45)),
+        ),
+      const SizedBox(height: 11),
+      DecoratedBox(
+        decoration: BoxDecoration(
+          color: scheme.primaryContainer.withValues(alpha: .48),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+          child: Row(children: [
+            Icon(Icons.chat_bubble_outline_rounded,
+                size: 16, color: scheme.primary),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('Would you like to know anything? Type below.',
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: scheme.onSurface,
+                        fontWeight: FontWeight.w600,
+                      )),
+            ),
+          ]),
+        ),
+      ),
+      if (cleanText != null && cleanText.isNotEmpty)
+        Theme(
+          data: Theme.of(context).copyWith(
+            dividerColor: Colors.transparent,
+            visualDensity: VisualDensity.compact,
+          ),
+          child: ExpansionTile(
+            tilePadding: const EdgeInsets.symmetric(horizontal: 2),
+            childrenPadding: const EdgeInsets.fromLTRB(2, 0, 2, 10),
+            title: Text('View extracted text',
+                style: Theme.of(context).textTheme.labelLarge),
+            textColor: scheme.primary,
+            collapsedTextColor: scheme.onSurfaceVariant,
+            iconColor: scheme.primary,
+            collapsedIconColor: scheme.onSurfaceVariant,
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: SelectableText(cleanText,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(height: 1.5)),
+              ),
+            ],
+          ),
+        ),
+    ]);
   }
 }
 
