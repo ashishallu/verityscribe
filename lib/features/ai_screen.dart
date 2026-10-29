@@ -533,21 +533,33 @@ class _Suggestion extends StatelessWidget {
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final scheme = Theme.of(context).colorScheme;
-    return _GlassPanel(
-      borderRadius: BorderRadius.circular(24),
-      enabled: dark,
-      child: ActionChip(
-        label: Text(text),
+    final radius = BorderRadius.circular(24);
+    return Material(
+      color: dark
+          ? const Color(0x77423957)
+          : scheme.surface.withValues(alpha: .92),
+      shape: RoundedRectangleBorder(
+        borderRadius: radius,
         side: dark
             ? BorderSide.none
             : BorderSide(color: Colors.white.withValues(alpha: .8)),
-        backgroundColor: dark
-            ? const Color(0x77423957)
-            : scheme.surface.withValues(alpha: .92),
-        labelStyle: TextStyle(
-            color: dark ? const Color(0xFFD5C7FF) : AppTheme.blue,
-            fontWeight: FontWeight.w700),
-        onPressed: () => onPressed(text),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        borderRadius: radius,
+        onTap: () => onPressed(text),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          child: Center(
+            child: Text(
+              text,
+              style: TextStyle(
+                color: dark ? const Color(0xFFD5C7FF) : AppTheme.blue,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -641,42 +653,50 @@ class _Composer extends StatelessWidget {
           ),
           const SizedBox(width: 9),
           Expanded(
-            child: _GlassPanel(
-              borderRadius: BorderRadius.circular(26),
-              child: Container(
-                constraints: const BoxConstraints(minHeight: 48),
-                decoration: BoxDecoration(
-                  color: dark
-                      ? const Color(0xB52E3045)
-                      : scheme.surface.withValues(alpha: .94),
-                  borderRadius: BorderRadius.circular(26),
-                  border: dark
-                      ? null
-                      : Border.all(color: Colors.white.withValues(alpha: .85)),
-                  boxShadow: [
-                    BoxShadow(
-                        color: scheme.shadow.withValues(alpha: dark ? .2 : .06),
-                        blurRadius: 20,
-                        offset: const Offset(0, 6)),
-                  ],
-                ),
-                child: TextField(
-                  controller: controller,
-                  minLines: 1,
-                  maxLines: 4,
-                  textInputAction: TextInputAction.send,
-                  onSubmitted: (_) => onSend(),
-                  cursorColor: dark ? const Color(0xFFB89AFF) : scheme.primary,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyLarge
-                      ?.copyWith(color: scheme.onSurface),
-                  decoration: InputDecoration(
-                    hintText: 'Ask Verity anything…',
-                    hintStyle: TextStyle(color: scheme.onSurfaceVariant),
-                    contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 18, vertical: 13),
-                    border: InputBorder.none,
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(26),
+                boxShadow: [
+                  BoxShadow(
+                    color: scheme.shadow.withValues(alpha: dark ? .2 : .06),
+                    blurRadius: 20,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: _GlassPanel(
+                borderRadius: BorderRadius.circular(26),
+                child: Container(
+                  constraints: const BoxConstraints(minHeight: 48),
+                  decoration: BoxDecoration(
+                    color: dark
+                        ? const Color(0xB52E3045)
+                        : scheme.surface.withValues(alpha: .94),
+                    borderRadius: BorderRadius.circular(26),
+                    border: dark
+                        ? null
+                        : Border.all(
+                            color: Colors.white.withValues(alpha: .85)),
+                  ),
+                  child: TextField(
+                    controller: controller,
+                    minLines: 1,
+                    maxLines: 4,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => onSend(),
+                    cursorColor:
+                        dark ? const Color(0xFFB89AFF) : scheme.primary,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyLarge
+                        ?.copyWith(color: scheme.onSurface),
+                    decoration: InputDecoration(
+                      hintText: 'Ask Verity anything…',
+                      hintStyle: TextStyle(color: scheme.onSurfaceVariant),
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 18, vertical: 13),
+                      border: InputBorder.none,
+                    ),
                   ),
                 ),
               ),
