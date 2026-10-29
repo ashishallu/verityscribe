@@ -232,24 +232,28 @@ class _CareSummary extends StatelessWidget {
   final AsyncValue<dynamic> appointments, medicines, reports;
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     String count(AsyncValue<dynamic> value) => value.when(
         data: (items) => items is List ? '${items.length}' : '0',
         loading: () => '…',
         error: (_, __) => '—');
     return SoftCard(
-      color: const Color(0xFFEAF2FF),
+      color: isDark ? const Color(0xFF202C43) : const Color(0xFFEAF2FF),
       child: Row(children: [
-        const Icon(Icons.auto_awesome_rounded, color: AppTheme.blue),
+        Icon(Icons.auto_awesome_rounded,
+            color: isDark ? const Color(0xFF9BC2FF) : AppTheme.blue),
         const SizedBox(width: 12),
         Expanded(
             child:
                 Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Your care summary',
-              style: TextStyle(fontWeight: FontWeight.w800)),
+          Text('Your care summary',
+              style: TextStyle(
+                  color: scheme.onSurface, fontWeight: FontWeight.w800)),
           const SizedBox(height: 5),
           Text(
               '${count(appointments)} appointments • ${count(medicines)} medicines • ${count(reports)} reports',
-              style: const TextStyle(color: AppTheme.muted, fontSize: 12)),
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12)),
         ])),
       ]),
     );
