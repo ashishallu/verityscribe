@@ -538,8 +538,9 @@ class _Suggestion extends StatelessWidget {
       enabled: dark,
       child: ActionChip(
         label: Text(text),
-        side:
-            BorderSide(color: Colors.white.withValues(alpha: dark ? .14 : .8)),
+        side: dark
+            ? BorderSide.none
+            : BorderSide(color: Colors.white.withValues(alpha: .8)),
         backgroundColor: dark
             ? const Color(0x77423957)
             : scheme.surface.withValues(alpha: .92),
@@ -649,8 +650,9 @@ class _Composer extends StatelessWidget {
                       ? const Color(0xB52E3045)
                       : scheme.surface.withValues(alpha: .94),
                   borderRadius: BorderRadius.circular(26),
-                  border: Border.all(
-                      color: Colors.white.withValues(alpha: dark ? .17 : .85)),
+                  border: dark
+                      ? null
+                      : Border.all(color: Colors.white.withValues(alpha: .85)),
                   boxShadow: [
                     BoxShadow(
                         color: scheme.shadow.withValues(alpha: dark ? .2 : .06),
