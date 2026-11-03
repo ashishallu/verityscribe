@@ -28,5 +28,7 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>VerityScribe uses the microphone only when you start an AI Virtual consultation or record a voice draft.</string>
 </dict>
 </plist>

@@ -47,3 +47,21 @@ extension DoctorChatRepository on DoctorRepository {
     return (data['answer'] ?? '').toString();
   }
 }
+
+extension DoctorAiConsultationRepository on DoctorRepository {
+  Future<Map<String, dynamic>> aiConsultation(String appointmentId) async {
+    final response = await api.request('/ai-consultations/doctor/appointments/$appointmentId');
+    final body = Map<String, dynamic>.from(response as Map);
+    return Map<String, dynamic>.from((body['data'] as Map?) ?? body);
+  }
+
+  Future<Map<String, dynamic>> reviewAiConsultation(String sessionId, {required String decision, required Map<String, dynamic> summary, String? note}) async {
+    final response = await api.request('/ai-consultations/doctor/sessions/$sessionId/review', method: 'POST', body: {
+      'decision': decision,
+      'summary': summary,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+    });
+    final body = Map<String, dynamic>.from(response as Map);
+    return Map<String, dynamic>.from((body['data'] as Map?) ?? body);
+  }
+}

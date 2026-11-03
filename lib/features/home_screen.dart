@@ -232,24 +232,28 @@ class _CareSummary extends StatelessWidget {
   final AsyncValue<dynamic> appointments, medicines, reports;
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     String count(AsyncValue<dynamic> value) => value.when(
         data: (items) => items is List ? '${items.length}' : '0',
         loading: () => '…',
         error: (_, __) => '—');
     return SoftCard(
-      color: const Color(0xFFEAF2FF),
+      color: isDark ? const Color(0xFF202C43) : const Color(0xFFEAF2FF),
       child: Row(children: [
-        const Icon(Icons.auto_awesome_rounded, color: AppTheme.blue),
+        Icon(Icons.auto_awesome_rounded,
+            color: isDark ? const Color(0xFF9BC2FF) : AppTheme.blue),
         const SizedBox(width: 12),
         Expanded(
             child:
                 Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Your care summary',
-              style: TextStyle(fontWeight: FontWeight.w800)),
+          Text('Your care summary',
+              style: TextStyle(
+                  color: scheme.onSurface, fontWeight: FontWeight.w800)),
           const SizedBox(height: 5),
           Text(
               '${count(appointments)} appointments • ${count(medicines)} medicines • ${count(reports)} reports',
-              style: const TextStyle(color: AppTheme.muted, fontSize: 12)),
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12)),
         ])),
       ]),
     );
@@ -321,47 +325,59 @@ class _AppointmentCard extends StatelessWidget {
   const _AppointmentCard({required this.item});
   final dynamic item;
   @override
-  Widget build(BuildContext context) => SoftCard(
-      child: InkWell(
-          onTap: () => context.go('/record'),
-          borderRadius: BorderRadius.circular(18),
-          child: Row(children: [
-            Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                    color: const Color(0xFFEAF9F5),
-                    borderRadius: BorderRadius.circular(15)),
-                child: const Icon(Icons.calendar_month_rounded,
-                    color: AppTheme.emerald)),
-            const SizedBox(width: 13),
-            Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                  Text(
-                      item.doctorName.toString().isEmpty
-                          ? 'Doctor details unavailable'
-                          : item.doctorName,
-                      style: Theme.of(context)
-                          .textTheme
-                          .titleSmall
-                          ?.copyWith(fontWeight: FontWeight.w800)),
-                  Text(
-                      [item.department, item.hospital]
-                          .where((x) => x.toString().trim().isNotEmpty)
-                          .join(' • '),
-                      style:
-                          const TextStyle(fontSize: 12, color: AppTheme.muted))
-                ])),
-            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-              Text('${item.date} ${item.time}',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.w800, color: AppTheme.blue)),
-              Text(item.status.toString(),
-                  style: const TextStyle(fontSize: 12, color: AppTheme.blue))
-            ]),
-          ])));
+  Widget build(BuildContext context) {
+    final type = item.consultationType?.toString() ?? '';
+    final isAi = type == 'ai_chat' || type == 'ai_virtual';
+    return SoftCard(
+        child: InkWell(
+            onTap: () => isAi
+                ? context.push('/ai-appointment/${item.id}', extra: item)
+                : context.go('/record'),
+            borderRadius: BorderRadius.circular(18),
+            child: Row(children: [
+              Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                      color: const Color(0xFFEAF9F5),
+                      borderRadius: BorderRadius.circular(15)),
+                  child: const Icon(Icons.calendar_month_rounded,
+                      color: AppTheme.emerald)),
+              const SizedBox(width: 13),
+              Expanded(
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                    Text(
+                        item.doctorName.toString().isEmpty
+                            ? 'Doctor details unavailable'
+                            : item.doctorName,
+                        style: Theme.of(context)
+                            .textTheme
+                            .titleSmall
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                    Text(
+                        [item.department, item.hospital]
+                            .where((x) => x.toString().trim().isNotEmpty)
+                            .join(' • '),
+                        style: const TextStyle(
+                            fontSize: 12, color: AppTheme.muted))
+                  ])),
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('${item.date} ${item.time}',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w800, color: AppTheme.blue)),
+                Text(item.status.toString(),
+                    style: const TextStyle(fontSize: 12, color: AppTheme.blue)),
+                if (isAi)
+                  Text(type == 'ai_chat' ? 'AI Chat' : 'AI Virtual',
+                      style: const TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.emerald,
+                          fontWeight: FontWeight.w800))
+              ]),
+            ])));
+  }
 }
 
 class _MedicineRow extends StatelessWidget {

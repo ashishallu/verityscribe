@@ -18,12 +18,18 @@ class ChatMessage {
   final DateTime sentAt;
   final String? attachment;
   final String? action;
+  final String? reportTitle;
+  final String? reportSummary;
+  final String? extractedText;
   const ChatMessage(
       {required this.text,
       required this.isUser,
       required this.sentAt,
       this.attachment,
-      this.action});
+      this.action,
+      this.reportTitle,
+      this.reportSummary,
+      this.extractedText});
 }
 
 class ChatSessionDocument {
@@ -324,6 +330,10 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           : decoded;
       final confirmation =
           (data['message'] ?? 'Your report was saved privately.').toString();
+      final summary = data['summary'] is Map
+          ? Map<String, dynamic>.from(data['summary'] as Map)
+          : <String, dynamic>{};
+      final extractedText = data['extracted_text']?.toString();
       final document = data['document'] is Map
           ? Map<String, dynamic>.from(data['document'] as Map)
           : <String, dynamic>{};
@@ -342,7 +352,14 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           sentAt: now,
           attachment: reportType,
         ),
-        ChatMessage(text: confirmation, isUser: false, sentAt: DateTime.now()),
+        ChatMessage(
+          text: confirmation,
+          isUser: false,
+          sentAt: DateTime.now(),
+          reportTitle: summary['title']?.toString(),
+          reportSummary: summary['summary']?.toString(),
+          extractedText: extractedText,
+        ),
       ], sessionDocuments: sessionDocuments, chatLoading: false);
       _pendingReportUploadId = null;
       _pendingReportFingerprint = null;

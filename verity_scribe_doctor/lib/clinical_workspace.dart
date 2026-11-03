@@ -4,9 +4,10 @@ import 'package:record/record.dart';
 import 'services.dart';
 
 class ClinicalWorkspace extends StatefulWidget {
-  const ClinicalWorkspace({required this.appointment, required this.patient, required this.repo, super.key});
+  const ClinicalWorkspace({required this.appointment, required this.patient, required this.repo, this.initialConsultationId, super.key});
   final Map<String, dynamic> appointment, patient;
   final DoctorRepository repo;
+  final String? initialConsultationId;
   @override State<ClinicalWorkspace> createState() => _ClinicalWorkspaceState();
 }
 
@@ -23,6 +24,8 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
   final chatQuestion = TextEditingController();
   String? chatAnswer;
   bool chatLoading = false;
+
+  @override void initState() { super.initState(); consultationId = widget.initialConsultationId; }
 
   @override
   void dispose() { recorder.dispose(); chatQuestion.dispose(); symptoms.dispose(); diagnosis.dispose(); plan.dispose(); note.dispose(); search.dispose(); report.dispose(); transcriptId.dispose(); dosage.dispose(); frequency.dispose(); quantity.dispose(); super.dispose(); }
