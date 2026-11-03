@@ -334,14 +334,14 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                     initialValue: type,
                     items: const [
                       DropdownMenuItem(
+                          value: 'ai_chat', child: Text('AI Chat')),
+                      DropdownMenuItem(
+                          value: 'ai_virtual', child: Text('AI Virtual')),
+                      DropdownMenuItem(
                           value: 'in_person', child: Text('In person')),
                       DropdownMenuItem(value: 'video', child: Text('Video')),
                       DropdownMenuItem(value: 'phone', child: Text('Phone')),
                       DropdownMenuItem(value: 'chat', child: Text('Chat')),
-                      DropdownMenuItem(
-                          value: 'ai_chat', child: Text('AI Chat')),
-                      DropdownMenuItem(
-                          value: 'ai_virtual', child: Text('AI Virtual'))
                     ],
                     onChanged: (x) => setState(() => type = x ?? 'in_person'),
                     decoration: const InputDecoration(
