@@ -1,14 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:go_router/go_router.dart';
-import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../core/constants/endpoints.dart';
 import '../models/entities.dart';
@@ -58,7 +57,7 @@ class AIAppointmentEntryScreen extends StatelessWidget {
                       const Divider(height: 28),
                       Text(
                           virtual
-                              ? 'Speak with Verity using a private, turn-based voice session.'
+                              ? 'Speak with Verity in a live voice session with captions and interruption support.'
                               : 'Share what is bothering you in a private text conversation with Verity.',
                           style: const TextStyle(height: 1.45)),
                       const SizedBox(height: 12),
@@ -99,13 +98,19 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   final _scroll = ScrollController();
   final List<Map<String, dynamic>> _messages = [];
   Timer? _clock;
+  StreamSubscription<Uint8List>? _audioSubscription;
+  StreamSubscription<dynamic>? _voiceSubscription;
+  WebSocketChannel? _voiceChannel;
   DateTime? _startedAt;
   String? _sessionId;
+  String _liveTranscript = '';
   String? _pendingChatKey,
       _pendingChatText,
       _pendingVoiceKey,
       _pendingVoiceText;
   int _requestCounter = 0;
+  int _voiceInterruptionCount = 0;
+  final Map<String, int> _voiceTurnInterruptions = {};
   String? _error;
   Map<String, dynamic>? _summary;
   bool _consented = false, _loading = false, _recording = false;
@@ -138,6 +143,9 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     _clock?.cancel();
     _input.dispose();
     _scroll.dispose();
+    _audioSubscription?.cancel();
+    _voiceSubscription?.cancel();
+    _voiceChannel?.sink.close();
     _recorder.dispose();
     _tts.stop();
     super.dispose();
@@ -185,11 +193,18 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     try {
       final response = await ref.read(apiClientProvider).post<dynamic>(
         '/ai-consultations/appointments/${widget.appointment.id}/start',
-        {'consent': true, 'voice_consent': _virtual},
+        {
+          'consent': true,
+          'voice_consent': _virtual,
+          'similar_case_consent': true,
+        },
       );
       setState(() => _loadSession(_data(response.data)));
-      if (_virtual && _messages.isNotEmpty) {
-        unawaited(_speak(_messages.last['content'].toString()));
+      if (_virtual) {
+        await _beginLiveVoice();
+        if (_messages.isNotEmpty) {
+          unawaited(_speak(_messages.last['content'].toString()));
+        }
       }
     } catch (_) {
       setState(() => _error =
@@ -294,124 +309,163 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
   }
 
-  Future<void> _beginVoiceTurn() async {
-    if (_loading ||
-        _recording ||
-        _sessionId == null ||
-        _ended ||
-        _pendingVoiceText != null) {
-      return;
-    }
-    if (_speaking) {
-      await _tts.stop();
-    }
+  Future<void> _beginLiveVoice() async {
+    if (_sessionId == null || _voiceChannel != null || _ended) return;
     try {
       if (!await _recorder.hasPermission()) {
-        setState(
-            () => _error = 'Microphone permission is needed for AI Virtual.');
+        setState(() => _error = 'Microphone permission is needed for AI Virtual.');
         return;
       }
-      final directory = await getTemporaryDirectory();
-      final path =
-          '${directory.path}/ai_virtual_${DateTime.now().millisecondsSinceEpoch}.wav';
-      await _recorder.start(
-          const RecordConfig(
-              encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1),
-          path: path);
-      setState(() {
-        _recording = true;
-        _pendingVoiceKey ??= _newRequestKey();
-        _error = null;
-      });
+      final ticketResponse = await ref.read(apiClientProvider).post<dynamic>(
+          '/ai-consultations/$_sessionId/voice-ticket', const {});
+      final ticket = _data(ticketResponse.data)['ticket'].toString();
+      if (ticket.isEmpty || ticket == 'null') throw StateError('Voice ticket missing');
+      final base = Uri.parse(apiBaseUrl);
+      final wsUri = base.replace(
+        scheme: base.scheme == 'https' ? 'wss' : 'ws',
+        path: '${base.path}/ai-consultations/$_sessionId/voice-stream',
+        query: null,
+        fragment: null,
+      );
+      final protocol = 'verityscribe-ticket.$ticket';
+      final channel = WebSocketChannel.connect(wsUri, protocols: [protocol]);
+      _voiceChannel = channel;
+      await channel.ready.timeout(const Duration(seconds: 15));
+      _voiceSubscription = channel.stream.listen(
+        _handleLiveVoiceEvent,
+        onError: (_) {
+          if (mounted) {
+            setState(() {
+              _recording = false;
+              _error = 'The live voice connection was interrupted. Reconnect and try again.';
+            });
+          }
+          unawaited(_stopLiveVoice());
+        },
+        onDone: () {
+          if (!_ended) unawaited(_stopLiveVoice());
+        },
+      );
+      final audio = await _recorder.startStream(const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: 16000,
+        numChannels: 1,
+        echoCancel: true,
+        noiseSuppress: true,
+        autoGain: true,
+        streamBufferSize: 4096,
+      ));
+      _audioSubscription = audio.listen(
+        (chunk) {
+          if (_recording && _voiceChannel == channel) channel.sink.add(chunk);
+        },
+        onError: (_) {
+          if (mounted) setState(() => _error = 'Microphone audio could not be streamed.');
+        },
+      );
+      if (mounted) {
+        setState(() {
+          _recording = true;
+          _error = null;
+        });
+      }
     } catch (_) {
-      setState(() => _error =
-          'Could not start the microphone. Check permission and try again.');
+      await _voiceChannel?.sink.close();
+      _voiceChannel = null;
+      if (mounted) {
+        setState(() {
+          _recording = false;
+          _error = 'Live voice could not connect. Check microphone permission and retry.';
+        });
+      }
     }
   }
 
-  Future<void> _finishVoiceTurn() async {
-    if (!_recording || _sessionId == null) return;
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    String? path;
-    final requestKey = _pendingVoiceKey ??= _newRequestKey();
+  void _handleLiveVoiceEvent(dynamic raw) {
+    if (raw is! String) return;
     try {
-      path = await _recorder.stop();
-      setState(() => _recording = false);
-      if (path == null || !await File(path).exists()) {
-        throw StateError('No audio captured');
-      }
-      final token = await ref.read(supabaseAuthProvider).accessToken();
-      final request = http.MultipartRequest('POST',
-          Uri.parse('$apiBaseUrl/ai-consultations/$_sessionId/voice-turn'));
-      if (token != null) request.headers['Authorization'] = 'Bearer $token';
-      request.fields['request_key'] = requestKey;
-      request.files.add(await http.MultipartFile.fromPath('audio', path,
-          filename: 'ai-virtual.wav'));
-      final streamed =
-          await request.send().timeout(const Duration(seconds: 90));
-      final raw = await streamed.stream.bytesToString();
-      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
-        throw StateError('Voice service unavailable');
-      }
-      final data = _data(jsonDecode(raw));
-      final added =
-          (data['messages'] as List? ?? const []).map((e) => _body(e)).toList();
-      setState(() {
-        _messages.addAll(added);
-        _emergency = data['emergency_warning'] == true;
-      });
-      _pendingVoiceKey = null;
-      _pendingVoiceText = null;
-      if (added.length > 1) unawaited(_speak(added.last['content'].toString()));
-    } catch (_) {
-      try {
-        final saved = _data((await ref
-                .read(apiClientProvider)
-                .get<dynamic>('/ai-consultations/$_sessionId'))
-            .data);
-        final rows = (saved['messages'] as List? ?? const [])
-            .map((e) => _body(e))
-            .toList();
-        final patientMessage = rows.cast<Map<String, dynamic>?>().firstWhere(
-            (row) =>
-                row?['request_key'] == requestKey && row?['role'] == 'patient',
-            orElse: () => null);
-        final hasAssistant = rows.any((row) =>
-            row['request_key'] == requestKey && row['role'] == 'assistant');
-        setState(() {
-          _loadSession(saved);
-          _error = patientMessage != null
-              ? hasAssistant
-                  ? 'Your voice turn and reply are saved.'
-                  : 'Your voice turn was transcribed and saved. Retry the saved turn or repeat the same phrase.'
-              : 'Speech could not be processed. Your audio was not retained. Try again or use captions.';
-        });
-        if (patientMessage != null && !hasAssistant) {
-          _pendingVoiceText = patientMessage['content']?.toString();
-        } else {
+      final event = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      switch (event['type']) {
+        case 'transcript':
+          if (mounted) setState(() => _liveTranscript = event['text']?.toString() ?? '');
+          break;
+        case 'speech_started':
+          _voiceInterruptionCount++;
+          if (_speaking) unawaited(_tts.stop());
+          if (mounted) setState(() => _speaking = false);
+          break;
+        case 'turn_started':
+          final key = event['request_key']?.toString();
+          _pendingVoiceKey = key;
+          _pendingVoiceText = event['transcript']?.toString();
+          if (key != null) _voiceTurnInterruptions[key] = _voiceInterruptionCount;
+          break;
+        case 'turn':
+          final key = event['request_key']?.toString();
+          final added = (event['messages'] as List? ?? const [])
+              .map((item) => _body(item))
+              .toList();
+          if (mounted) {
+            setState(() {
+              _messages.removeWhere((row) => row['request_key'] == key);
+              _messages.addAll(added);
+              _emergency = event['emergency_warning'] == true;
+              _liveTranscript = '';
+            });
+          }
           _pendingVoiceKey = null;
           _pendingVoiceText = null;
-        }
-      } catch (_) {
-        setState(() => _error =
-            'Speech could not be confirmed. Your audio was not retained. Try again or use captions.');
+          final wasInterrupted = key != null &&
+              _voiceTurnInterruptions.remove(key) != _voiceInterruptionCount;
+          if (added.length > 1 && !wasInterrupted) {
+            unawaited(_speak(added.last['content'].toString()));
+          }
+          break;
+        case 'turn_error':
+          final key = event['request_key']?.toString();
+          _pendingVoiceKey = key;
+          _pendingVoiceText = event['transcript']?.toString();
+          if (key != null) _voiceTurnInterruptions.remove(key);
+          if (mounted) setState(() => _error = event['message']?.toString() ?? 'Voice turn failed. Retry the saved transcript.');
+          break;
+        case 'error':
+          if (mounted) setState(() => _error = event['message']?.toString());
+          break;
       }
-    } finally {
-      if (path != null) {
-        try {
-          await File(path).delete();
-        } catch (_) {}
-      }
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _recording = false;
-        });
-      }
+    } catch (_) {
+      if (mounted) setState(() => _error = 'The live voice service returned an invalid response.');
     }
+  }
+
+  Future<void> _toggleLiveMicrophone() async {
+    if (_voiceChannel == null) {
+      await _beginLiveVoice();
+      return;
+    }
+    try {
+      if (_recording) {
+        await _recorder.pause();
+        if (mounted) setState(() => _recording = false);
+      } else {
+        await _recorder.resume();
+        if (mounted) setState(() => _recording = true);
+      }
+    } catch (_) {
+      if (mounted) setState(() => _error = 'The microphone could not be toggled.');
+    }
+  }
+
+  Future<void> _stopLiveVoice() async {
+    await _audioSubscription?.cancel();
+    _audioSubscription = null;
+    await _voiceSubscription?.cancel();
+    _voiceSubscription = null;
+    try {
+      await _recorder.stop();
+    } catch (_) {}
+    await _voiceChannel?.sink.close();
+    _voiceChannel = null;
+    if (mounted) setState(() => _recording = false);
   }
 
   Future<void> _retryPendingVoice() async {
@@ -448,10 +502,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
 
   Future<void> _end() async {
     if (_sessionId == null || _loading || _ended) return;
-    if (_recording) {
-      await _recorder.cancel();
-      setState(() => _recording = false);
-    }
+    if (_virtual) await _stopLiveVoice();
     if (_speaking) await _tts.stop();
     setState(() {
       _loading = true;
@@ -500,11 +551,16 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           const Text(
               'You are speaking with an AI intake assistant, not a doctor. Your conversation and a draft summary will be shared securely with the doctor assigned to this appointment for review. The AI will not diagnose or prescribe.',
               style: TextStyle(height: 1.5)),
+          const Padding(
+              padding: EdgeInsets.only(top: 12),
+              child: Text(
+                  'Your doctor may also see up to three symptom-pattern matches from previously doctor-approved AI consultations at this hospital. The matches omit patient names and are shown only to your care team; they are not diagnoses or recommendations.',
+                  style: TextStyle(height: 1.5))),
           if (_virtual)
             const Padding(
                 padding: EdgeInsets.only(top: 12),
                 child: Text(
-                    'AI Virtual sends each recorded turn to the configured Cloudflare Workers AI speech recognition models. Your transcript and conversation are processed by the configured Cloudflare AI service and securely shared with your assigned doctor. Raw audio is deleted from this device after upload and is not retained by this feature.',
+                    'AI Virtual streams microphone audio to the configured Cloudflare Workers AI speech recognition service. VerityScribe does not save raw audio. Your transcript and conversation are securely shared with your assigned doctor.',
                     style: TextStyle(height: 1.5))),
           if (!_virtual)
             const Padding(
@@ -517,7 +573,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               onChanged: (v) => setState(() => _consented = v == true),
               contentPadding: EdgeInsets.zero,
               title: const Text(
-                  'I consent to AI processing and secure sharing with my assigned doctor.'),
+                  'I consent to AI processing, secure sharing with my assigned doctor, and de-identified symptom matching for my care team.'),
               controlAffinity: ListTileControlAffinity.leading),
           if (_error != null)
             Text(_error!, style: const TextStyle(color: Colors.red)),
@@ -682,6 +738,14 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               Center(
                   child: Text('Private voice session • $_duration',
                       style: const TextStyle(color: Color(0xFF667085)))),
+              if (_liveTranscript.isNotEmpty)
+                Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Card(
+                        child: Padding(
+                            padding: const EdgeInsets.all(14),
+                            child: Text('Live caption: $_liveTranscript',
+                                style: const TextStyle(height: 1.45))))),
               const SizedBox(height: 20),
               ..._messages.map(_messageBubble),
             ])),
@@ -712,7 +776,13 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                         label: const Text('Retry saved turn'))
                   else
                     GestureDetector(
-                        onTap: _recording ? _finishVoiceTurn : _beginVoiceTurn,
+                        onTap: _toggleLiveMicrophone,
+                        child: Tooltip(
+                            message: _voiceChannel == null
+                                ? 'Connect microphone'
+                                : _recording
+                                    ? 'Mute microphone'
+                                    : 'Unmute microphone',
                         child: AnimatedContainer(
                             duration: const Duration(milliseconds: 200),
                             width: 72,
@@ -721,11 +791,11 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                 shape: BoxShape.circle,
                                 color: _recording ? Colors.redAccent : _blue),
                             child: Icon(
-                                _recording
-                                    ? Icons.stop_rounded
+                                _voiceChannel == null || !_recording
+                                    ? Icons.mic_off_rounded
                                     : Icons.mic_rounded,
                                 color: Colors.white,
-                                size: 32))),
+                                size: 32)))),
                   const SizedBox(width: 16),
                   IconButton.filledTonal(
                       onPressed: _end,

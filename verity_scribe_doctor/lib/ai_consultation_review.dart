@@ -122,6 +122,11 @@ class _AIConsultationReviewScreenState
                 .toList();
             final status = session['status']?.toString() ?? 'in_progress';
             final canReview = status == 'awaiting_doctor_review';
+            final similarCases = Map<String, dynamic>.from(
+                (summary['similar_cases'] as Map?) ?? const {});
+            final similarMatches = (similarCases['matches'] as List? ?? const [])
+                .map((item) => Map<String, dynamic>.from(item as Map))
+                .toList();
             final consultationId = session['consultation_id']?.toString();
             final type = widget.appointment['consultation_type'] == 'ai_virtual'
                 ? 'AI Virtual'
@@ -163,8 +168,7 @@ class _AIConsultationReviewScreenState
                 _items('Evidence references', summary['evidence_references']),
                 _items('Uncertainties', summary['uncertainties']),
                 _items('Warnings', summary['warning_indicators']),
-                const Text(
-                    'Similar cases: no verified de-identified case corpus is configured. No matches were returned.'),
+                _similarCases(similarCases, similarMatches),
                 const SizedBox(height: 6),
                 const Text(
                     'Draft prescription: none generated. Any prescription must be created and signed separately by the doctor.',
@@ -265,5 +269,31 @@ class _AIConsultationReviewScreenState
                 : e.toString())
             .join('\n');
     return Text('$label: $text', style: const TextStyle(height: 1.4));
+  }
+
+  Widget _similarCases(Map<String, dynamic> data, List<Map<String, dynamic>> matches) {
+    final status = data['status']?.toString() ?? 'not_available';
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text('De-identified, doctor-approved symptom matches',
+          style: TextStyle(fontWeight: FontWeight.w700)),
+      const SizedBox(height: 6),
+      if (matches.isEmpty)
+        Text(status == 'no_matches'
+            ? 'No matching approved cases were found at this hospital.'
+            : status == 'unavailable'
+                ? 'Case matching is temporarily unavailable.'
+                : 'No matching cases are available for this consultation.'),
+      for (final match in matches)
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          title: Text((match['symptom_terms'] as List? ?? const [])
+              .map((term) => term.toString())
+              .join(', ')),
+          subtitle: const Text('Clinician-approved intake symptom pattern'),
+        ),
+      const Text(
+          'Matches are contextual examples only. They do not establish a diagnosis or recommend treatment.',
+          style: TextStyle(fontSize: 12, color: Colors.black54)),
+    ]);
   }
 }
