@@ -325,47 +325,59 @@ class _AppointmentCard extends StatelessWidget {
   const _AppointmentCard({required this.item});
   final dynamic item;
   @override
-  Widget build(BuildContext context) => SoftCard(
-      child: InkWell(
-          onTap: () => context.go('/record'),
-          borderRadius: BorderRadius.circular(18),
-          child: Row(children: [
-            Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                    color: const Color(0xFFEAF9F5),
-                    borderRadius: BorderRadius.circular(15)),
-                child: const Icon(Icons.calendar_month_rounded,
-                    color: AppTheme.emerald)),
-            const SizedBox(width: 13),
-            Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                  Text(
-                      item.doctorName.toString().isEmpty
-                          ? 'Doctor details unavailable'
-                          : item.doctorName,
-                      style: Theme.of(context)
-                          .textTheme
-                          .titleSmall
-                          ?.copyWith(fontWeight: FontWeight.w800)),
-                  Text(
-                      [item.department, item.hospital]
-                          .where((x) => x.toString().trim().isNotEmpty)
-                          .join(' • '),
-                      style:
-                          const TextStyle(fontSize: 12, color: AppTheme.muted))
-                ])),
-            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-              Text('${item.date} ${item.time}',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.w800, color: AppTheme.blue)),
-              Text(item.status.toString(),
-                  style: const TextStyle(fontSize: 12, color: AppTheme.blue))
-            ]),
-          ])));
+  Widget build(BuildContext context) {
+    final type = item.consultationType?.toString() ?? '';
+    final isAi = type == 'ai_chat' || type == 'ai_virtual';
+    return SoftCard(
+        child: InkWell(
+            onTap: () => isAi
+                ? context.push('/ai-appointment/${item.id}', extra: item)
+                : context.go('/record'),
+            borderRadius: BorderRadius.circular(18),
+            child: Row(children: [
+              Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                      color: const Color(0xFFEAF9F5),
+                      borderRadius: BorderRadius.circular(15)),
+                  child: const Icon(Icons.calendar_month_rounded,
+                      color: AppTheme.emerald)),
+              const SizedBox(width: 13),
+              Expanded(
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                    Text(
+                        item.doctorName.toString().isEmpty
+                            ? 'Doctor details unavailable'
+                            : item.doctorName,
+                        style: Theme.of(context)
+                            .textTheme
+                            .titleSmall
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                    Text(
+                        [item.department, item.hospital]
+                            .where((x) => x.toString().trim().isNotEmpty)
+                            .join(' • '),
+                        style: const TextStyle(
+                            fontSize: 12, color: AppTheme.muted))
+                  ])),
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('${item.date} ${item.time}',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w800, color: AppTheme.blue)),
+                Text(item.status.toString(),
+                    style: const TextStyle(fontSize: 12, color: AppTheme.blue)),
+                if (isAi)
+                  Text(type == 'ai_chat' ? 'AI Chat' : 'AI Virtual',
+                      style: const TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.emerald,
+                          fontWeight: FontWeight.w800))
+              ]),
+            ])));
+  }
 }
 
 class _MedicineRow extends StatelessWidget {

@@ -17,6 +17,7 @@ import '../app_shell.dart';
 import '../../features/live_care_screen.dart';
 import '../../features/live_clinical_screen.dart';
 import '../../features/live_health_record_screen.dart';
+import '../../features/ai_consultation_screen.dart';
 
 final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(path: '/', builder: (_, __) => const SplashScreen()),
@@ -43,6 +44,14 @@ final appRouter = GoRouter(initialLocation: '/', routes: [
   GoRoute(
       path: '/book-appointment',
       builder: (_, __) => const AppointmentBookingScreen()),
+  GoRoute(
+      path: '/ai-appointment/:id',
+      builder: (_, state) => AIAppointmentEntryScreen(
+          appointment: state.extra as LiveAppointment)),
+  GoRoute(
+      path: '/ai-consultation/:id',
+      builder: (_, state) =>
+          AIConsultationScreen(appointment: state.extra as LiveAppointment)),
   GoRoute(
       path: '/consultations-live',
       builder: (_, __) => const LiveConsultationsScreen()),

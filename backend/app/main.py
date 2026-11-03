@@ -6,6 +6,7 @@ from .core.config import settings
 from .routers.resources import resource_router
 from .routers.doctors import router as doctors_provision_router
 from .routers.integration import router as integration_router
+from .routers.ai_consultations import router as ai_consultations_router
 from .middleware import RequestContextMiddleware
 
 config = settings()
@@ -30,6 +31,7 @@ async def health() -> dict:
     return {"status": "ok", "environment": config.environment, "release": release[:12]}
 
 app.include_router(integration_router, prefix=config.api_prefix)
+app.include_router(ai_consultations_router, prefix=config.api_prefix)
 for name in ("patients", "doctors", "prescriptions", "reports", "insurance", "analytics", "admin", "voice"):
     app.include_router(resource_router(name), prefix=config.api_prefix)
 app.include_router(doctors_provision_router, prefix=config.api_prefix)

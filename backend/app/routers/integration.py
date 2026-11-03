@@ -42,6 +42,9 @@ class AppointmentCreate(BaseModel):
     appointment_fee: float | None = Field(default=None, ge=0)
 
 
+CONSULTATION_TYPES = {"in_person", "video", "phone", "chat", "ai_chat", "ai_virtual"}
+
+
 class ConsultationCreate(BaseModel):
     appointment_id: str
     symptoms: str | None = None
@@ -1501,6 +1504,8 @@ def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[
 
 @router.post("/appointments", status_code=status.HTTP_201_CREATED)
 def create_appointment(payload: AppointmentCreate, claims: dict = Depends(current_claims)):
+    if payload.consultation_type not in CONSULTATION_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported consultation type")
     client = db()
     role = claims.get("app_metadata", {}).get("role")
     if role == "patient":

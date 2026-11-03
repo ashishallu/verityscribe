@@ -337,7 +337,11 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                           value: 'in_person', child: Text('In person')),
                       DropdownMenuItem(value: 'video', child: Text('Video')),
                       DropdownMenuItem(value: 'phone', child: Text('Phone')),
-                      DropdownMenuItem(value: 'chat', child: Text('Chat'))
+                      DropdownMenuItem(value: 'chat', child: Text('Chat')),
+                      DropdownMenuItem(
+                          value: 'ai_chat', child: Text('AI Chat')),
+                      DropdownMenuItem(
+                          value: 'ai_virtual', child: Text('AI Virtual'))
                     ],
                     onChanged: (x) => setState(() => type = x ?? 'in_person'),
                     decoration: const InputDecoration(
@@ -473,7 +477,38 @@ class AppointmentsLiveScreen extends ConsumerWidget {
                               subtitle: Text(
                                   '${item.date} ${item.time}\n${item.hospital} • ${item.department}'),
                               isThreeLine: true,
-                              trailing: Text(item.status),
+                              trailing: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  Text(item.status),
+                                  if (item.consultationType == 'ai_chat' ||
+                                      item.consultationType == 'ai_virtual')
+                                    Container(
+                                      margin: const EdgeInsets.only(top: 5),
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 8, vertical: 3),
+                                      decoration: BoxDecoration(
+                                          color: const Color(0xFFE8F2FF),
+                                          borderRadius:
+                                              BorderRadius.circular(20)),
+                                      child: Text(
+                                          item.consultationType == 'ai_chat'
+                                              ? 'AI Chat'
+                                              : 'AI Virtual',
+                                          style: const TextStyle(
+                                              color: Color(0xFF205BD8),
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700)),
+                                    ),
+                                ],
+                              ),
+                              onTap: item.consultationType == 'ai_chat' ||
+                                      item.consultationType == 'ai_virtual'
+                                  ? () => context.push(
+                                      '/ai-appointment/${item.id}',
+                                      extra: item)
+                                  : null,
                             ),
                           ))
                       .toList(),
