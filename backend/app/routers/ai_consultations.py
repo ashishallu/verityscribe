@@ -57,10 +57,16 @@ def _session_or_404(client, session_id: str, patient_id: str | None = None, doct
         query = query.eq("patient_id", patient_id)
     if doctor_id:
         query = query.eq("doctor_id", doctor_id)
-    row = query.maybe_single().execute().data
+    row = _maybe_single_data(query)
     if not row:
         raise HTTPException(status_code=404, detail="AI consultation not found")
     return row
+
+
+def _maybe_single_data(query):
+    """Return the row or None; PostgREST's maybe_single execute can return None."""
+    response = query.maybe_single().execute()
+    return response.data if response is not None else None
 
 
 def _messages(client, session_id: str):
@@ -86,7 +92,9 @@ def start_consultation(appointment_id: str, payload: StartRequest, claims: dict 
     if not payload.consent:
         raise HTTPException(status_code=422, detail="AI consultation consent is required")
     client = db()
-    appointment = client.table("appointments").select("*").eq("id", appointment_id).eq("patient_id", patient["id"]).maybe_single().execute().data
+    appointment = _maybe_single_data(
+        client.table("appointments").select("*").eq("id", appointment_id).eq("patient_id", patient["id"])
+    )
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
     mode = appointment.get("consultation_type")
@@ -96,7 +104,9 @@ def start_consultation(appointment_id: str, payload: StartRequest, claims: dict 
         raise HTTPException(status_code=422, detail="Voice processing consent is required")
     if appointment.get("status") in {"cancelled", "completed", "no_show"}:
         raise HTTPException(status_code=409, detail="This appointment is no longer available")
-    existing = client.table("ai_consultation_sessions").select("*").eq("appointment_id", appointment_id).maybe_single().execute().data
+    existing = _maybe_single_data(
+        client.table("ai_consultation_sessions").select("*").eq("appointment_id", appointment_id)
+    )
     if existing:
         if existing["status"] in {"approved", "rejected"}:
             raise HTTPException(status_code=409, detail="This consultation has already been reviewed")
@@ -111,7 +121,9 @@ def start_consultation(appointment_id: str, payload: StartRequest, claims: dict 
         }).execute().data[0]
     except Exception:
         # Unique appointment_id makes racing starts idempotent.
-        session = client.table("ai_consultation_sessions").select("*").eq("appointment_id", appointment_id).maybe_single().execute().data
+        session = _maybe_single_data(
+            client.table("ai_consultation_sessions").select("*").eq("appointment_id", appointment_id)
+        )
         if not session:
             logger.exception("Unable to create AI consultation session")
             raise HTTPException(status_code=503, detail="Unable to start consultation")
@@ -474,16 +486,24 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
 @router.get("/doctor/appointments/{appointment_id}")
 def doctor_review_detail(appointment_id: str, doctor: dict = Depends(get_current_doctor)):
     client = db()
-    session = client.table("ai_consultation_sessions").select("*").eq("appointment_id", appointment_id).eq("doctor_id", doctor["id"]).maybe_single().execute().data
-    appointment = client.table("appointments").select("*").eq("id", appointment_id).eq("doctor_id", doctor["id"]).maybe_single().execute().data
+    session = _maybe_single_data(
+        client.table("ai_consultation_sessions").select("*").eq("appointment_id", appointment_id).eq("doctor_id", doctor["id"])
+    )
+    appointment = _maybe_single_data(
+        client.table("appointments").select("*").eq("id", appointment_id).eq("doctor_id", doctor["id"])
+    )
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
     if appointment.get("consultation_type") not in AI_TYPES:
         raise HTTPException(status_code=422, detail="This is not an AI consultation appointment")
     if not session:
-        patient = client.table("profiles").select("id,first_name,last_name").eq("id", appointment["patient_id"]).maybe_single().execute().data
+        patient = _maybe_single_data(
+            client.table("profiles").select("id,first_name,last_name").eq("id", appointment["patient_id"])
+        )
         return {"data": {"session": None, "messages": [], "appointment": appointment, "patient": patient}}
-    patient = client.table("profiles").select("id,first_name,last_name").eq("id", session["patient_id"]).maybe_single().execute().data
+    patient = _maybe_single_data(
+        client.table("profiles").select("id,first_name,last_name").eq("id", session["patient_id"])
+    )
     return {"data": {**_response(client, session, include_similar_cases=True), "appointment": appointment, "patient": patient}}
 
 
