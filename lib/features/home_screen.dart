@@ -49,7 +49,7 @@ class HomeScreen extends ConsumerWidget {
               label: const Text('Book an appointment'),
             ),
           ),
-          const SectionTitle('Today at a glance'),
+          const SectionTitle("Today's appointments"),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: appointments.when(
@@ -58,14 +58,25 @@ class HomeScreen extends ConsumerWidget {
                 label: 'Appointments are temporarily unavailable.',
                 onRetry: () => ref.invalidate(appointmentsLiveProvider),
               ),
-              data: (items) => _upcoming(items).isEmpty
-                  ? _EmptyCard(
-                      icon: Icons.calendar_today_outlined,
-                      title: 'No upcoming appointments',
-                      action: 'Book',
-                      onTap: () => context.go('/book-appointment'),
-                    )
-                  : _AppointmentCard(item: _upcoming(items).first),
+              data: (items) {
+                final today = _appointmentsForToday(items, DateTime.now());
+                if (today.isEmpty) {
+                  return _EmptyCard(
+                    icon: Icons.calendar_today_outlined,
+                    title: 'No appointments scheduled for today',
+                    action: 'Book',
+                    onTap: () => context.go('/book-appointment'),
+                  );
+                }
+                return Column(
+                  children: [
+                    for (var index = 0; index < today.length; index++) ...[
+                      if (index > 0) const SizedBox(height: 10),
+                      _AppointmentCard(item: today[index]),
+                    ],
+                  ],
+                );
+              },
             ),
           ),
           const SectionTitle("Today's medicines", action: 'View all'),
@@ -173,16 +184,11 @@ class HomeScreen extends ConsumerWidget {
   }
 }
 
-List<dynamic> _upcoming(List<dynamic> items) {
-  final result = items.where((item) {
-    final status = item.status.toString().toLowerCase();
-    if (status == 'completed' || status == 'cancelled' || status == 'no_show')
-      return false;
-    final scheduled = DateTime.tryParse('${item.date} ${item.time}');
-    return scheduled != null &&
-        scheduled.isAfter(DateTime.now().subtract(const Duration(minutes: 10)));
-  }).toList();
-  result.sort((a, b) => '${a.date} ${a.time}'.compareTo('${b.date} ${b.time}'));
+List<dynamic> _appointmentsForToday(List<dynamic> items, DateTime now) {
+  final today =
+      '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+  final result = items.where((item) => item.date.toString() == today).toList();
+  result.sort((a, b) => a.time.toString().compareTo(b.time.toString()));
   return result;
 }
 

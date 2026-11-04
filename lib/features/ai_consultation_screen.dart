@@ -134,7 +134,12 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       if (mounted) setState(() => _speaking = false);
     });
     _tts.setErrorHandler((_) {
-      if (mounted) setState(() => _speaking = false);
+      if (mounted) {
+        setState(() {
+          _speaking = false;
+          _error = 'Voice playback failed. Tap the speaker button to replay the response.';
+        });
+      }
     });
   }
 
@@ -215,15 +220,38 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   }
 
   Future<void> _speak(String text) async {
-    if (!_virtual || _muted || text.trim().isEmpty) return;
+    final response = text.trim();
+    if (!_virtual || _muted || response.isEmpty) return;
+    if (mounted) setState(() => _error = null);
     try {
-      await _tts.setSpeechRate(0.48);
-      await _tts.speak(text);
+      await _tts.setVolume(1.0);
+      await _tts.setSpeechRate(0.62);
+      final result = await _tts.speak(response);
+      if (result != 1 && mounted) {
+        setState(() => _error =
+            'Voice playback did not start. Tap the speaker button to try again.');
+      }
     } catch (_) {
       if (mounted) {
         setState(() => _error =
-            'Device speech output is unavailable. Captions remain available.');
+            'Voice playback failed. Tap the speaker button to replay the response.');
       }
+    }
+  }
+
+  Future<void> _toggleSpeech() async {
+    final muted = !_muted;
+    setState(() => _muted = muted);
+    if (muted) {
+      await _tts.stop();
+      return;
+    }
+    final lastAssistant = _messages.lastWhere(
+      (message) => message['role'] == 'assistant',
+      orElse: () => <String, dynamic>{},
+    );
+    if (lastAssistant.isNotEmpty) {
+      unawaited(_speak(lastAssistant['content']?.toString() ?? ''));
     }
   }
 
@@ -714,20 +742,20 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                 spreadRadius: 8)
                           ]),
                       child: Icon(
-                          _recording
-                              ? Icons.mic_rounded
-                              : _speaking
-                                  ? Icons.graphic_eq_rounded
+                          _speaking
+                              ? Icons.graphic_eq_rounded
+                              : _recording
+                                  ? Icons.mic_rounded
                                   : Icons.auto_awesome_rounded,
                           color: Colors.white,
                           size: 60))),
               const SizedBox(height: 14),
               Center(
                   child: Text(
-                      _recording
-                          ? 'Listening • microphone active'
-                          : _speaking
-                              ? 'Verity is speaking'
+                      _speaking
+                          ? 'Verity is speaking'
+                          : _recording
+                              ? 'Listening • microphone active'
                               : _loading
                                   ? 'Processing your turn…'
                                   : 'Ready when you are',
@@ -760,11 +788,10 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                 child:
                     Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                   IconButton.filledTonal(
-                      onPressed: () => setState(() {
-                            _muted = !_muted;
-                            if (_muted) _tts.stop();
-                          }),
-                      tooltip: _muted ? 'Unmute AI speech' : 'Mute AI speech',
+                      onPressed: _toggleSpeech,
+                      tooltip: _muted
+                          ? 'Unmute and replay last response'
+                          : 'Mute AI speech',
                       icon: Icon(_muted
                           ? Icons.volume_off_outlined
                           : Icons.volume_up_outlined)),
