@@ -191,7 +191,21 @@ def _send_message(client, session: dict[str, Any], content: str, request_key: st
             mode=session["mode"], history=history, message=content,
         )
     except Exception as exc:
-        logger.warning("AI consultation provider unavailable (%s)", type(exc).__name__)
+        reason = "unknown"
+        if isinstance(exc, RuntimeError):
+            message = str(exc)
+            prefix = "Cloudflare Workers AI request failed (HTTP "
+            if message.startswith(prefix) and message.endswith(")"):
+                status = message[len(prefix):-1]
+                if len(status) == 3 and status.isdigit():
+                    reason = f"http_{status}"
+            elif message == "Cloudflare Workers AI is not configured":
+                reason = "not_configured"
+            elif message == "Cloudflare Workers AI returned an unsuccessful response":
+                reason = "unsuccessful_response"
+            elif message == "Cloudflare Workers AI returned an empty answer":
+                reason = "empty_answer"
+        logger.warning("AI consultation provider unavailable (%s, reason=%s)", type(exc).__name__, reason)
         raise HTTPException(status_code=503, detail="Your message was saved. The AI reply is temporarily unavailable; you can retry your message.")
     try:
         assistant_message = client.table("ai_consultation_messages").insert({

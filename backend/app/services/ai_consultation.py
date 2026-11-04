@@ -62,6 +62,10 @@ def generate_reply(
     client: Client, *, patient_id: str, hospital_id: str, similar_case_consent: bool,
     mode: str, history: list[dict[str, Any]], message: str
 ) -> str:
+    greeting = re.sub(r"[^a-z]+", " ", message.casefold()).strip()
+    if greeting in {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}:
+        return "Hi! What would you like help with today? I’ll gather details for your doctor to review."
+
     context = patient_context(client, patient_id)
     patient_names = _patient_name_terms(client, patient_id)
     case_matches = _retrieve_similar_cases(
@@ -90,7 +94,7 @@ De-identified symptom patterns approved by clinicians at this hospital (may be e
 Recent conversation: {json.dumps(safe_history, ensure_ascii=False)}
 Patient's latest message: {message[:4000]}
 """
-    answer = ai_provider.answer(prompt)
+    answer = ai_provider.answer_consultation(prompt)
     return answer[:5000]
 
 
