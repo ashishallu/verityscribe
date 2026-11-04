@@ -835,7 +835,7 @@ class AIProvider:
         request = Request(
             url,
             data=json.dumps({
-                "messages": [{"role": "user", "content": prompt}],
+                "prompt": prompt,
                 "temperature": 0.1,
                 "max_tokens": max(64, min(1000, max_tokens)),
             }).encode("utf-8"),
