@@ -20,6 +20,7 @@ dependencies:
   supabase_flutter: ^2.8.3
   flutter_secure_storage: ^9.2.2
   record: ^6.0.0
+  flutter_sound: ^9.30.0
   web_socket_channel: ^3.0.3
   flutter_tts: ^4.2.5
   file_picker: ^8.1.6
@@ -41,3 +42,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/icon/verityscribe_app_icon.png
+    - assets/images/verity_voice_orb.png

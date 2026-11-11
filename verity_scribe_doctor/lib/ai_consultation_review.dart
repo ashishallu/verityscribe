@@ -122,11 +122,21 @@ class _AIConsultationReviewScreenState
                 .toList();
             final status = session['status']?.toString() ?? 'in_progress';
             final canReview = status == 'awaiting_doctor_review';
+            final incomplete = const {
+                  'incomplete',
+                  'ended_early',
+                  'summary_failed'
+                }.contains(summary['completion_status']) ||
+                summary['summary_generation_status'] == 'failed' ||
+                status == 'failed' ||
+                summary['interview_state'] == 'ended_early' ||
+                summary['interview_complete'] == false;
             final similarCases = Map<String, dynamic>.from(
                 (summary['similar_cases'] as Map?) ?? const {});
-            final similarMatches = (similarCases['matches'] as List? ?? const [])
-                .map((item) => Map<String, dynamic>.from(item as Map))
-                .toList();
+            final similarMatches =
+                (similarCases['matches'] as List? ?? const [])
+                    .map((item) => Map<String, dynamic>.from(item as Map))
+                    .toList();
             final consultationId = session['consultation_id']?.toString();
             final type = widget.appointment['consultation_type'] == 'ai_virtual'
                 ? 'AI Virtual'
@@ -141,26 +151,76 @@ class _AIConsultationReviewScreenState
                 Text(
                     '${widget.appointment['appointment_date'] ?? ''} ${widget.appointment['appointment_time'] ?? ''} • $type'),
                 Text('Status: ${status.replaceAll('_', ' ')}'),
+                if (summary['interview_state'] == 'ended_early')
+                  const Text(
+                      'The patient ended the voice interview early. Review the full transcript before acting on this draft.',
+                      style: TextStyle(
+                          color: Colors.deepOrange,
+                          fontWeight: FontWeight.w700)),
               ]),
-              _card('AI-generated clinical summary • edit before approval', [
-                const Text(
-                    'This is a draft. Confirm every fact against the transcript and patient record.',
-                    style: TextStyle(
-                        color: Colors.deepOrange, fontWeight: FontWeight.w600)),
-                TextField(
-                    controller: _summary,
-                    minLines: 4,
-                    maxLines: 9,
-                    enabled: canReview,
-                    decoration: const InputDecoration(
-                        labelText: 'Clinical summary',
-                        border: OutlineInputBorder())),
-              ]),
+              _card(
+                  incomplete
+                      ? 'Incomplete clinical intake summary • doctor review required'
+                      : 'Clinical intake summary • draft for doctor review',
+                  [
+                    Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 7),
+                        decoration: BoxDecoration(
+                            color: incomplete
+                                ? Colors.orange.withValues(alpha: .12)
+                                : _reviewBlue.withValues(alpha: .09),
+                            borderRadius: BorderRadius.circular(10)),
+                        child: Text(incomplete
+                            ? 'INCOMPLETE — do not treat unknowns as negative findings'
+                            : 'DRAFT — verify against source conversation and record')),
+                    _items(
+                        'Presenting complaint',
+                        summary['chief_complaint'] == null
+                            ? const []
+                            : [summary['chief_complaint']]),
+                    _items('Symptoms', summary['symptoms']),
+                    _items('Duration / onset', summary['onset_duration']),
+                    _items(
+                        'Severity / frequency', summary['severity_frequency']),
+                    _items(
+                        'Associated symptoms', summary['associated_symptoms']),
+                    _items('Relevant medical history',
+                        summary['relevant_history']),
+                    _items('Current medications', summary['medications']),
+                    _items('Allergies', summary['allergies']),
+                    _items('Additional notes', summary['additional_notes']),
+                    _items('Unanswered questions',
+                        summary['unanswered_questions']),
+                    _items('Information requiring clarification',
+                        summary['uncertainties']),
+                    const Text(
+                        'Source of truth remains the original conversation and verified patient record. Empty sections mean not documented, not confirmed absent.',
+                        style: TextStyle(
+                            color: Colors.deepOrange,
+                            fontWeight: FontWeight.w600)),
+                    TextField(
+                        controller: _summary,
+                        minLines: 4,
+                        maxLines: 9,
+                        enabled: canReview,
+                        decoration: const InputDecoration(
+                            labelText: 'Clinical summary',
+                            border: OutlineInputBorder())),
+                  ]),
               _card('Extracted clinical information', [
                 _items('Symptoms', summary['symptoms']),
+                _items('Onset and duration', summary['onset_duration']),
                 _items('Relevant history', summary['relevant_history']),
                 _items('Medications', summary['medications']),
                 _items('Allergies', summary['allergies']),
+                _items('Positive findings', summary['positive_findings']),
+                _items('Negative findings', summary['negative_findings']),
+                _items('Risk indicators', summary['risk_indicators']),
+                _items('Follow-up recommendations',
+                    summary['follow_up_recommendations']),
+                _items('Items requiring doctor review',
+                    summary['items_for_doctor_review']),
                 _items('Clinical considerations (unconfirmed)',
                     summary['clinical_considerations']),
                 _items('Suggested investigations',
@@ -174,17 +234,22 @@ class _AIConsultationReviewScreenState
                     'Draft prescription: none generated. Any prescription must be created and signed separately by the doctor.',
                     style: TextStyle(fontWeight: FontWeight.w600)),
               ]),
-              _card(
-                  'Complete transcript',
-                  messages.isEmpty
-                      ? [const Text('No messages saved yet.')]
-                      : messages
-                          .map((message) => Padding(
-                              padding: const EdgeInsets.only(bottom: 10),
-                              child: Text(
-                                  '${message['role'] == 'patient' ? 'Patient' : message['role'] == 'system' ? 'Doctor request' : 'Verity'}: ${message['content'] ?? ''}',
-                                  style: const TextStyle(height: 1.4))))
-                          .toList()),
+              _card('Source conversation • reference only', [
+                ExpansionTile(
+                    tilePadding: EdgeInsets.zero,
+                    title: Text('View ${messages.length} saved messages'),
+                    children: messages.isEmpty
+                        ? [const Text('No source messages were saved.')]
+                        : messages
+                            .map((message) => Padding(
+                                padding: const EdgeInsets.only(bottom: 10),
+                                child: Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: Text(
+                                        '${message['role'] == 'patient' ? 'Patient' : message['role'] == 'system' ? 'Doctor request' : 'Verity'}: ${message['content'] ?? ''}',
+                                        style: const TextStyle(height: 1.4)))))
+                            .toList()),
+              ]),
               if (canReview)
                 _card('Doctor review', [
                   TextField(
@@ -260,7 +325,7 @@ class _AIConsultationReviewScreenState
   Widget _items(String label, dynamic value) {
     final list = value is List ? value : const [];
     final text = list.isEmpty
-        ? 'None reported'
+        ? 'Not documented'
         : list
             .map((e) => e is Map
                 ? e.entries
@@ -271,7 +336,8 @@ class _AIConsultationReviewScreenState
     return Text('$label: $text', style: const TextStyle(height: 1.4));
   }
 
-  Widget _similarCases(Map<String, dynamic> data, List<Map<String, dynamic>> matches) {
+  Widget _similarCases(
+      Map<String, dynamic> data, List<Map<String, dynamic>> matches) {
     final status = data['status']?.toString() ?? 'not_available';
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('De-identified, doctor-approved symptom matches',

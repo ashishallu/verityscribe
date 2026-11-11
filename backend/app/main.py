@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
@@ -7,6 +8,7 @@ from .routers.resources import resource_router
 from .routers.doctors import router as doctors_provision_router
 from .routers.integration import router as integration_router
 from .routers.ai_consultations import router as ai_consultations_router
+from .services.gemini_live import gemini_live
 from .middleware import RequestContextMiddleware
 
 config = settings()
@@ -23,6 +25,34 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Upload-Id"],
     max_age=600,
 )
+
+
+@app.on_event("startup")
+async def warm_gemini_live_agent() -> None:
+    """Load the comparatively heavy ADK stack before the first patient call.
+
+    Keep startup/health responsive; the first voice request can safely await
+    the same lock-protected initializer while this background warm-up runs.
+    """
+    if not config.google_api_key:
+        logging.getLogger(__name__).info(
+            "AI Virtual warm-up skipped reason=google_api_key_not_configured",
+        )
+        return
+
+    async def initialize_in_background() -> None:
+        started = asyncio.get_running_loop().time()
+        initialized = await asyncio.to_thread(gemini_live.initialize)
+        logging.getLogger(__name__).info(
+            "AI Virtual warm-up complete initialized=%s elapsed_ms=%d error_type=%s",
+            initialized,
+            round((asyncio.get_running_loop().time() - started) * 1000),
+            gemini_live.initialization_error or "none",
+        )
+
+    app.state.gemini_live_warmup_task = asyncio.create_task(
+        initialize_in_background(),
+    )
 
 @app.get("/health")
 async def health() -> dict:

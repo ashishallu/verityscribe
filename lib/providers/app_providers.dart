@@ -6,8 +6,13 @@ import '../core/services/supabase_auth_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 final supabaseAuthProvider = Provider((_) => SupabaseAuthService());
-final apiClientProvider = Provider<ApiClient>((ref) =>
-    HttpApiClient(accessToken: ref.read(supabaseAuthProvider).accessToken));
+final apiClientProvider = Provider<ApiClient>((ref) {
+  final auth = ref.read(supabaseAuthProvider);
+  return HttpApiClient(
+    accessToken: auth.accessToken,
+    refreshAccessToken: auth.refreshAccessToken,
+  );
+});
 final authRepositoryProvider = Provider<AuthRepository>(
     (_) => SupabaseAuthRepository(Supabase.instance.client.auth));
 final healthRepositoryProvider = Provider<HealthRepository>(
@@ -62,47 +67,76 @@ final prescriptionsProvider = FutureProvider<List<Prescription>>(
     (ref) => ref.read(healthRepositoryProvider).prescriptions());
 final reportsProvider = FutureProvider<List<Report>>(
     (ref) => ref.read(healthRepositoryProvider).reports());
-final patientProfileProvider = FutureProvider<Patient>((ref) => ref.read(healthRepositoryProvider).patientProfile());
-final patientProfileDataProvider = FutureProvider<Map<String, dynamic>>((ref) async {
+final patientProfileProvider = FutureProvider<Patient>(
+    (ref) => ref.read(healthRepositoryProvider).patientProfile());
+final patientProfileDataProvider =
+    FutureProvider<Map<String, dynamic>>((ref) async {
   final client = ref.read(apiClientProvider);
-  final profileBody = Map<String, dynamic>.from((await client.get<dynamic>('/me')).data as Map);
-  final patientBody = Map<String, dynamic>.from((await client.get<dynamic>('/me/patient')).data as Map);
-  return {'profile': Map<String, dynamic>.from(profileBody['data'] as Map), 'patient': Map<String, dynamic>.from(patientBody['data'] as Map)};
+  final profileBody =
+      Map<String, dynamic>.from((await client.get<dynamic>('/me')).data as Map);
+  final patientBody = Map<String, dynamic>.from(
+      (await client.get<dynamic>('/me/patient')).data as Map);
+  return {
+    'profile': Map<String, dynamic>.from(profileBody['data'] as Map),
+    'patient': Map<String, dynamic>.from(patientBody['data'] as Map)
+  };
 });
-final hospitalsProvider = FutureProvider<List<Hospital>>((ref) => ref.read(healthRepositoryProvider).hospitals());
-final departmentsProvider = FutureProvider.family<List<Department>, String>((ref, hospitalId) => ref.read(healthRepositoryProvider).departments(hospitalId));
-final doctorsDirectoryProvider = FutureProvider<List<DoctorDirectoryItem>>((ref) => ref.read(healthRepositoryProvider).doctors());
-final appointmentsLiveProvider = FutureProvider<List<LiveAppointment>>((ref) => ref.read(healthRepositoryProvider).appointments());
-final patientConsultationsProvider = FutureProvider<List<Map<String,dynamic>>>((ref) => ref.read(healthRepositoryProvider).clinicalConsultations());
-final patientPrescriptionsProvider = FutureProvider<List<Map<String,dynamic>>>((ref) => ref.read(healthRepositoryProvider).prescriptionsLive());
-final patientReportsProvider = FutureProvider<List<Map<String,dynamic>>>((ref) => ref.read(healthRepositoryProvider).reportsLive());
-final patientMedicalRecordProvider = FutureProvider<Map<String, dynamic>>((ref) async {
-  final response = await ref.read(apiClientProvider).get<dynamic>('/patients/me/medical-record');
+final hospitalsProvider = FutureProvider<List<Hospital>>(
+    (ref) => ref.read(healthRepositoryProvider).hospitals());
+final departmentsProvider = FutureProvider.family<List<Department>, String>(
+    (ref, hospitalId) =>
+        ref.read(healthRepositoryProvider).departments(hospitalId));
+final doctorsDirectoryProvider = FutureProvider<List<DoctorDirectoryItem>>(
+    (ref) => ref.read(healthRepositoryProvider).doctors());
+final appointmentsLiveProvider = FutureProvider<List<LiveAppointment>>(
+    (ref) => ref.read(healthRepositoryProvider).appointments());
+final patientConsultationsProvider = FutureProvider<List<Map<String, dynamic>>>(
+    (ref) => ref.read(healthRepositoryProvider).clinicalConsultations());
+final patientPrescriptionsProvider = FutureProvider<List<Map<String, dynamic>>>(
+    (ref) => ref.read(healthRepositoryProvider).prescriptionsLive());
+final patientReportsProvider = FutureProvider<List<Map<String, dynamic>>>(
+    (ref) => ref.read(healthRepositoryProvider).reportsLive());
+final patientMedicalRecordProvider =
+    FutureProvider<Map<String, dynamic>>((ref) async {
+  final response = await ref
+      .read(apiClientProvider)
+      .get<dynamic>('/patients/me/medical-record');
   final body = Map<String, dynamic>.from(response.data as Map);
   return Map<String, dynamic>.from((body['data'] as Map?) ?? body);
 });
 final patientTimelineProvider = FutureProvider<List<dynamic>>((ref) async {
-  final response = await ref.read(apiClientProvider).get<dynamic>('/patients/me/timeline');
+  final response =
+      await ref.read(apiClientProvider).get<dynamic>('/patients/me/timeline');
   final body = Map<String, dynamic>.from(response.data as Map);
   return List<dynamic>.from((body['data'] as List?) ?? const []);
 });
-final patientInsuranceProvider = FutureProvider<Map<String, dynamic>>((ref) async {
-  final response = await ref.read(apiClientProvider).get<dynamic>('/me/insurance');
+final patientInsuranceProvider =
+    FutureProvider<Map<String, dynamic>>((ref) async {
+  final response =
+      await ref.read(apiClientProvider).get<dynamic>('/me/insurance');
   final body = Map<String, dynamic>.from(response.data as Map);
   return Map<String, dynamic>.from((body['data'] as Map?) ?? body);
 });
-final patientNotificationsProvider = FutureProvider<Map<String, dynamic>>((ref) async {
-  final response = await ref.read(apiClientProvider).get<dynamic>('/notifications');
+final patientNotificationsProvider =
+    FutureProvider<Map<String, dynamic>>((ref) async {
+  final response =
+      await ref.read(apiClientProvider).get<dynamic>('/notifications');
   final body = Map<String, dynamic>.from(response.data as Map);
-  return Map<String, dynamic>.from((body['data'] is List) ? body : ((body['data'] as Map?) ?? body));
+  return Map<String, dynamic>.from(
+      (body['data'] is List) ? body : ((body['data'] as Map?) ?? body));
 });
-final patientMedicationScheduleProvider = FutureProvider<List<dynamic>>((ref) async {
-  final response = await ref.read(apiClientProvider).get<dynamic>('/me/medication-schedules');
+final patientMedicationScheduleProvider =
+    FutureProvider<List<dynamic>>((ref) async {
+  final response = await ref
+      .read(apiClientProvider)
+      .get<dynamic>('/me/medication-schedules');
   final body = Map<String, dynamic>.from(response.data as Map);
   return List<dynamic>.from((body['data'] as List?) ?? const []);
 });
-final patientPharmacyOrdersProvider = FutureProvider<List<dynamic>>((ref) async {
-  final response = await ref.read(apiClientProvider).get<dynamic>('/me/pharmacy-orders');
+final patientPharmacyOrdersProvider =
+    FutureProvider<List<dynamic>>((ref) async {
+  final response =
+      await ref.read(apiClientProvider).get<dynamic>('/me/pharmacy-orders');
   final body = Map<String, dynamic>.from(response.data as Map);
   return List<dynamic>.from((body['data'] as List?) ?? const []);
 });

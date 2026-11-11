@@ -25,6 +25,7 @@ from ..services.document_ocr import (
     validate_image_dimensions,
 )
 from ..services.document_tables import format_result_row
+from ..services.appointment_expiry import appointment_expiry_payload, ensure_appointment_not_expired
 
 router = APIRouter(tags=["integration"])
 logger = logging.getLogger(__name__)
@@ -1535,6 +1536,7 @@ def me_doctor(doctor: dict = Depends(get_current_doctor)):
 
 
 def _appointment_detail(client: Client, appointment: dict) -> dict[str, Any]:
+    appointment = appointment_expiry_payload(appointment)
     patient = client.table("profiles").select("id,first_name,last_name,email,phone").eq("id", appointment["patient_id"]).maybe_single().execute().data
     doctor = client.table("doctors").select("*,profiles!inner(id,first_name,last_name,email,phone),hospitals!inner(id,name),departments!inner(id,name)").eq("id", appointment["doctor_id"]).maybe_single().execute().data
     return {**appointment, "patient": patient, "doctor": doctor}
@@ -1563,7 +1565,7 @@ def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[
     doctors_by_id = {row["id"]: row for row in doctors}
     return [
         {
-            **appointment,
+            **appointment_expiry_payload(appointment),
             "patient": patients_by_id.get(appointment["patient_id"]),
             "doctor": doctors_by_id.get(appointment["doctor_id"]),
         }
@@ -1655,11 +1657,12 @@ def appointment_detail(appointment_id: str, claims: dict = Depends(current_claim
 @router.post("/consultations", status_code=status.HTTP_201_CREATED)
 def create_consultation(payload: ConsultationCreate, doctor: dict = Depends(get_current_doctor)):
     client = db()
-    appointment = client.table("appointments").select("id,patient_id,doctor_id").eq("id", payload.appointment_id).maybe_single().execute().data
+    appointment = client.table("appointments").select("id,patient_id,doctor_id,appointment_date,appointment_time").eq("id", payload.appointment_id).maybe_single().execute().data
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
     if appointment.get("doctor_id") != doctor["id"]:
         raise HTTPException(status_code=403, detail="You cannot create a consultation for this appointment")
+    ensure_appointment_not_expired(appointment)
     existing = client.table("consultations").select("id").eq("appointment_id", payload.appointment_id).limit(1).execute().data
     if existing:
         raise HTTPException(status_code=409, detail="A consultation already exists for this appointment")
@@ -1965,9 +1968,10 @@ async def upload_consultation_voice(consultation_id: str, request: Request, audi
 async def upload_patient_voice_draft(appointment_id: str, request: Request, audio: UploadFile = File(...), patient: dict = Depends(get_current_patient)):
     """Create an appointment-scoped transcript draft; it never creates clinical records."""
     client = db()
-    appointment = client.table("appointments").select("id,patient_id,doctor_id,status").eq("id", appointment_id).maybe_single().execute().data
+    appointment = client.table("appointments").select("id,patient_id,doctor_id,status,appointment_date,appointment_time").eq("id", appointment_id).maybe_single().execute().data
     if not appointment or appointment.get("patient_id") != patient["id"]:
         raise HTTPException(status_code=404, detail="Appointment not found")
+    ensure_appointment_not_expired(appointment)
     if appointment.get("status") in {"cancelled", "no_show"}:
         raise HTTPException(status_code=422, detail="Voice drafts are unavailable for this appointment")
     content = await audio.read()

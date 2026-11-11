@@ -1,6 +1,8 @@
 fastapi==0.115.8
 uvicorn[standard]==0.34.0
 websockets>=14,<16
+google-genai==1.36.0
+google-adk==1.15.0
 pydantic-settings==2.7.1
 supabase==2.33.0
 python-jose[cryptography]==3.3.0

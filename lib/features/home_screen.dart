@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../models/entities.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ui.dart';
@@ -49,7 +50,7 @@ class HomeScreen extends ConsumerWidget {
               label: const Text('Book an appointment'),
             ),
           ),
-          const SectionTitle("Today's appointments"),
+          const SectionTitle('Upcoming appointments'),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: appointments.when(
@@ -59,20 +60,20 @@ class HomeScreen extends ConsumerWidget {
                 onRetry: () => ref.invalidate(appointmentsLiveProvider),
               ),
               data: (items) {
-                final today = _appointmentsForToday(items, DateTime.now());
-                if (today.isEmpty) {
+                final upcoming = filterUpcomingAppointments(items);
+                if (upcoming.isEmpty) {
                   return _EmptyCard(
                     icon: Icons.calendar_today_outlined,
-                    title: 'No appointments scheduled for today',
+                    title: 'No upcoming appointments',
                     action: 'Book',
                     onTap: () => context.go('/book-appointment'),
                   );
                 }
                 return Column(
                   children: [
-                    for (var index = 0; index < today.length; index++) ...[
+                    for (var index = 0; index < upcoming.length; index++) ...[
                       if (index > 0) const SizedBox(height: 10),
-                      _AppointmentCard(item: today[index]),
+                      _AppointmentCard(item: upcoming[index]),
                     ],
                   ],
                 );
@@ -184,14 +185,6 @@ class HomeScreen extends ConsumerWidget {
   }
 }
 
-List<dynamic> _appointmentsForToday(List<dynamic> items, DateTime now) {
-  final today =
-      '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-  final result = items.where((item) => item.date.toString() == today).toList();
-  result.sort((a, b) => a.time.toString().compareTo(b.time.toString()));
-  return result;
-}
-
 class _Header extends StatelessWidget {
   const _Header({required this.profile});
   final AsyncValue<dynamic> profile;
@@ -244,6 +237,12 @@ class _CareSummary extends StatelessWidget {
         data: (items) => items is List ? '${items.length}' : '0',
         loading: () => '…',
         error: (_, __) => '—');
+    final upcomingCount = appointments.when(
+      data: (items) =>
+          '${filterUpcomingAppointments((items as List).whereType<LiveAppointment>()).length}',
+      loading: () => '…',
+      error: (_, __) => '—',
+    );
     return SoftCard(
       color: isDark ? const Color(0xFF202C43) : const Color(0xFFEAF2FF),
       child: Row(children: [
@@ -258,7 +257,7 @@ class _CareSummary extends StatelessWidget {
                   color: scheme.onSurface, fontWeight: FontWeight.w800)),
           const SizedBox(height: 5),
           Text(
-              '${count(appointments)} appointments • ${count(medicines)} medicines • ${count(reports)} reports',
+              '$upcomingCount upcoming appointments • ${count(medicines)} medicines • ${count(reports)} reports',
               style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12)),
         ])),
       ]),

@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     supabase_service_role_key: str = ""
     supabase_jwt_secret: str = ""
     huggingface_token: str = ""
+    google_api_key: str = ""
+    gemini_live_model: str = "gemini-2.5-flash-native-audio-preview-12-2025"
+    gemini_live_voice: str = "Aoede"
     cors_origins: str = DEFAULT_CORS_ORIGINS
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
