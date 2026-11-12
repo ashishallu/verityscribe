@@ -11,6 +11,30 @@ from app.routers import ai_consultations
 from app.services import gemini_live as gemini_live_module
 
 
+def test_interrupted_gemini_event_drops_stale_caption_and_audio():
+    stale = SimpleNamespace(
+        interrupted=True,
+        content=SimpleNamespace(parts=[SimpleNamespace(
+            inline_data=SimpleNamespace(data=b"cancelled-pcm"),
+        )]),
+        output_transcription=SimpleNamespace(text="cancelled caption"),
+    )
+    current = SimpleNamespace(
+        interrupted=False,
+        content=SimpleNamespace(parts=[SimpleNamespace(
+            inline_data=SimpleNamespace(data=b"current-pcm"),
+        )]),
+        output_transcription=SimpleNamespace(text="current caption"),
+    )
+
+    stale_caption, stale_audio = ai_consultations._live_assistant_output(stale)
+    current_caption, current_audio = ai_consultations._live_assistant_output(current)
+    assert stale_caption is None
+    assert stale_audio == []
+    assert current_caption.text == "current caption"
+    assert current_audio == [b"current-pcm"]
+
+
 def test_ai_virtual_cannot_fall_back_to_http_llm(monkeypatch):
     monkeypatch.setattr(ai_consultations, "get_current_patient", lambda _claims: {"id": "patient-1"})
     monkeypatch.setattr(ai_consultations, "db", lambda: object())
@@ -94,6 +118,7 @@ def test_local_web_origin_is_allowed_but_unknown_remote_origin_is_not():
 @pytest.mark.parametrize("disconnect", [False, True])
 @pytest.mark.parametrize("rpc_data", [True, False])
 def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc_data, caplog):
+    caplog.set_level("INFO")
     session_id = str(uuid.uuid4())
     ticket_id = str(uuid.uuid4())
     persisted = []

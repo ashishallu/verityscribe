@@ -164,7 +164,7 @@ def test_expired_appointment_cannot_bypass_expiry_with_existing_voice_ticket(mon
 
     asyncio.run(ai_consultations.voice_stream(socket, session_id))
 
-    assert socket.close_info["code"] == 4401
+    assert socket.close_info["code"] == 4403
     assert "unavailable" in socket.close_info["reason"].lower()
 
 

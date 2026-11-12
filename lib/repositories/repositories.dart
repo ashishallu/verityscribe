@@ -6,8 +6,10 @@ abstract class AuthRepository {
   Future<UserModel> login(String email, String password);
   Future<UserModel> register(String name, String email, String password);
   Future<bool> verifyOtp(String code);
+  Future<UserModel?> restoreSession();
+  Stream<UserModel?> get authChanges;
+  Future<void> signOut();
 }
-
 
 class SupabaseAuthRepository implements AuthRepository {
   SupabaseAuthRepository(this._auth);
@@ -38,18 +40,51 @@ class SupabaseAuthRepository implements AuthRepository {
 
   @override
   Future<bool> verifyOtp(String code) async => code.length == 6;
+
+  @override
+  Stream<UserModel?> get authChanges => _auth.onAuthStateChange.map(
+      (event) => event.session == null ? null : _model(event.session!.user));
+
+  @override
+  Future<UserModel?> restoreSession() async {
+    final session = _auth.currentSession;
+    if (session == null) return null;
+    if (!session.isExpired) return _model(session.user);
+
+    try {
+      final response = await _auth.refreshSession();
+      final user = response.user ?? _auth.currentUser;
+      return user == null ? null : _model(user);
+    } catch (_) {
+      // Supabase clears the local session for an invalid/revoked refresh token.
+      // Preserve an expired session on transient network errors and surface a
+      // bootstrap error instead of silently sending the user to sign in.
+      if (_auth.currentSession == null) return null;
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> signOut() => _auth.signOut();
 }
 
 abstract class HealthRepository {
-  Future<List<Map<String,dynamic>>> clinicalConsultations();
-  Future<List<Map<String,dynamic>>> prescriptionsLive();
-  Future<List<Map<String,dynamic>>> reportsLive();
+  Future<List<Map<String, dynamic>>> clinicalConsultations();
+  Future<List<Map<String, dynamic>>> prescriptionsLive();
+  Future<List<Map<String, dynamic>>> reportsLive();
   Future<Patient> patientProfile();
   Future<List<Hospital>> hospitals();
   Future<List<Department>> departments(String hospitalId);
   Future<List<DoctorDirectoryItem>> doctors();
   Future<List<LiveAppointment>> appointments();
-  Future<LiveAppointment> bookAppointment({required String doctorId, required String hospitalId, required String date, required String time, required String consultationType, String? reason, String? notes});
+  Future<LiveAppointment> bookAppointment(
+      {required String doctorId,
+      required String hospitalId,
+      required String date,
+      required String time,
+      required String consultationType,
+      String? reason,
+      String? notes});
   Future<List<Medicine>> medicines();
   Future<List<Consultation>> consultations();
   Future<Appointment> nextAppointment();
@@ -67,33 +102,115 @@ class ApiHealthRepository implements HealthRepository {
     final root = _row(value);
     return (root['data'] as List? ?? const []).map(_row).toList();
   }
-  @override Future<List<Map<String,dynamic>>> clinicalConsultations() async => _rows((await _client.get<dynamic>('/me/consultations')).data);
-  @override Future<List<Map<String,dynamic>>> prescriptionsLive() async => _rows((await _client.get<dynamic>('/me/prescriptions')).data);
-  @override Future<List<Map<String,dynamic>>> reportsLive() async => _rows((await _client.get<dynamic>('/me/reports')).data);
-  @override Future<Patient> patientProfile() async { final profile=_row((await _client.get<dynamic>('/me')).data)['data']; final x=_row((await _client.get<dynamic>('/me/patient')).data)['data']; final date=DateTime.tryParse((x['date_of_birth']??profile['date_of_birth']??'').toString()); if(date==null) throw const ApiException('Patient date of birth is unavailable.'); return Patient(id:x['id'].toString(),name:'${profile['first_name']??''} ${profile['last_name']??''}'.trim(),email:(profile['email']??'').toString(),medicalId:(x['mrn']??x['id']).toString(),dateOfBirth:date); }
-  @override Future<List<Hospital>> hospitals() async => _rows((await _client.get<dynamic>('/hospitals')).data).map(Hospital.fromJson).toList();
-  @override Future<List<Department>> departments(String hospitalId) async => _rows((await _client.get<dynamic>('/hospitals/$hospitalId/departments')).data).map(Department.fromJson).toList();
-  @override Future<List<DoctorDirectoryItem>> doctors() async => _rows((await _client.get<dynamic>('/doctors')).data).map(DoctorDirectoryItem.fromJson).toList();
-  @override Future<List<LiveAppointment>> appointments() async { final root=_row((await _client.get<dynamic>('/me/appointments')).data); return (root['data'] as List? ?? const []).map((x)=>LiveAppointment.fromJson(_row(x))).toList(); }
-  @override Future<LiveAppointment> bookAppointment({required String doctorId,required String hospitalId,required String date,required String time,required String consultationType,String? reason,String? notes}) async { final root=_row((await _client.post<dynamic>('/appointments',{'doctor_id':doctorId,'hospital_id':hospitalId,'appointment_date':date,'appointment_time':time,'consultation_type':consultationType,if(reason?.trim().isNotEmpty==true)'reason_for_visit':reason,if(notes?.trim().isNotEmpty==true)'notes':notes})).data); return LiveAppointment.fromJson(_row(root['data'])); }
+
+  @override
+  Future<List<Map<String, dynamic>>> clinicalConsultations() async =>
+      _rows((await _client.get<dynamic>('/me/consultations')).data);
+  @override
+  Future<List<Map<String, dynamic>>> prescriptionsLive() async =>
+      _rows((await _client.get<dynamic>('/me/prescriptions')).data);
+  @override
+  Future<List<Map<String, dynamic>>> reportsLive() async =>
+      _rows((await _client.get<dynamic>('/me/reports')).data);
+  @override
+  Future<Patient> patientProfile() async {
+    final profile = _row((await _client.get<dynamic>('/me')).data)['data'];
+    final x = _row((await _client.get<dynamic>('/me/patient')).data)['data'];
+    final date = DateTime.tryParse(
+        (x['date_of_birth'] ?? profile['date_of_birth'] ?? '').toString());
+    if (date == null)
+      throw const ApiException('Patient date of birth is unavailable.');
+    return Patient(
+        id: x['id'].toString(),
+        name: '${profile['first_name'] ?? ''} ${profile['last_name'] ?? ''}'
+            .trim(),
+        email: (profile['email'] ?? '').toString(),
+        medicalId: (x['mrn'] ?? x['id']).toString(),
+        dateOfBirth: date);
+  }
+
+  @override
+  Future<List<Hospital>> hospitals() async =>
+      _rows((await _client.get<dynamic>('/hospitals')).data)
+          .map(Hospital.fromJson)
+          .toList();
+  @override
+  Future<List<Department>> departments(String hospitalId) async =>
+      _rows((await _client.get<dynamic>('/hospitals/$hospitalId/departments'))
+              .data)
+          .map(Department.fromJson)
+          .toList();
+  @override
+  Future<List<DoctorDirectoryItem>> doctors() async =>
+      _rows((await _client.get<dynamic>('/doctors')).data)
+          .map(DoctorDirectoryItem.fromJson)
+          .toList();
+  @override
+  Future<List<LiveAppointment>> appointments() async {
+    final root = _row((await _client.get<dynamic>('/me/appointments')).data);
+    return (root['data'] as List? ?? const [])
+        .map((x) => LiveAppointment.fromJson(_row(x)))
+        .toList();
+  }
+
+  @override
+  Future<LiveAppointment> bookAppointment(
+      {required String doctorId,
+      required String hospitalId,
+      required String date,
+      required String time,
+      required String consultationType,
+      String? reason,
+      String? notes}) async {
+    final root = _row((await _client.post<dynamic>('/appointments', {
+      'doctor_id': doctorId,
+      'hospital_id': hospitalId,
+      'appointment_date': date,
+      'appointment_time': time,
+      'consultation_type': consultationType,
+      if (reason?.trim().isNotEmpty == true) 'reason_for_visit': reason,
+      if (notes?.trim().isNotEmpty == true) 'notes': notes
+    }))
+        .data);
+    return LiveAppointment.fromJson(_row(root['data']));
+  }
 
   @override
   Future<List<Medicine>> medicines() async {
-    final prescriptions = _rows((await _client.get<dynamic>('/me/prescriptions')).data);
-    return prescriptions.expand((prescription) => (prescription['items'] as List? ?? const []).map((item) {
-      final row = _row(item);
-      final medicine = _row(row['medicine'] ?? const {});
-      final quantity = (row['quantity'] as num? ?? 0).toInt();
-      return Medicine(id: row['medicine_id'].toString(), name: (medicine['name'] ?? '').toString(), dosage: (row['dosage'] ?? '').toString(), purpose: (medicine['description'] ?? '').toString(), schedule: (row['frequency'] ?? '').toString(), remaining: quantity, initialQuantity: quantity, dailyUsage: 0);
-    })).toList();
+    final prescriptions =
+        _rows((await _client.get<dynamic>('/me/prescriptions')).data);
+    return prescriptions
+        .expand((prescription) =>
+            (prescription['items'] as List? ?? const []).map((item) {
+              final row = _row(item);
+              final medicine = _row(row['medicine'] ?? const {});
+              final quantity = (row['quantity'] as num? ?? 0).toInt();
+              return Medicine(
+                  id: row['medicine_id'].toString(),
+                  name: (medicine['name'] ?? '').toString(),
+                  dosage: (row['dosage'] ?? '').toString(),
+                  purpose: (medicine['description'] ?? '').toString(),
+                  schedule: (row['frequency'] ?? '').toString(),
+                  remaining: quantity,
+                  initialQuantity: quantity,
+                  dailyUsage: 0);
+            }))
+        .toList();
   }
+
   @override
   Future<List<Consultation>> consultations() async =>
       _rows((await _client.get<dynamic>('/consultations')).data)
           .map((x) {
-            final date = DateTime.tryParse((x['consultation_date'] ?? x['created_at'] ?? '').toString());
+            final date = DateTime.tryParse(
+                (x['consultation_date'] ?? x['created_at'] ?? '').toString());
             if (date == null) return null;
-            return Consultation(id: x['id'] as String, doctorName: (x['doctor_name'] ?? 'Not available') as String, summary: (x['treatment_plan'] ?? 'Not available') as String, diagnosis: (x['diagnosis'] ?? 'Not available') as String, date: date);
+            return Consultation(
+                id: x['id'] as String,
+                doctorName: (x['doctor_name'] ?? 'Not available') as String,
+                summary: (x['treatment_plan'] ?? 'Not available') as String,
+                diagnosis: (x['diagnosis'] ?? 'Not available') as String,
+                date: date);
           })
           .whereType<Consultation>()
           .toList();
@@ -107,7 +224,8 @@ class ApiHealthRepository implements HealthRepository {
     }
     final x = rows.first;
     final scheduledAt = DateTime.tryParse((x['scheduled_at'] ?? '').toString());
-    if (scheduledAt == null) throw const ApiException('Appointment date is unavailable.');
+    if (scheduledAt == null)
+      throw const ApiException('Appointment date is unavailable.');
     return Appointment(
         id: x['id'] as String,
         doctor: Doctor(
@@ -125,15 +243,25 @@ class ApiHealthRepository implements HealthRepository {
   @override
   Future<List<Prescription>> prescriptions() async =>
       _rows((await _client.get<dynamic>('/prescriptions')).data)
-          .map((row) => Prescription(id: row['id'] as String, consultationId: (row['consultation_id'] ?? '') as String, medicines: const []))
+          .map((row) => Prescription(
+              id: row['id'] as String,
+              consultationId: (row['consultation_id'] ?? '') as String,
+              medicines: const []))
           .toList();
   @override
   Future<List<Report>> reports() async =>
       _rows((await _client.get<dynamic>('/reports')).data)
           .map((row) {
-            final date = DateTime.tryParse((row['report_date'] ?? row['created_at'] ?? '').toString());
+            final date = DateTime.tryParse(
+                (row['report_date'] ?? row['created_at'] ?? '').toString());
             if (date == null) return null;
-            return Report(id: row['id'] as String, title: (row['title'] ?? row['report_type'] ?? 'Not available').toString(), category: (row['category'] ?? 'Not available').toString(), url: (row['file_url'] ?? '').toString(), date: date);
+            return Report(
+                id: row['id'] as String,
+                title: (row['title'] ?? row['report_type'] ?? 'Not available')
+                    .toString(),
+                category: (row['category'] ?? 'Not available').toString(),
+                url: (row['file_url'] ?? '').toString(),
+                date: date);
           })
           .whereType<Report>()
           .toList();

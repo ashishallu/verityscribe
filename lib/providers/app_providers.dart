@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'dart:async';
 import '../models/entities.dart';
 import '../repositories/repositories.dart';
 import '../core/services/api_service.dart';
@@ -23,7 +24,63 @@ final authStateProvider =
 
 class AuthNotifier extends StateNotifier<AsyncValue<UserModel?>> {
   final AuthRepository _repo;
-  AuthNotifier(this._repo) : super(const AsyncData(null));
+  late final StreamSubscription<UserModel?> _authSubscription;
+  bool _bootstrapping = true;
+  bool _sessionRestoreFailed = false;
+  bool _hasPendingAuthEvent = false;
+  UserModel? _pendingAuthUser;
+
+  bool get isBootstrapping => _bootstrapping;
+  bool get sessionRestoreFailed => _sessionRestoreFailed;
+
+  AuthNotifier(this._repo) : super(const AsyncLoading()) {
+    _authSubscription = _repo.authChanges.listen(
+      (user) {
+        if (_bootstrapping) {
+          _hasPendingAuthEvent = true;
+          _pendingAuthUser = user;
+          return;
+        }
+        state = AsyncData(user);
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        if (_bootstrapping) return;
+        // A transient auth-stream error must not erase a restored session.
+        if (state.valueOrNull == null) state = AsyncError(error, stackTrace);
+      },
+    );
+    unawaited(restoreSession());
+  }
+
+  Future<void> restoreSession() async {
+    _bootstrapping = true;
+    _sessionRestoreFailed = false;
+    _hasPendingAuthEvent = false;
+    _pendingAuthUser = null;
+    state = const AsyncLoading();
+    try {
+      final restoredUser = await _repo.restoreSession();
+      if (!mounted) return;
+      // An auth event may arrive while restoration is awaiting a token refresh.
+      // Prefer the latest event (including a signed-out/null event) so a stale
+      // restored session cannot overwrite a concurrent sign-out or account swap.
+      final user = _hasPendingAuthEvent ? _pendingAuthUser : restoredUser;
+      _bootstrapping = false;
+      _sessionRestoreFailed = false;
+      state = AsyncData(user);
+    } catch (error, stackTrace) {
+      if (!mounted) return;
+      _bootstrapping = false;
+      _sessionRestoreFailed = true;
+      if (_hasPendingAuthEvent) {
+        _sessionRestoreFailed = false;
+        state = AsyncData(_pendingAuthUser);
+      } else {
+        state = AsyncError(error, stackTrace);
+      }
+    }
+  }
+
   Future<bool> login(String email, String password) async {
     state = const AsyncLoading();
     try {
@@ -47,7 +104,13 @@ class AuthNotifier extends StateNotifier<AsyncValue<UserModel?>> {
   }
 
   Future<bool> verifyOtp(String code) => _repo.verifyOtp(code);
-  void logout() => state = const AsyncData(null);
+  Future<void> logout() => _repo.signOut();
+
+  @override
+  void dispose() {
+    unawaited(_authSubscription.cancel());
+    super.dispose();
+  }
 }
 
 final loginProvider = Provider((ref) => ref.read(authStateProvider.notifier));

@@ -13,6 +13,19 @@ def test_gemini_live_stays_unconfigured_without_backend_key():
     assert not service.configured
 
 
+def test_live_model_defaults_to_documented_target_and_keeps_rollback(monkeypatch):
+    monkeypatch.delenv("GEMINI_LIVE_MODEL", raising=False)
+    assert Settings(_env_file=None).gemini_live_model == "gemini-3.8-live"
+
+    monkeypatch.setenv(
+        "GEMINI_LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
+    )
+    assert (
+        Settings(_env_file=None).gemini_live_model
+        == "gemini-2.5-flash-native-audio-preview-12-2025"
+    )
+
+
 def test_tool_callbacks_resolve_session_from_adk_state_not_session_attribute():
     context = SimpleNamespace(state={"ai_consultation_session_id": "consultation-123"})
 
@@ -66,6 +79,7 @@ def test_adk_live_run_config():
     service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
     service.model = "gemini-2.5-flash-native-audio-preview-12-2025"
     service.voice = "Aoede"
+    service.silence_duration_ms = 700
     service.agent = object()
     service.runner = object()
     service.sessions = object()
@@ -80,6 +94,11 @@ def test_adk_live_run_config():
     assert run_config.speech_config.voice_config.prebuilt_voice_config.voice_name == "Aoede"
     assert run_config.input_audio_transcription is not None
     assert run_config.output_audio_transcription is not None
+    assert run_config.realtime_input_config is not None
+    vad = run_config.realtime_input_config.automatic_activity_detection
+    assert vad is not None
+    assert vad.disabled is False
+    assert vad.silence_duration_ms == 700
     # The installed Gemini API SDK rejects session_resumption.transparent.
     # Omit it unless the provider API explicitly supports this option.
     assert run_config.session_resumption is None
@@ -101,14 +120,23 @@ def test_virtual_summary_uses_gemini_json_and_preserves_incomplete_state():
             }))
 
     service.summary_client = SimpleNamespace(models=Models())
+    service.summary_model = "test-fast-summary-model"
+    transcript = [
+        {"role": "patient", "content": f"Earlier detail {index}: right knee pain."}
+        for index in range(105)
+    ]
+    transcript.extend([
+        {"role": "assistant", "content": "Did you have surgery on that knee?"},
+        {"role": "patient", "content": "Yes, three years ago."},
+    ])
     summary = service.generate_consultation_summary(
-        transcript=[{"role": "patient", "content": "I have a headache for two days."}],
+        transcript=transcript,
         patient_context={"allergies": []}, appointment={"id": "appt-1"},
         interview_complete=False,
     )
 
     assert gemini_live_module.SUMMARY_MODEL == "gemini-3.8-flash"
-    assert request["model"] == "gemini-3.8-flash"
+    assert request["model"] == "test-fast-summary-model"
     assert request["config"]["response_mime_type"] == "application/json"
     # Gemini 3.8 Flash no longer accepts legacy sampling parameters such as
     # temperature; sending one makes structured summaries fail and invokes
@@ -117,3 +145,21 @@ def test_virtual_summary_uses_gemini_json_and_preserves_incomplete_state():
     assert summary["interview_complete"] is False
     assert summary["review_required"] is True
     assert summary["draft_prescription"] is None
+    serialized = request["contents"]
+    assert "Earlier detail 0" in serialized
+    assert "Earlier detail 104" in serialized
+    assert "three years ago" in serialized
+    assert "assistant messages are questions/context only" in serialized.lower()
+    assert "Consultation Summary (2-3 coherent paragraphs)" in serialized
+    assert "Doctor's Advice & Treatment Plan" in serialized
+    assert "Final Impression must say clinical assessment pending" in serialized
+    assert "Do not expose ASR placeholders" in serialized
+
+
+def test_summary_model_is_configurable_without_changing_live_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+    monkeypatch.setenv("GEMINI_SUMMARY_MODEL", "gemini-3.8-flash")
+    cfg = Settings(_env_file=None)
+
+    assert cfg.gemini_live_model == "gemini-3.8-live"
+    assert cfg.gemini_summary_model == "gemini-3.8-flash"

@@ -4,14 +4,307 @@ import 'package:go_router/go_router.dart';
 import '../../providers/app_providers.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/ui.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-class SplashScreen extends StatefulWidget { const SplashScreen({super.key}); @override State<SplashScreen> createState() => _SplashScreenState(); }
-class _SplashScreenState extends State<SplashScreen> { @override void initState() { super.initState(); Future.delayed(const Duration(milliseconds: 1300), () { if (mounted) context.go('/onboarding'); }); } @override Widget build(BuildContext context) => const Scaffold(body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [AppLogo(), SizedBox(height: 15), Text('VerityScribe', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800)), SizedBox(height: 5), Text('Care, clearly understood.', style: TextStyle(color: AppTheme.muted))]))); }
-class IntroScreen extends StatelessWidget { final String title, body, next; const IntroScreen({required this.title, required this.body, required this.next, super.key}); @override Widget build(BuildContext c) => Scaffold(body: SafeArea(child: Padding(padding: const EdgeInsets.all(28), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Spacer(), const AppLogo(), const SizedBox(height: 35), Text(title, style: Theme.of(c).textTheme.displaySmall?.copyWith(fontWeight: FontWeight.w800)), const SizedBox(height: 15), Text(body, style: const TextStyle(color: AppTheme.muted, height: 1.55, fontSize: 16)), const Spacer(), FilledButton(onPressed: () => c.go(next), style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(56), backgroundColor: AppTheme.blue), child: const Text('Continue'))])))); }
-class LoginScreen extends ConsumerStatefulWidget { const LoginScreen({super.key}); @override ConsumerState<LoginScreen> createState() => _LoginScreenState(); }
-class _LoginScreenState extends ConsumerState<LoginScreen> { final email = TextEditingController(); final pass = TextEditingController(); String? validationError; @override void dispose() { email.dispose(); pass.dispose(); super.dispose(); } @override Widget build(BuildContext c) { final state = ref.watch(authStateProvider); final errorText = validationError ?? (state.hasError ? state.error.toString() : null); return _AuthFrame(title: 'Welcome back', subtitle: 'Sign in to your personal care space.', child: Column(children: [TextField(controller: email, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Email address', hintText: 'you@example.com')), const SizedBox(height: 12), TextField(controller: pass, obscureText: true, decoration: const InputDecoration(labelText: 'Password')), if (errorText != null) Padding(padding: const EdgeInsets.only(top: 12), child: Align(alignment: Alignment.centerLeft, child: Text(errorText, style: const TextStyle(color: Colors.red))),), const SizedBox(height: 24), FilledButton(onPressed: state.isLoading ? null : () async { if (email.text.trim().isEmpty || pass.text.isEmpty) { setState(() => validationError = 'Enter your email and password.'); return; } setState(() => validationError = null); final success=await ref.read(loginProvider).login(email.text.trim(), pass.text); if (!mounted || !success) return; context.go('/home'); }, style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)), child: Text(state.isLoading ? 'Signing in...' : 'Sign in')), TextButton(onPressed: () => c.go('/register'), child: const Text('New to VerityScribe? Create account'))])); } }
-class RegisterScreen extends ConsumerWidget { const RegisterScreen({super.key}); @override Widget build(BuildContext c, WidgetRef ref) => _AuthFrame(title: 'Create your account', subtitle: 'Start building a clearer health story.', child: FilledButton(onPressed: () async { await ref.read(registrationProvider).register('', '', ''); if (c.mounted) c.go('/otp'); }, style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)), child: const Text('Create account'))); }
-class OtpScreen extends ConsumerStatefulWidget { const OtpScreen({super.key}); @override ConsumerState<OtpScreen> createState() => _OtpScreenState(); }
-class _OtpScreenState extends ConsumerState<OtpScreen> { final code = TextEditingController(); @override void dispose() { code.dispose(); super.dispose(); } @override Widget build(BuildContext c) => _AuthFrame(title: 'Verify your email', subtitle: 'Enter the verification code sent to your email.', child: Column(children: [TextField(controller: code, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Verification code')), const SizedBox(height: 16), FilledButton(onPressed: () async { if (await ref.read(otpProvider).verifyOtp(code.text.trim()) && c.mounted) c.go('/biometric'); }, style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)), child: const Text('Verify code'))])); }
-class SetupScreen extends StatelessWidget { final String title, body, next; const SetupScreen({required this.title, required this.body, required this.next, super.key}); @override Widget build(BuildContext c) => _AuthFrame(title: title, subtitle: body, child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [const Icon(Icons.verified_user_rounded, size: 68, color: AppTheme.blue), const SizedBox(height: 28), FilledButton(onPressed: () => c.go(next), style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)), child: Text(next == '/home' ? 'Finish setup' : 'Continue')), TextButton(onPressed: () => c.go(next), child: const Text('Skip for now'))])); }
-class _AuthFrame extends StatelessWidget { final String title, subtitle; final Widget child; const _AuthFrame({required this.title, required this.subtitle, required this.child}); @override Widget build(BuildContext c) => Scaffold(body: SafeArea(child: SingleChildScrollView(padding: const EdgeInsets.all(24), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const SizedBox(height: 30), const AppLogo(), const SizedBox(height: 36), Text(title, style: Theme.of(c).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800)), const SizedBox(height: 9), Text(subtitle, style: const TextStyle(color: AppTheme.muted)), const SizedBox(height: 35), child])))); }
+class AuthBootstrapScreen extends StatelessWidget {
+  const AuthBootstrapScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        backgroundColor: const Color(0xFFF5F7FC),
+        body: const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AppLogo(),
+              SizedBox(height: 18),
+              SizedBox.square(
+                dimension: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.4),
+              ),
+              SizedBox(height: 12),
+              Text('Restoring your secure session…'),
+            ],
+          ),
+        ),
+      );
+}
+
+class AuthRestoreErrorScreen extends StatelessWidget {
+  const AuthRestoreErrorScreen({required this.onRetry, super.key});
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_clock_outlined,
+                    size: 48, color: AppTheme.blue),
+                const SizedBox(height: 16),
+                Text('Your sign-in could not be restored',
+                    style: Theme.of(context).textTheme.titleLarge,
+                    textAlign: TextAlign.center),
+                const SizedBox(height: 8),
+                const Text(
+                  'Your saved session has not been cleared. Check your connection and retry.',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton.icon(
+                  onPressed: onRetry,
+                  icon: const Icon(Icons.refresh_rounded),
+                  label: const Text('Retry session restore'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+}
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen> {
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(const Duration(milliseconds: 250), () {
+      if (!mounted) return;
+      final hasSession = Supabase.instance.client.auth.currentSession != null;
+      context.go(hasSession ? '/home' : '/onboarding');
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => const Scaffold(
+          body: Center(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+        AppLogo(),
+        SizedBox(height: 15),
+        Text('VerityScribe',
+            style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+        SizedBox(height: 5),
+        Text('Care, clearly understood.',
+            style: TextStyle(color: AppTheme.muted))
+      ])));
+}
+
+class IntroScreen extends StatelessWidget {
+  final String title, body, next;
+  const IntroScreen(
+      {required this.title, required this.body, required this.next, super.key});
+  @override
+  Widget build(BuildContext c) => Scaffold(
+      body: SafeArea(
+          child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Spacer(),
+                    const AppLogo(),
+                    const SizedBox(height: 35),
+                    Text(title,
+                        style: Theme.of(c)
+                            .textTheme
+                            .displaySmall
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 15),
+                    Text(body,
+                        style: const TextStyle(
+                            color: AppTheme.muted, height: 1.55, fontSize: 16)),
+                    const Spacer(),
+                    FilledButton(
+                        onPressed: () => c.go(next),
+                        style: FilledButton.styleFrom(
+                            minimumSize: const Size.fromHeight(56),
+                            backgroundColor: AppTheme.blue),
+                        child: const Text('Continue'))
+                  ]))));
+}
+
+class LoginScreen extends ConsumerStatefulWidget {
+  const LoginScreen({super.key});
+  @override
+  ConsumerState<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends ConsumerState<LoginScreen> {
+  final email = TextEditingController();
+  final pass = TextEditingController();
+  String? validationError;
+  @override
+  void dispose() {
+    email.dispose();
+    pass.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final state = ref.watch(authStateProvider);
+    final errorText =
+        validationError ?? (state.hasError ? state.error.toString() : null);
+    return _AuthFrame(
+        title: 'Welcome back',
+        subtitle: 'Sign in to your personal care space.',
+        child: Column(children: [
+          TextField(
+              controller: email,
+              keyboardType: TextInputType.emailAddress,
+              decoration: const InputDecoration(
+                  labelText: 'Email address', hintText: 'you@example.com')),
+          const SizedBox(height: 12),
+          TextField(
+              controller: pass,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'Password')),
+          if (errorText != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(errorText,
+                      style: const TextStyle(color: Colors.red))),
+            ),
+          const SizedBox(height: 24),
+          FilledButton(
+              onPressed: state.isLoading
+                  ? null
+                  : () async {
+                      if (email.text.trim().isEmpty || pass.text.isEmpty) {
+                        setState(() =>
+                            validationError = 'Enter your email and password.');
+                        return;
+                      }
+                      setState(() => validationError = null);
+                      final success = await ref
+                          .read(loginProvider)
+                          .login(email.text.trim(), pass.text);
+                      if (!mounted || !success) return;
+                      final requestedPath =
+                          GoRouterState.of(c).uri.queryParameters['next'];
+                      final destination = requestedPath != null &&
+                              requestedPath.startsWith('/') &&
+                              !requestedPath.startsWith('//')
+                          ? requestedPath
+                          : '/home';
+                      context.go(destination);
+                    },
+              style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(54)),
+              child: Text(state.isLoading ? 'Signing in...' : 'Sign in')),
+          TextButton(
+              onPressed: () => c.go('/register'),
+              child: const Text('New to VerityScribe? Create account'))
+        ]));
+  }
+}
+
+class RegisterScreen extends ConsumerWidget {
+  const RegisterScreen({super.key});
+  @override
+  Widget build(BuildContext c, WidgetRef ref) => _AuthFrame(
+      title: 'Create your account',
+      subtitle: 'Start building a clearer health story.',
+      child: FilledButton(
+          onPressed: () async {
+            await ref.read(registrationProvider).register('', '', '');
+            if (c.mounted) c.go('/otp');
+          },
+          style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)),
+          child: const Text('Create account')));
+}
+
+class OtpScreen extends ConsumerStatefulWidget {
+  const OtpScreen({super.key});
+  @override
+  ConsumerState<OtpScreen> createState() => _OtpScreenState();
+}
+
+class _OtpScreenState extends ConsumerState<OtpScreen> {
+  final code = TextEditingController();
+  @override
+  void dispose() {
+    code.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => _AuthFrame(
+      title: 'Verify your email',
+      subtitle: 'Enter the verification code sent to your email.',
+      child: Column(children: [
+        TextField(
+            controller: code,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Verification code')),
+        const SizedBox(height: 16),
+        FilledButton(
+            onPressed: () async {
+              if (await ref.read(otpProvider).verifyOtp(code.text.trim()) &&
+                  c.mounted) c.go('/biometric');
+            },
+            style:
+                FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)),
+            child: const Text('Verify code'))
+      ]));
+}
+
+class SetupScreen extends StatelessWidget {
+  final String title, body, next;
+  const SetupScreen(
+      {required this.title, required this.body, required this.next, super.key});
+  @override
+  Widget build(BuildContext c) => _AuthFrame(
+      title: title,
+      subtitle: body,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        const Icon(Icons.verified_user_rounded, size: 68, color: AppTheme.blue),
+        const SizedBox(height: 28),
+        FilledButton(
+            onPressed: () => c.go(next),
+            style:
+                FilledButton.styleFrom(minimumSize: const Size.fromHeight(54)),
+            child: Text(next == '/home' ? 'Finish setup' : 'Continue')),
+        TextButton(
+            onPressed: () => c.go(next), child: const Text('Skip for now'))
+      ]));
+}
+
+class _AuthFrame extends StatelessWidget {
+  final String title, subtitle;
+  final Widget child;
+  const _AuthFrame(
+      {required this.title, required this.subtitle, required this.child});
+  @override
+  Widget build(BuildContext c) => Scaffold(
+      body: SafeArea(
+          child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SizedBox(height: 30),
+                    const AppLogo(),
+                    const SizedBox(height: 36),
+                    Text(title,
+                        style: Theme.of(c)
+                            .textTheme
+                            .headlineMedium
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 9),
+                    Text(subtitle,
+                        style: const TextStyle(color: AppTheme.muted)),
+                    const SizedBox(height: 35),
+                    child
+                  ]))));
+}
