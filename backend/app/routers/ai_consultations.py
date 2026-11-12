@@ -79,6 +79,47 @@ def _rpc_boolean(data: Any) -> bool:
     )
 
 
+def _safe_live_client_config(config: Any) -> dict[str, Any]:
+    """Return a wire-valid Live setup config without server-only instructions.
+
+    The constrained ephemeral token already binds the complete Live config,
+    including the clinical system instruction. Returning that instruction to
+    Flutter would expose the patient's verified chart context unnecessarily.
+    The GenAI SDK's ``LiveConnectConfig`` is not itself the WebSocket setup
+    shape: response modalities and speech config belong under
+    ``generationConfig`` in the raw BidiGenerateContent protocol.
+    """
+    serialized = config.model_dump(by_alias=True, exclude_none=True)
+    if not isinstance(serialized, dict):
+        raise TypeError("Gemini Live config did not serialize to an object")
+    serialized.pop("systemInstruction", None)
+    serialized.pop("system_instruction", None)
+    generation_config = serialized.pop("generationConfig", {})
+    for field in ("responseModalities", "speechConfig"):
+        value = serialized.pop(field, None)
+        if value is not None:
+            generation_config[field] = value
+    if generation_config:
+        serialized["generationConfig"] = generation_config
+    return serialized
+
+
+def _live_assistant_output(event: Any) -> tuple[Any | None, list[bytes]]:
+    """Return current-turn caption/audio; discard stale output on interruption."""
+    if bool(getattr(event, "interrupted", False)):
+        return None, []
+    content = getattr(event, "content", None)
+    parts = getattr(content, "parts", None) or []
+    audio_chunks = [
+        part.inline_data.data
+        for part in parts
+        if getattr(part, "inline_data", None)
+        and isinstance(part.inline_data.data, bytes)
+        and part.inline_data.data
+    ]
+    return getattr(event, "output_transcription", None), audio_chunks
+
+
 def _postgrest_authorization_role(client: Any) -> str:
     """Read only the JWT role claim from the outgoing server-side header."""
     try:
@@ -120,6 +161,12 @@ class StartRequest(BaseModel):
 class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     request_key: str = Field(min_length=1, max_length=80)
+
+
+class DirectLiveTurnRequest(BaseModel):
+    request_key: str = Field(min_length=8, max_length=100)
+    input_text: str = Field(max_length=20000)
+    output_text: str = Field(max_length=20000)
 
 
 class ReviewRequest(BaseModel):
@@ -537,6 +584,137 @@ def create_voice_ticket(session_id: str, claims: dict = Depends(current_claims))
     return {"data": {"ticket": token, "expires_at": expires.isoformat()}}
 
 
+@router.post("/{session_id}/live-credential")
+def create_direct_live_credential(session_id: str, claims: dict = Depends(current_claims)):
+    """Issue a one-use, model/config-constrained Gemini Live token.
+
+    This is additive: the existing authenticated FastAPI/ADK WebSocket remains
+    available as a fallback. The permanent Gemini API key never leaves server.
+    """
+    patient = get_current_patient(claims)
+    client = db()
+    session = _session_or_404(client, session_id, patient_id=patient["id"])
+    if session.get("mode") != "ai_virtual" or not session.get("voice_consent_at"):
+        raise HTTPException(status_code=403, detail="Voice processing was not authorized for this session")
+    if session.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail="This consultation is not accepting voice")
+    appointment = _maybe_single_data(
+        client.table("appointments").select("id,appointment_date,appointment_time")
+        .eq("id", session["appointment_id"]).eq("patient_id", patient["id"])
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    ensure_appointment_not_expired(appointment)
+    # Token creation does not require the ADK runner. This keeps the direct
+    # browser-to-Gemini path independent from the legacy FastAPI audio proxy.
+    if not gemini_live.initialize_client() or gemini_live.summary_client is None:
+        raise HTTPException(status_code=503, detail="Gemini Live is not configured")
+
+    try:
+        types = gemini_live.types
+        context = patient_context(client, patient["id"])
+        context_text = json.dumps(context, ensure_ascii=False, default=str)[:12000]
+        instructions = (
+            "You are Verity, a concise AI medical intake assistant, not a clinician. Ask one relevant follow-up "
+            "at a time, adapt to patient answers, and do not diagnose or prescribe. Support English, Telugu, Hindi "
+            "and code-switching; preserve the patient's language and ask for clarification rather than guessing "
+            "unclear medical words, sides, numbers, medicines or procedures. Only the patient or verified record "
+            "can establish patient facts. Never imply AI guidance was doctor-approved. If emergency symptoms are "
+            "reported, direct the patient to urgent local care. Verified record context follows: " + context_text
+        )
+        live_config = types.LiveConnectConfig(
+            response_modalities=[types.Modality.AUDIO],
+            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=gemini_live.voice),
+            )),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False, prefix_padding_ms=200,
+                    silence_duration_ms=max(500, min(gemini_live.silence_duration_ms, 2000)),
+                ),
+            ),
+            system_instruction=types.Content(parts=[types.Part(text=instructions)]),
+        )
+        now = datetime.now(timezone.utc)
+        token = gemini_live.summary_client.auth_tokens.create(config=types.CreateAuthTokenConfig(
+            # The Google GenAI Auth Tokens endpoint is currently served on
+            # v1alpha even though the Live WebSocket itself uses v1beta.
+            http_options=types.HttpOptions(api_version="v1alpha", timeout=30_000),
+            uses=1,
+            new_session_expire_time=now + timedelta(minutes=2),
+            expire_time=now + timedelta(minutes=30),
+            live_connect_constraints=types.LiveConnectConstraints(
+                model=gemini_live.model,
+                config=live_config,
+            ),
+        ))
+        serialized_config = _safe_live_client_config(live_config)
+    except Exception as exc:
+        logger.exception("AI Virtual ephemeral credential creation failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="A secure direct Gemini session could not be prepared") from exc
+    logger.info("AI Virtual direct credential issued model=%s", gemini_live.model)
+    return {"data": {
+        "credential": token.name,
+        "model": gemini_live.model,
+        "config": serialized_config,
+        "expires_at": (
+            token.expire_time.isoformat()
+            if hasattr(token.expire_time, "isoformat")
+            else str(token.expire_time or (now + timedelta(minutes=30)).isoformat())
+        ),
+    }}
+
+
+@router.post("/{session_id}/direct-turn")
+def persist_direct_live_turn(session_id: str, payload: DirectLiveTurnRequest, claims: dict = Depends(current_claims)):
+    """Persist a completed direct-Gemini turn idempotently for finalization."""
+    patient = get_current_patient(claims)
+    client = db()
+    session = _session_or_404(client, session_id, patient_id=patient["id"])
+    if session.get("mode") != "ai_virtual" or session.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail="This consultation is not accepting messages")
+    if not payload.input_text.strip() and not payload.output_text.strip():
+        raise HTTPException(status_code=422, detail="The consultation turn is empty")
+    rows = client.table("ai_consultation_messages").select(
+        "id,role,content,created_at,request_key"
+    ).eq("session_id", session_id).eq("request_key", payload.request_key).order("created_at").execute().data or []
+    by_role = {row.get("role"): row for row in rows}
+    saved = []
+    for role, content in (("patient", payload.input_text.strip()), ("assistant", payload.output_text.strip())):
+        if not content:
+            continue
+        existing = by_role.get(role)
+        if existing:
+            if existing.get("content") != content:
+                raise HTTPException(status_code=409, detail="The turn key was already used")
+            saved.append(existing)
+            continue
+        try:
+            inserted = client.table("ai_consultation_messages").insert({
+                "session_id": session_id, "role": role, "content": content,
+                "request_key": payload.request_key,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute().data or []
+        except Exception:
+            # The partial unique index is the concurrency-safe source of
+            # idempotency. If parallel finalization/client retries race, read
+            # the winning row and accept only an exact payload match.
+            duplicate_rows = client.table("ai_consultation_messages").select(
+                "id,role,content,created_at,request_key"
+            ).eq("session_id", session_id).eq(
+                "request_key", payload.request_key
+            ).eq("role", role).limit(1).execute().data or []
+            duplicate = duplicate_rows[0] if duplicate_rows else None
+            if not duplicate or duplicate.get("content") != content:
+                raise
+            inserted = [duplicate]
+        if inserted:
+            saved.append(inserted[0])
+    return {"data": {"messages": saved}}
+
+
 @router.websocket("/{session_id}/voice-stream")
 async def voice_stream(websocket: WebSocket, session_id: str):
     """Authenticated native bidirectional Gemini Live audio session."""
@@ -741,6 +919,11 @@ async def voice_stream(websocket: WebSocket, session_id: str):
     voice_started_at = time.perf_counter()
     first_patient_audio_logged = False
     first_gemini_audio_logged = False
+    live_turn_index = 0
+    live_turn_started_at: float | None = None
+    live_turn_ended_at: float | None = None
+    live_turn_first_response_logged = False
+    live_turn_first_audio_logged = False
     # ADK's imports can scan installed entry points; initialize off the event
     # loop and only after the patient has authenticated and opened the socket.
     logger.info(
@@ -1011,6 +1194,8 @@ async def voice_stream(websocket: WebSocket, session_id: str):
 
     async def gemini_to_browser():
         nonlocal input_partial, assistant_partial, current_turn_key, first_gemini_audio_logged
+        nonlocal live_turn_index, live_turn_started_at, live_turn_ended_at
+        nonlocal live_turn_first_response_logged, live_turn_first_audio_logged
         async def events():
             if first_event is not None:
                 yield first_event
@@ -1019,24 +1204,53 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                     yield event
 
         async for event in events():
+            if live_turn_ended_at is not None and not live_turn_first_response_logged:
+                live_turn_first_response_logged = True
+                logger.info(
+                    "AI Virtual turn_latency stage=first_gemini_event turn=%d elapsed_after_transcript_ms=%d",
+                    live_turn_index,
+                    round((time.perf_counter() - live_turn_ended_at) * 1000),
+                )
             if event.interrupted:
                 interrupted_turn = current_turn_key
                 await send_json({"type": "interrupted", "turn_id": interrupted_turn})
+                # The transcript fragment associated with the interrupted
+                # assistant turn must not be merged into the next patient
+                # utterance. Preserve the durable messages already written,
+                # then start fresh per-turn timing/caption state.
+                input_partial = ""
                 assistant_partial = ""
                 current_turn_key = f"live-{uuid.uuid4()}"
-            content = event.content
-            if content and content.parts:
-                for part in content.parts:
-                    if part.inline_data and part.inline_data.data:
-                        if not first_gemini_audio_logged:
-                            first_gemini_audio_logged = True
-                            logger.info("AI Virtual latency stage=first_gemini_audio elapsed_ms=%d", round((time.perf_counter() - voice_started_at) * 1000))
-                        # Forward native Gemini PCM chunks immediately; Flutter
-                        # feeds these into its PCM stream player without waiting
-                        # for the end of the assistant turn.
-                        await send_bytes(part.inline_data.data)
+                live_turn_started_at = None
+                live_turn_ended_at = None
+                live_turn_first_response_logged = False
+                live_turn_first_audio_logged = False
+            output_transcription, audio_chunks = _live_assistant_output(event)
+            for audio_chunk in audio_chunks:
+                if live_turn_ended_at is not None and not live_turn_first_audio_logged:
+                    live_turn_first_audio_logged = True
+                    logger.info(
+                        "AI Virtual turn_latency stage=first_gemini_audio turn=%d elapsed_after_transcript_ms=%d",
+                        live_turn_index,
+                        round((time.perf_counter() - live_turn_ended_at) * 1000),
+                    )
+                if not first_gemini_audio_logged:
+                    first_gemini_audio_logged = True
+                    logger.info("AI Virtual latency stage=first_gemini_audio elapsed_ms=%d", round((time.perf_counter() - voice_started_at) * 1000))
+                # Forward native Gemini PCM chunks immediately; Flutter feeds
+                # these into its PCM stream player without waiting for turn end.
+                await send_bytes(audio_chunk)
             if event.input_transcription and event.input_transcription.text:
                 if not input_partial:
+                    live_turn_index += 1
+                    live_turn_started_at = time.perf_counter()
+                    live_turn_ended_at = None
+                    live_turn_first_response_logged = False
+                    live_turn_first_audio_logged = False
+                    logger.info(
+                        "AI Virtual turn_latency stage=patient_transcription_started turn=%d",
+                        live_turn_index,
+                    )
                     await send_json({"type": "speech_started"})
                 input_partial += event.input_transcription.text
                 logger.info(
@@ -1047,17 +1261,25 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                 await send_json({"type": "caption", "role": "patient", "text": event.input_transcription.text,
                                  "final": bool(event.input_transcription.finished),
                                  "turn_id": current_turn_key})
-            if event.output_transcription and event.output_transcription.text:
-                assistant_partial += event.output_transcription.text
+                if event.input_transcription.finished:
+                    live_turn_ended_at = time.perf_counter()
+                    logger.info(
+                        "AI Virtual turn_latency stage=patient_transcription_complete turn=%d speech_to_transcript_ms=%d",
+                        live_turn_index,
+                        round((live_turn_ended_at - live_turn_started_at) * 1000)
+                        if live_turn_started_at is not None else -1,
+                    )
+            if output_transcription and output_transcription.text:
+                assistant_partial += output_transcription.text
                 logger.info(
                     "AI Virtual event=output_transcription chars=%d final=%s",
-                    len(event.output_transcription.text),
-                    bool(event.output_transcription.finished),
+                    len(output_transcription.text),
+                    bool(output_transcription.finished),
                 )
-                await send_json({"type": "caption", "role": "assistant", "text": event.output_transcription.text,
-                                 "final": bool(event.output_transcription.finished),
+                await send_json({"type": "caption", "role": "assistant", "text": output_transcription.text,
+                                 "final": bool(output_transcription.finished),
                                  "turn_id": current_turn_key})
-            if event.turn_complete:
+            if event.turn_complete and not event.interrupted:
                 typed_turn = pending_text_turns.pop(0) if pending_text_turns else (None, "")
                 input_text = input_partial.strip() or typed_turn[1]
                 request_key = typed_turn[0] or current_turn_key
@@ -1075,6 +1297,10 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                 # a second request key.
                 input_partial = assistant_partial = ""
                 current_turn_key = f"live-{uuid.uuid4()}"
+                live_turn_started_at = None
+                live_turn_ended_at = None
+                live_turn_first_response_logged = False
+                live_turn_first_audio_logged = False
                 await send_json({"type": "turn_complete", "request_key": request_key,
                                  "input_text": input_text,
                                  "output_text": assistant_text,
@@ -1234,18 +1460,26 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
         "ended_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", session_id).eq("patient_id", patient["id"]).eq(
-        "status", session["status"]).select("id").execute()
-    if not getattr(processing_result, "data", None):
+        "status", session["status"]).execute()
+    # This Supabase client version's update builder does not support select()
+    # after filters. Verify the compare-and-set with a separate owned read.
+    claimed_session = _session_or_404(client, session_id, patient_id=patient["id"])
+    if claimed_session.get("status") != "processing":
         raise HTTPException(status_code=409, detail="This consultation changed while it was being finalized")
     try:
         appointment = client.table("appointments").select("*").eq("id", session["appointment_id"]).single().execute().data
         if session["mode"] == "ai_virtual":
             verified_context = patient_context(client, patient["id"])
+            summary_started_at = time.perf_counter()
             summary = gemini_live.generate_consultation_summary(
                 transcript=messages,
                 patient_context=verified_context,
                 appointment=appointment,
                 interview_complete=interview_complete,
+            )
+            logger.info(
+                "AI Virtual latency stage=clinical_summary_generation elapsed_ms=%d",
+                round((time.perf_counter() - summary_started_at) * 1000),
             )
             summary["interview_state"] = "complete" if interview_complete else "ended_early"
             summary["completion_status"] = summary["interview_state"]
@@ -1299,6 +1533,7 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
         return {"data": _response(client, saved_fallback[0])}
     summary["summary_id"] = str(uuid.uuid4())
     summary["session_id"] = session_id
+    summary_persist_started_at = time.perf_counter()
     try:
         persisted = client.table("ai_consultation_sessions").update({
             "status": "awaiting_doctor_review", "summary": summary,
@@ -1309,6 +1544,10 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
         if not persisted:
             raise RuntimeError("Consultation summary update returned no row")
         session = persisted[0]
+        logger.info(
+            "AI Virtual latency stage=clinical_summary_persistence elapsed_ms=%d",
+            round((time.perf_counter() - summary_persist_started_at) * 1000),
+        )
     except Exception as exc:
         # Do not convert a committed-but-unacknowledged write into a failed
         # session. Read back the exact draft; unrelated/old summaries do not

@@ -298,8 +298,7 @@ class LiveAppointment {
   /// Supplied by the backend from the appointment's scheduled start time.
   /// Missing server expiry fails closed; the client must not re-derive it from
   /// the booking creation timestamp or its local timezone.
-  DateTime? get expiresAt => serverExpiresAt?.toUtc() ??
-      _scheduledLocalDateTime()?.add(const Duration(minutes: 30)).toUtc();
+  DateTime? get expiresAt => serverExpiresAt?.toUtc();
 
   /// The backend defines expiry as scheduled start + 30 minutes. Deriving the
   /// start from its UTC expiry keeps home filtering independent of device TZ.
@@ -319,8 +318,12 @@ class LiveAppointment {
     var hour = int.tryParse(time.group(1)!);
     final minute = int.tryParse(time.group(2)!);
     final second = int.tryParse(time.group(3) ?? '0');
-    if (year == null || month == null || day == null || hour == null ||
-        minute == null || second == null) return null;
+    if (year == null ||
+        month == null ||
+        day == null ||
+        hour == null ||
+        minute == null ||
+        second == null) return null;
     final meridiem = time.group(4)?.toUpperCase();
     if (meridiem != null) hour = (hour % 12) + (meridiem == 'PM' ? 12 : 0);
     if (hour > 23 || minute > 59 || second > 59) return null;
@@ -332,10 +335,12 @@ class LiveAppointment {
 
   bool isUpcomingAt(DateTime now) {
     final start = scheduledStartAt;
+    final expiry = expiresAt;
     final current = now.toUtc();
     return start != null &&
+        expiry != null &&
         current.isBefore(start) &&
-        current.isBefore(expiresAt!) &&
+        current.isBefore(expiry) &&
         !{
           'cancelled',
           'canceled',
