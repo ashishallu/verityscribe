@@ -23,9 +23,16 @@ abstract class ApiClient {
 }
 
 class HttpApiClient implements ApiClient {
-  HttpApiClient({required this.accessToken, http.Client? client})
-      : _client = client ?? http.Client();
+  HttpApiClient({
+    required this.accessToken,
+    this.refreshAccessToken,
+    http.Client? client,
+  }) : _client = client ?? http.Client();
   final Future<String?> Function() accessToken;
+
+  /// Refreshes the Supabase session after an API rejects an otherwise cached
+  /// access token. It is called at most once per request.
+  final Future<String?> Function()? refreshAccessToken;
   final http.Client _client;
   Future<Map<String, String>> _headers() async {
     final token = await accessToken();
@@ -42,7 +49,16 @@ class HttpApiClient implements ApiClient {
       // A cold free-tier backend can take longer than a normal interactive
       // request to wake. The server now batches appointment relationships,
       // while this avoids misrepresenting a still-running request as empty.
-      final response = await call().timeout(const Duration(seconds: 30));
+      var response = await call().timeout(const Duration(seconds: 30));
+      if (response.statusCode == 401 && refreshAccessToken != null) {
+        // Supabase can reject a token before the local expiry check considers
+        // it expired (for example after session revocation or clock drift).
+        // Refresh and retry once; never loop or downgrade authorization.
+        final refreshed = await refreshAccessToken!();
+        if (refreshed != null && refreshed.isNotEmpty) {
+          response = await call().timeout(const Duration(seconds: 30));
+        }
+      }
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw ApiException(response.body, statusCode: response.statusCode);
       }

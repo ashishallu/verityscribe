@@ -5,13 +5,14 @@ import os
 import re
 import time
 import uuid
+from functools import lru_cache
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 import httpx
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
 
 from ..core.config import settings
 from ..core.security import current_claims, get_current_doctor, get_current_patient, get_current_profile, require_roles
@@ -24,9 +25,11 @@ from ..services.document_ocr import (
     validate_image_dimensions,
 )
 from ..services.document_tables import format_result_row
+from ..services.appointment_expiry import appointment_expiry_payload, ensure_appointment_not_expired
 
 router = APIRouter(tags=["integration"])
 logger = logging.getLogger(__name__)
+DIRECTORY_QUERY_TIMEOUT_SECONDS = 8
 
 
 class AppointmentCreate(BaseModel):
@@ -143,6 +146,45 @@ def db() -> Client:
     if not cfg.supabase_url or not cfg.supabase_service_role_key:
         raise HTTPException(status_code=503, detail="Integration service is unavailable")
     return create_client(cfg.supabase_url, cfg.supabase_service_role_key)
+
+
+@lru_cache(maxsize=1)
+def _directory_db(url: str, service_role_key: str) -> Client:
+    """Reuse a bounded PostgREST client for public directory lookups only."""
+    return create_client(
+        url,
+        service_role_key,
+        options=ClientOptions(postgrest_client_timeout=DIRECTORY_QUERY_TIMEOUT_SECONDS),
+    )
+
+
+def directory_db() -> Client:
+    cfg = settings()
+    if not cfg.supabase_url or not cfg.supabase_service_role_key:
+        raise HTTPException(status_code=503, detail="Directory service is unavailable")
+    return _directory_db(cfg.supabase_url, cfg.supabase_service_role_key)
+
+
+def _timed_directory_query(endpoint: str, stage: str, operation):
+    started = time.perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        logger.warning(
+            "directory_request endpoint=%s stage=%s outcome=error duration_ms=%d error_type=%s",
+            endpoint,
+            stage,
+            round((time.perf_counter() - started) * 1000),
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=503, detail="Directory data is temporarily unavailable") from exc
+    logger.info(
+        "directory_request endpoint=%s stage=%s outcome=ok duration_ms=%d",
+        endpoint,
+        stage,
+        round((time.perf_counter() - started) * 1000),
+    )
+    return result
 
 
 def _voice_bucket(client: Client) -> str:
@@ -1383,10 +1425,15 @@ def _list(client: Client, table: str, page: int, page_size: int, search: str | N
 @router.get("/hospitals")
 def hospitals(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, _: dict = Depends(current_claims)):
     # Keep this directory query limited to columns guaranteed by the live schema.
-    query = db().table("hospitals").select("id,name", count="exact")
-    if search:
-        query = query.ilike("name", f"%{search}%")
-    result = query.range((page - 1) * page_size, page * page_size - 1).execute()
+    client = directory_db()
+
+    def load_hospitals():
+        query = client.table("hospitals").select("id,name", count="exact")
+        if search:
+            query = query.ilike("name", f"%{search}%")
+        return query.range((page - 1) * page_size, page * page_size - 1).execute()
+
+    result = _timed_directory_query("hospitals", "postgrest_select", load_hospitals)
     return {"data": result.data or [], "meta": {"page": page, "page_size": page_size, "total": result.count or 0}}
 
 @router.get("/patients")
@@ -1416,23 +1463,42 @@ def admin_patients(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, 
 
 @router.get("/departments")
 def departments(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, hospital_id: str | None = None, _: dict = Depends(current_claims)):
-    return _list(db(), "departments", page, page_size, search, hospital_id)
+    client = directory_db()
+    return _timed_directory_query(
+        "departments",
+        "postgrest_select",
+        lambda: _list(client, "departments", page, page_size, search, hospital_id),
+    )
 
 
 @router.get("/hospitals/{hospital_id}/departments")
 def hospital_departments(hospital_id: str, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), search: str | None = None, _: dict = Depends(current_claims)):
-    hospital = db().table("hospitals").select("id").eq("id", hospital_id).maybe_single().execute().data
+    client = directory_db()
+    hospital = _timed_directory_query(
+        "hospital_departments",
+        "hospital_lookup",
+        lambda: client.table("hospitals").select("id").eq("id", hospital_id).maybe_single().execute().data,
+    )
     if not hospital:
         raise HTTPException(status_code=404, detail="Hospital not found")
-    return _list(db(), "departments", page, page_size, search, hospital_id)
+    return _timed_directory_query(
+        "hospital_departments",
+        "department_select",
+        lambda: _list(client, "departments", page, page_size, search, hospital_id),
+    )
 
 
 @router.get("/doctors")
 def doctor_directory(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100), hospital_id: str | None = None, department_id: str | None = None, claims: dict = Depends(current_claims)):
-    client = db()
+    client = directory_db()
     role = claims.get("app_metadata", {}).get("role")
     if role == "hospital_admin":
-        hospital_id = get_current_profile(claims).get("hospital_id")
+        profile = _timed_directory_query(
+            "doctors",
+            "admin_hospital_scope",
+            lambda: client.table("profiles").select("hospital_id").eq("id", claims["sub"]).maybe_single().execute().data,
+        )
+        hospital_id = (profile or {}).get("hospital_id")
         if not hospital_id:
             raise HTTPException(status_code=403, detail="Your administrator account is not assigned to a hospital")
     query = client.table("doctors").select("*, profiles!inner(id,first_name,last_name,email,phone), hospitals!inner(id,name), departments!inner(id,name,hospital_id)", count="exact").is_("deleted_at", "null").eq("is_available", True)
@@ -1440,7 +1506,11 @@ def doctor_directory(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1
         query = query.eq("hospital_id", hospital_id)
     if department_id:
         query = query.eq("department_id", department_id)
-    result = query.range((page - 1) * page_size, page * page_size - 1).execute()
+    result = _timed_directory_query(
+        "doctors",
+        "postgrest_select",
+        lambda: query.range((page - 1) * page_size, page * page_size - 1).execute(),
+    )
     data = []
     for row in result.data or []:
         profile = row.pop("profiles", {}) or {}
@@ -1466,6 +1536,7 @@ def me_doctor(doctor: dict = Depends(get_current_doctor)):
 
 
 def _appointment_detail(client: Client, appointment: dict) -> dict[str, Any]:
+    appointment = appointment_expiry_payload(appointment)
     patient = client.table("profiles").select("id,first_name,last_name,email,phone").eq("id", appointment["patient_id"]).maybe_single().execute().data
     doctor = client.table("doctors").select("*,profiles!inner(id,first_name,last_name,email,phone),hospitals!inner(id,name),departments!inner(id,name)").eq("id", appointment["doctor_id"]).maybe_single().execute().data
     return {**appointment, "patient": patient, "doctor": doctor}
@@ -1494,7 +1565,7 @@ def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[
     doctors_by_id = {row["id"]: row for row in doctors}
     return [
         {
-            **appointment,
+            **appointment_expiry_payload(appointment),
             "patient": patients_by_id.get(appointment["patient_id"]),
             "doctor": doctors_by_id.get(appointment["doctor_id"]),
         }
@@ -1586,11 +1657,12 @@ def appointment_detail(appointment_id: str, claims: dict = Depends(current_claim
 @router.post("/consultations", status_code=status.HTTP_201_CREATED)
 def create_consultation(payload: ConsultationCreate, doctor: dict = Depends(get_current_doctor)):
     client = db()
-    appointment = client.table("appointments").select("id,patient_id,doctor_id").eq("id", payload.appointment_id).maybe_single().execute().data
+    appointment = client.table("appointments").select("id,patient_id,doctor_id,appointment_date,appointment_time").eq("id", payload.appointment_id).maybe_single().execute().data
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
     if appointment.get("doctor_id") != doctor["id"]:
         raise HTTPException(status_code=403, detail="You cannot create a consultation for this appointment")
+    ensure_appointment_not_expired(appointment)
     existing = client.table("consultations").select("id").eq("appointment_id", payload.appointment_id).limit(1).execute().data
     if existing:
         raise HTTPException(status_code=409, detail="A consultation already exists for this appointment")
@@ -1896,9 +1968,10 @@ async def upload_consultation_voice(consultation_id: str, request: Request, audi
 async def upload_patient_voice_draft(appointment_id: str, request: Request, audio: UploadFile = File(...), patient: dict = Depends(get_current_patient)):
     """Create an appointment-scoped transcript draft; it never creates clinical records."""
     client = db()
-    appointment = client.table("appointments").select("id,patient_id,doctor_id,status").eq("id", appointment_id).maybe_single().execute().data
+    appointment = client.table("appointments").select("id,patient_id,doctor_id,status,appointment_date,appointment_time").eq("id", appointment_id).maybe_single().execute().data
     if not appointment or appointment.get("patient_id") != patient["id"]:
         raise HTTPException(status_code=404, detail="Appointment not found")
+    ensure_appointment_not_expired(appointment)
     if appointment.get("status") in {"cancelled", "no_show"}:
         raise HTTPException(status_code=422, detail="Voice drafts are unavailable for this appointment")
     content = await audio.read()

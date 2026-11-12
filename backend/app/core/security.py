@@ -1,14 +1,62 @@
 import logging
 import asyncio
+import time
+from functools import lru_cache
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from supabase import create_client
+import httpx
+from supabase import ClientOptions, create_client
 from .config import settings
 from supabase import Client
 
 bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
+SUPABASE_REQUEST_TIMEOUT_SECONDS = 8
+SUPABASE_CONNECT_TIMEOUT_SECONDS = 4
+
+
+def _client_options() -> ClientOptions:
+    # Supabase Python defaults PostgREST calls to 120s. Bound both the
+    # PostgREST connect/read timeouts so abandoned requests cannot linger.
+    # SyncClientOptions does not accept an injected ``httpx_client``; passing
+    # one raises TypeError before any request reaches Supabase.
+    return ClientOptions(
+        postgrest_client_timeout=httpx.Timeout(
+            SUPABASE_REQUEST_TIMEOUT_SECONDS,
+            connect=SUPABASE_CONNECT_TIMEOUT_SECONDS,
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def _auth_client(url: str, publishable_key: str) -> Client:
+    return create_client(url, publishable_key, options=_client_options())
+
+
+@lru_cache(maxsize=1)
+def _role_client(url: str, service_role_key: str) -> Client:
+    return create_client(url, service_role_key, options=_client_options())
+
+
+async def _timed_auth_stage(stage: str, operation, timeout: int = SUPABASE_REQUEST_TIMEOUT_SECONDS):
+    started = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(operation), timeout=timeout)
+    except Exception as exc:
+        logger.warning(
+            "supabase_auth stage=%s outcome=error duration_ms=%d error_type=%s",
+            stage,
+            round((time.perf_counter() - started) * 1000),
+            type(exc).__name__,
+        )
+        raise
+    logger.info(
+        "supabase_auth stage=%s outcome=ok duration_ms=%d",
+        stage,
+        round((time.perf_counter() - started) * 1000),
+    )
+    return result
 
 async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
     if not credentials:
@@ -20,10 +68,10 @@ async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depe
         raise HTTPException(status_code=503, detail="Supabase authentication is unavailable")
 
     try:
-        client = create_client(config.supabase_url, config.supabase_publishable_key)
-        response = await asyncio.wait_for(
-            asyncio.to_thread(client.auth.get_user, credentials.credentials),
-            timeout=15,
+        client = _auth_client(config.supabase_url, config.supabase_publishable_key)
+        response = await _timed_auth_stage(
+            "validate_access_token",
+            lambda: client.auth.get_user(credentials.credentials),
         )
         user = response.user
         if not user:
@@ -35,12 +83,10 @@ async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depe
         if not config.supabase_service_role_key:
             logger.error("Supabase service role is not configured for role resolution")
             raise HTTPException(status_code=503, detail="Authorization service is unavailable")
-        profile_client = create_client(config.supabase_url, config.supabase_service_role_key)
-        profile = await asyncio.wait_for(
-            asyncio.to_thread(
-                lambda: profile_client.table("profiles").select("role").eq("id", user.id).maybe_single().execute().data
-            ),
-            timeout=15,
+        profile_client = _role_client(config.supabase_url, config.supabase_service_role_key)
+        profile = await _timed_auth_stage(
+            "resolve_profile_role",
+            lambda: profile_client.table("profiles").select("role").eq("id", user.id).maybe_single().execute().data,
         )
         if not profile or not profile.get("role"):
             raise HTTPException(status_code=403, detail="User profile role is not configured")
@@ -56,6 +102,12 @@ async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depe
     except asyncio.TimeoutError:
         logger.exception("Supabase access-token validation timed out")
         raise HTTPException(status_code=503, detail="Authentication service timed out")
+    except httpx.TimeoutException:
+        logger.exception("Supabase authentication dependency timed out")
+        raise HTTPException(status_code=503, detail="Authentication service timed out")
+    except httpx.TransportError:
+        logger.exception("Supabase authentication dependency is unavailable")
+        raise HTTPException(status_code=503, detail="Authentication service is unavailable")
     except HTTPException:
         raise
     except Exception:
@@ -77,7 +129,7 @@ def _profile_client() -> Client:
     config = settings()
     if not config.supabase_url or not config.supabase_service_role_key:
         raise HTTPException(status_code=503, detail="Authorization service is unavailable")
-    return create_client(config.supabase_url, config.supabase_service_role_key)
+    return _role_client(config.supabase_url, config.supabase_service_role_key)
 
 
 def _profile_for_claims(claims: dict) -> dict:
@@ -92,8 +144,10 @@ def get_current_profile(claims: dict = Depends(current_claims)) -> dict:
 
 
 def get_current_patient(claims: dict = Depends(current_claims)) -> dict:
-    profile = _profile_for_claims(claims)
-    if profile.get("role") != "patient":
+    # current_claims validates the Supabase access token and injects the
+    # canonical profile role into this server-side claims object. Do not repeat
+    # the same role query on every patient endpoint.
+    if claims.get("app_metadata", {}).get("role") != "patient":
         raise HTTPException(status_code=403, detail="Patient access required")
     patient = _profile_client().table("patients").select("*").eq("id", claims["sub"]).maybe_single().execute().data
     if not patient:
@@ -102,8 +156,7 @@ def get_current_patient(claims: dict = Depends(current_claims)) -> dict:
 
 
 def get_current_doctor(claims: dict = Depends(current_claims)) -> dict:
-    profile = _profile_for_claims(claims)
-    if profile.get("role") != "doctor":
+    if claims.get("app_metadata", {}).get("role") != "doctor":
         raise HTTPException(status_code=403, detail="Doctor access required")
     doctor = _profile_client().table("doctors").select("*").eq("id", claims["sub"]).maybe_single().execute().data
     if not doctor:

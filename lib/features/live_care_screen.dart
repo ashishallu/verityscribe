@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -450,10 +452,33 @@ class DoctorsDirectoryScreen extends ConsumerWidget {
   }
 }
 
-class AppointmentsLiveScreen extends ConsumerWidget {
+class AppointmentsLiveScreen extends ConsumerStatefulWidget {
   const AppointmentsLiveScreen({super.key});
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<AppointmentsLiveScreen> createState() =>
+      _AppointmentsLiveScreenState();
+}
+
+class _AppointmentsLiveScreenState
+    extends ConsumerState<AppointmentsLiveScreen> {
+  Timer? _expiryTicker;
+
+  @override
+  void initState() {
+    super.initState();
+    _expiryTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _expiryTicker?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final state = ref.watch(appointmentsLiveProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('My appointments')),
@@ -478,10 +503,19 @@ class AppointmentsLiveScreen extends ConsumerWidget {
                                   '${item.date} ${item.time}\n${item.hospital} • ${item.department}'),
                               isThreeLine: true,
                               trailing: Column(
+                                mainAxisSize: MainAxisSize.min,
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 crossAxisAlignment: CrossAxisAlignment.end,
                                 children: [
-                                  Text(item.status),
+                                  Text(item.isExpired ? 'Expired' : item.status,
+                                      style: TextStyle(
+                                        color: item.isExpired
+                                            ? Colors.red.shade700
+                                            : null,
+                                        fontWeight: item.isExpired
+                                            ? FontWeight.w700
+                                            : null,
+                                      )),
                                   if (item.consultationType == 'ai_chat' ||
                                       item.consultationType == 'ai_virtual')
                                     Container(
@@ -501,11 +535,21 @@ class AppointmentsLiveScreen extends ConsumerWidget {
                                               fontSize: 11,
                                               fontWeight: FontWeight.w700)),
                                     ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _appointmentExpiryLabel(item),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: item.isExpired
+                                          ? Colors.red.shade700
+                                          : const Color(0xFF667085),
+                                    ),
+                                  ),
                                 ],
                               ),
                               onTap: item.consultationType == 'ai_chat' ||
                                       item.consultationType == 'ai_virtual'
-                                  ? () => context.push(
+                                  ? item.isExpired ? null : () => context.push(
                                       '/ai-appointment/${item.id}',
                                       extra: item)
                                   : null,
@@ -517,6 +561,16 @@ class AppointmentsLiveScreen extends ConsumerWidget {
       ),
     );
   }
+}
+
+String _appointmentExpiryLabel(LiveAppointment appointment) {
+  final remaining = appointment.timeRemaining;
+  if (remaining == null) return 'Expiry unavailable';
+  if (remaining == Duration.zero) return 'Appointment expired';
+  final seconds = remaining.inSeconds;
+  final minutes = seconds ~/ 60;
+  final remainder = seconds % 60;
+  return 'Expires in ${minutes.toString().padLeft(2, '0')}:${remainder.toString().padLeft(2, '0')}';
 }
 
 class _Error extends StatelessWidget {

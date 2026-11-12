@@ -821,6 +821,11 @@ class AIProvider:
         timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
         return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=260)
 
+    def answer_consultation(self, prompt: str) -> str:
+        """Keep intake replies short so the patient is not left waiting."""
+        timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
+        return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=140)
+
     def _cloudflare_chat(self, prompt: str, *, timeout: float, max_tokens: int) -> str:
         """Generate patient-chat text with Workers AI, without a paid fallback."""
         account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
@@ -835,7 +840,7 @@ class AIProvider:
         request = Request(
             url,
             data=json.dumps({
-                "messages": [{"role": "user", "content": prompt}],
+                "prompt": prompt,
                 "temperature": 0.1,
                 "max_tokens": max(64, min(1000, max_tokens)),
             }).encode("utf-8"),

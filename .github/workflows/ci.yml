@@ -6,9 +6,10 @@ jobs:
     defaults: {run: {working-directory: admin_portal}}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
-        with: {node-version: 20, cache: pnpm, cache-dependency-path: admin_portal/pnpm-lock.yaml}
+        with: {node-version: 22, cache: pnpm, cache-dependency-path: admin_portal/pnpm-lock.yaml}
+      - uses: pnpm/action-setup@v4
+        with: {version: 11.9.0}
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm build
