@@ -20,6 +20,7 @@ class ChatMessage {
   final String? action;
   final String? reportTitle;
   final String? reportSummary;
+  final MedicalDocumentSummary? documentSummary;
   final String? extractedText;
   const ChatMessage(
       {required this.text,
@@ -29,8 +30,123 @@ class ChatMessage {
       this.action,
       this.reportTitle,
       this.reportSummary,
+      this.documentSummary,
       this.extractedText});
 }
+
+class DocumentMedicationSummary {
+  final String name, dosage, frequency, duration, instructions;
+  const DocumentMedicationSummary({
+    required this.name,
+    required this.dosage,
+    required this.frequency,
+    required this.duration,
+    required this.instructions,
+  });
+
+  factory DocumentMedicationSummary.fromJson(Map<String, dynamic> json) =>
+      DocumentMedicationSummary(
+        name: _summaryField(json['name']),
+        dosage: _summaryField(json['dosage']),
+        frequency: _summaryField(json['frequency']),
+        duration: _summaryField(json['duration']),
+        instructions: _summaryField(json['instructions']),
+      );
+}
+
+class DocumentTestResultSummary {
+  final String name, value, unit, referenceRange, status, interpretation;
+  const DocumentTestResultSummary({
+    required this.name,
+    required this.value,
+    required this.unit,
+    required this.referenceRange,
+    required this.status,
+    required this.interpretation,
+  });
+
+  factory DocumentTestResultSummary.fromJson(Map<String, dynamic> json) =>
+      DocumentTestResultSummary(
+        name: _summaryField(json['name']),
+        value: _summaryField(json['value']),
+        unit: _summaryField(json['unit']),
+        referenceRange: _summaryField(json['reference_range']),
+        status: _summaryField(json['status']),
+        interpretation: _summaryField(json['interpretation']),
+      );
+}
+
+class MedicalDocumentSummary {
+  final String documentType, title, provider, documentDate, reason, summary;
+  final List<String> documentedDiagnoses,
+      clinicalFindings,
+      recommendedTests,
+      followUp,
+      warnings,
+      missingInformation,
+      sourceReferences;
+  final List<DocumentMedicationSummary> medications;
+  final List<DocumentTestResultSummary> testResults;
+
+  const MedicalDocumentSummary({
+    required this.documentType,
+    required this.title,
+    required this.provider,
+    required this.documentDate,
+    required this.reason,
+    required this.summary,
+    required this.documentedDiagnoses,
+    required this.clinicalFindings,
+    required this.medications,
+    required this.testResults,
+    required this.recommendedTests,
+    required this.followUp,
+    required this.warnings,
+    required this.missingInformation,
+    required this.sourceReferences,
+  });
+
+  factory MedicalDocumentSummary.fromJson(Map<String, dynamic> json) =>
+      MedicalDocumentSummary(
+        documentType: _summaryField(json['document_type']),
+        title: _summaryField(json['title']),
+        provider: _summaryField(json['provider']),
+        documentDate: _summaryField(json['document_date']),
+        reason: _summaryField(json['reason']),
+        summary: _summaryField(json['summary']),
+        documentedDiagnoses: _summaryStrings(json['documented_diagnoses']),
+        clinicalFindings: _summaryStrings(json['clinical_findings']),
+        medications: _summaryMaps(json['medications'])
+            .map(DocumentMedicationSummary.fromJson)
+            .toList(),
+        testResults: _summaryMaps(json['test_results'])
+            .map(DocumentTestResultSummary.fromJson)
+            .toList(),
+        recommendedTests: _summaryStrings(json['recommended_tests']),
+        followUp: _summaryStrings(json['follow_up']),
+        warnings: _summaryStrings(json['warnings']),
+        missingInformation: _summaryStrings(json['missing_information']),
+        sourceReferences: _summaryStrings(json['source_references']),
+      );
+}
+
+String _summaryField(dynamic value) =>
+    value is String && value.trim().isNotEmpty ? value.trim() : 'Not specified';
+
+List<String> _summaryStrings(dynamic value) => value is List
+    ? value
+        .whereType<String>()
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toList()
+    : const [];
+
+List<Map<String, dynamic>> _summaryMaps(dynamic value) => value is List
+    ? value
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList()
+    : const [];
 
 class ChatSessionDocument {
   final String id;
@@ -330,9 +446,12 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           : decoded;
       final confirmation =
           (data['message'] ?? 'Your report was saved privately.').toString();
-      final summary = data['summary'] is Map
+      final summaryData = data['summary'] is Map
           ? Map<String, dynamic>.from(data['summary'] as Map)
           : <String, dynamic>{};
+      final summary = data['summary'] is Map
+          ? MedicalDocumentSummary.fromJson(summaryData)
+          : null;
       final extractedText = data['extracted_text']?.toString();
       final document = data['document'] is Map
           ? Map<String, dynamic>.from(data['document'] as Map)
@@ -356,8 +475,9 @@ class ClinicNotifier extends StateNotifier<ClinicState> {
           text: confirmation,
           isUser: false,
           sentAt: DateTime.now(),
-          reportTitle: summary['title']?.toString(),
-          reportSummary: summary['summary']?.toString(),
+          reportTitle: summaryData['title']?.toString(),
+          reportSummary: summaryData['summary']?.toString(),
+          documentSummary: summary,
           extractedText: extractedText,
         ),
       ], sessionDocuments: sessionDocuments, chatLoading: false);

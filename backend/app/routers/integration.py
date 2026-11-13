@@ -340,9 +340,11 @@ def _is_personal_health_question(message: str) -> bool:
         return True
     terms = (
         "my ", "mine", "medical record", "health record",
+        "patient's", "patient’s", "patient ",
         "report", "prescription", "medicine", "medication", "diagnosis",
         "allergy", "allergies", "allergic", "vital", "blood", "mri", "x-ray", "xray", "ecg",
-        "lab result", "consultation",
+        "lab result", "consultation", "platelet", "hemoglobin", "haemoglobin",
+        "white blood cell", "wbc", "rbc", "glucose", "creatinine", "cholesterol",
     )
     return any(term in message.lower() for term in terms)
 
@@ -1026,6 +1028,9 @@ def secure_chat(payload: ChatRequest, claims: dict = Depends(current_claims)):
         # Session-uploaded evidence is preferred and explicitly labelled as
         # machine-extracted. It is never converted into an authoritative Rx.
         if use_session_documents:
+            exact_result = _structured_result_answer(payload.message, session_documents)
+            if exact_result:
+                return response(exact_result, personal_data=True)
             evidence = _document_evidence(payload.message, session_documents)
             if not evidence:
                 return response("I couldn't find readable text relevant to that question in a document attached to this conversation. Please verify it with your clinician or pharmacist.", personal_data=True)

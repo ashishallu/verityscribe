@@ -79,6 +79,61 @@ def _rpc_boolean(data: Any) -> bool:
     )
 
 
+def _persist_live_message(
+    client,
+    session_id: str,
+    role: str,
+    content: str,
+    request_key: str,
+) -> dict[str, Any] | None:
+    """Idempotently upsert a live transcript turn, refining partial captions."""
+    text = content.strip()[:12000]
+    if not text:
+        return None
+    query = client.table("ai_consultation_messages").select(
+        "id,session_id,role,content,created_at,request_key"
+    ).eq("session_id", session_id).eq("role", role).eq(
+        "request_key", request_key
+    ).limit(1)
+    rows = getattr(query.execute(), "data", None) or []
+    existing = rows[0] if rows else None
+    if existing:
+        if existing.get("content") != text:
+            client.table("ai_consultation_messages").update({
+                "content": text,
+            }).eq("id", existing["id"]).eq("session_id", session_id).execute()
+            existing["content"] = text
+        return existing
+    try:
+        result = client.table("ai_consultation_messages").insert({
+            "session_id": session_id,
+            "role": role,
+            "content": text,
+            "request_key": request_key,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        inserted = getattr(result, "data", None) or []
+        return inserted[0] if inserted else None
+    except Exception:
+        # Concurrent final-caption and finalization requests can race. Reuse
+        # only a message scoped to the same session, speaker and request key.
+        retry = client.table("ai_consultation_messages").select(
+            "id,session_id,role,content,created_at,request_key"
+        ).eq("session_id", session_id).eq("role", role).eq(
+            "request_key", request_key
+        ).limit(1).execute()
+        existing_rows = getattr(retry, "data", None) or []
+        if not existing_rows:
+            raise
+        existing = existing_rows[0]
+        if existing.get("content") != text:
+            client.table("ai_consultation_messages").update({
+                "content": text,
+            }).eq("id", existing["id"]).eq("session_id", session_id).execute()
+            existing["content"] = text
+        return existing
+
+
 def _safe_live_client_config(config: Any) -> dict[str, Any]:
     """Return a wire-valid Live setup config without server-only instructions.
 
@@ -983,17 +1038,9 @@ async def voice_stream(websocket: WebSocket, session_id: str):
             if not text:
                 continue
             try:
-                def save_if_missing():
-                    existing = client.table("ai_consultation_messages").select("id").eq(
-                        "session_id", session_id).eq("request_key", request_key).eq(
-                        "role", role).limit(1).execute()
-                    if getattr(existing, "data", None):
-                        return
-                    client.table("ai_consultation_messages").insert({
-                        "session_id": session_id, "role": role, "content": text[:12000],
-                        "request_key": request_key,
-                    }).execute()
-                await run_in_threadpool(save_if_missing)
+                await run_in_threadpool(
+                    _persist_live_message, client, session_id, role, text, request_key,
+                )
             except Exception as exc:
                 logger.warning("AI Virtual transcript persistence failed (%s)", type(exc).__name__)
                 raise
@@ -1323,6 +1370,7 @@ async def voice_stream(websocket: WebSocket, session_id: str):
             asyncio.create_task(gemini_to_browser()),
         }
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        queue.close()
         for task in pending:
             task.cancel()
         if pending:
@@ -1339,6 +1387,10 @@ async def voice_stream(websocket: WebSocket, session_id: str):
         try:
             await send_json({"type": "error", "message": "The live voice connection ended."})
         except _VoiceClientDisconnected:
+            pass
+        try:
+            await websocket.close(code=1011, reason="Gemini Live session ended")
+        except Exception:
             pass
     finally:
         # Persist partial speech/captions even if the patient ends the call or

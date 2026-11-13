@@ -195,6 +195,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   bool _speaking = false, _ended = false, _emergency = false;
   bool _playerStreaming = false, _stoppingVoice = false, _endingCall = false;
   bool _voiceSessionReady = false;
+  bool _connected = false;
   bool _voiceCancelledBeforeReady = false;
   bool _recoveringVoice = false;
   bool _voiceStarting = false;
@@ -528,6 +529,30 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   Future<void> _sendText() async {
     final text = _input.text.trim();
     if (text.isEmpty || _sessionId == null || _loading || _ended) return;
+    if (_virtual) {
+      if (_voiceChannel == null) await _beginLiveVoice();
+      final channel = _voiceChannel;
+      if (channel == null || !_connected) {
+        if (mounted) {
+          setState(() => _error =
+              'Gemini Live is not connected. Reconnect before sending a message.');
+        }
+        return;
+      }
+      final key = _pendingChatText == text && _pendingChatKey != null
+          ? _pendingChatKey!
+          : _newRequestKey();
+      _pendingChatKey = key;
+      _pendingChatText = text;
+      _input.clear();
+      setState(() {
+        _loading = true;
+        _error = null;
+        _messages.add({'role': 'patient', 'content': text, 'request_key': key});
+      });
+      channel.sink.add(jsonEncode({'type': 'text', 'text': text, 'request_key': key}));
+      return;
+    }
     final requestKey = _pendingChatText == text && _pendingChatKey != null
         ? _pendingChatKey!
         : _newRequestKey();
@@ -845,6 +870,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       );
       if (mounted) {
         setState(() {
+          _connected = true;
           _recording = true;
           _error = null;
         });
@@ -873,6 +899,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           !_stoppingVoice &&
           !_ended) {
         setState(() {
+          _connected = false;
           _recording = false;
           _error = _liveServerStartupError ??
               (error is ApiException &&
@@ -942,7 +969,12 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           break;
         case 'transcript':
           if (mounted) {
-            setState(() => _liveTranscript = event['text']?.toString() ?? '');
+            setState(() {
+              _liveTranscript = event['text']?.toString() ?? '';
+              if (event['speaker'] == 'assistant') {
+                _speaking = event['final'] != true;
+              }
+            });
           }
           break;
         case 'caption':
@@ -983,6 +1015,11 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           _liveCaptionTurnId = null;
           _turnAudioBytes = 0;
           unawaited(_stopLivePlayback());
+          _voiceInterruptionCount++;
+          _activeVoiceTurn++;
+          _activeTurnLatency = Stopwatch()..start();
+          _activeTurnMilestones.clear();
+          _recordTurnLatency('patient_speech_detected');
           if (mounted) {
             setState(() {
               _speaking = false;
@@ -1043,16 +1080,6 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             _voiceSaveAck?.complete(true);
           }
           break;
-        case 'speech_started':
-          _voiceInterruptionCount++;
-          _activeVoiceTurn++;
-          _activeTurnLatency = Stopwatch()..start();
-          _activeTurnMilestones.clear();
-          _recordTurnLatency('patient_speech_detected');
-          // VAD/transcription onset can be echo or incidental noise. Only
-          // Gemini's explicit `interrupted` event is authoritative enough to
-          // flush speech; genuine barge-in remains immediate on that event.
-          break;
         case 'turn_started':
           final key = event['request_key']?.toString();
           _pendingVoiceKey = key;
@@ -1072,6 +1099,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               _messages.addAll(added);
               _emergency = event['emergency_warning'] == true;
               _liveTranscript = '';
+              _loading = false;
             });
           }
           _pendingVoiceKey = null;
@@ -1352,6 +1380,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     try {
       if (_recording) {
         await _recorder.pause();
+        _voiceChannel?.sink.add(jsonEncode({'type': 'end_input'}));
         if (mounted) setState(() => _recording = false);
       } else {
         await _recorder.resume();

@@ -73,12 +73,17 @@ class ASRModelPrediction {
     required this.weight,
     required this.latencyMs,
     this.errorCode,
+    this.startedAt,
+    this.completedAt,
+    this.retryCount = 0,
   });
 
   final String model, text, status;
   final double weight;
   final int latencyMs;
   final String? errorCode;
+  final String? startedAt, completedAt;
+  final int retryCount;
 
   factory ASRModelPrediction.fromJson(Map<String, dynamic> json) =>
       ASRModelPrediction(
@@ -88,6 +93,9 @@ class ASRModelPrediction {
         weight: double.tryParse('${json['weight'] ?? 1}') ?? 1,
         latencyMs: int.tryParse('${json['latency_ms'] ?? 0}') ?? 0,
         errorCode: json['error_code']?.toString(),
+        startedAt: json['started_at']?.toString(),
+        completedAt: json['completed_at']?.toString(),
+        retryCount: int.tryParse('${json['retry_count'] ?? 0}') ?? 0,
       );
 }
 
@@ -159,7 +167,17 @@ class VoiceDraftService {
   String _message(String text, int status) {
     try {
       final body = Map<String, dynamic>.from(jsonDecode(text) as Map);
-      return (body['detail'] ?? 'Voice processing failed ($status)').toString();
+      final detail = body['detail'];
+      if (detail is Map) {
+        final message = detail['message']?.toString();
+        final requestId = detail['request_id']?.toString();
+        if (message != null && message.isNotEmpty) {
+          return requestId == null || requestId.isEmpty
+              ? message
+              : '$message (Request ID: $requestId)';
+        }
+      }
+      return (detail ?? 'Voice processing failed ($status)').toString();
     } catch (_) {
       return 'Voice processing failed ($status).';
     }

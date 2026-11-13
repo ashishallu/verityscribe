@@ -1,14 +1,14 @@
-import logging
 import asyncio
+import logging
 import time
 from functools import lru_cache
 
+import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-import httpx
-from supabase import ClientOptions, create_client
+from supabase import Client, ClientOptions, create_client
+
 from .config import settings
-from supabase import Client
 
 bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
@@ -17,14 +17,14 @@ SUPABASE_CONNECT_TIMEOUT_SECONDS = 4
 
 
 def _client_options() -> ClientOptions:
-    # Supabase Python defaults PostgREST calls to 120s. Bound both the
-    # PostgREST connect/read timeouts so abandoned requests cannot linger.
-    # SyncClientOptions does not accept an injected ``httpx_client``; passing
-    # one raises TypeError before any request reaches Supabase.
+    """Bound both the shared HTTP transport and PostgREST requests."""
     return ClientOptions(
-        postgrest_client_timeout=httpx.Timeout(
-            SUPABASE_REQUEST_TIMEOUT_SECONDS,
-            connect=SUPABASE_CONNECT_TIMEOUT_SECONDS,
+        postgrest_client_timeout=SUPABASE_REQUEST_TIMEOUT_SECONDS,
+        httpx_client=httpx.Client(
+            timeout=httpx.Timeout(
+                SUPABASE_REQUEST_TIMEOUT_SECONDS,
+                connect=SUPABASE_CONNECT_TIMEOUT_SECONDS,
+            ),
         ),
     )
 
@@ -58,9 +58,15 @@ async def _timed_auth_stage(stage: str, operation, timeout: int = SUPABASE_REQUE
     )
     return result
 
-async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+
+async def current_claims(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> dict:
     if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
 
     config = settings()
     if not config.supabase_url or not config.supabase_publishable_key:
@@ -68,36 +74,36 @@ async def current_claims(credentials: HTTPAuthorizationCredentials | None = Depe
         raise HTTPException(status_code=503, detail="Supabase authentication is unavailable")
 
     try:
-        client = _auth_client(config.supabase_url, config.supabase_publishable_key)
+        auth_client = _auth_client(config.supabase_url, config.supabase_publishable_key)
         response = await _timed_auth_stage(
             "validate_access_token",
-            lambda: client.auth.get_user(credentials.credentials),
+            lambda: auth_client.auth.get_user(credentials.credentials),
         )
         user = response.user
         if not user:
             raise ValueError("Supabase returned no authenticated user")
 
-        # Authorization is based on the canonical database profile, not mutable
-        # raw user metadata or stale JWT claims. The service key remains inside
-        # FastAPI and is never returned to the caller.
+        # Resolve the canonical role from the server-side profile after the
+        # access token has been validated. Never trust mutable user_metadata.
         if not config.supabase_service_role_key:
             logger.error("Supabase service role is not configured for role resolution")
             raise HTTPException(status_code=503, detail="Authorization service is unavailable")
-        profile_client = _role_client(config.supabase_url, config.supabase_service_role_key)
+        role_client = _role_client(config.supabase_url, config.supabase_service_role_key)
         profile = await _timed_auth_stage(
             "resolve_profile_role",
-            lambda: profile_client.table("profiles").select("role").eq("id", user.id).maybe_single().execute().data,
+            lambda: role_client.table("profiles")
+            .select("role")
+            .eq("id", user.id)
+            .maybe_single()
+            .execute()
+            .data,
         )
         if not profile or not profile.get("role"):
             raise HTTPException(status_code=403, detail="User profile role is not configured")
 
         app_metadata = dict(user.app_metadata or {})
         app_metadata["role"] = profile["role"]
-        return {
-            "sub": user.id,
-            "email": user.email,
-            "app_metadata": app_metadata,
-        }
+        return {"sub": user.id, "email": user.email, "app_metadata": app_metadata}
 
     except asyncio.TimeoutError:
         logger.exception("Supabase access-token validation timed out")
@@ -133,7 +139,15 @@ def _profile_client() -> Client:
 
 
 def _profile_for_claims(claims: dict) -> dict:
-    profile = _profile_client().table("profiles").select("*").eq("id", claims["sub"]).maybe_single().execute().data
+    profile = (
+        _profile_client()
+        .table("profiles")
+        .select("*")
+        .eq("id", claims["sub"])
+        .maybe_single()
+        .execute()
+        .data
+    )
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     return profile
@@ -144,12 +158,18 @@ def get_current_profile(claims: dict = Depends(current_claims)) -> dict:
 
 
 def get_current_patient(claims: dict = Depends(current_claims)) -> dict:
-    # current_claims validates the Supabase access token and injects the
-    # canonical profile role into this server-side claims object. Do not repeat
-    # the same role query on every patient endpoint.
+    # current_claims already supplies the canonical server-resolved role.
     if claims.get("app_metadata", {}).get("role") != "patient":
         raise HTTPException(status_code=403, detail="Patient access required")
-    patient = _profile_client().table("patients").select("*").eq("id", claims["sub"]).maybe_single().execute().data
+    patient = (
+        _profile_client()
+        .table("patients")
+        .select("*")
+        .eq("id", claims["sub"])
+        .maybe_single()
+        .execute()
+        .data
+    )
     if not patient:
         raise HTTPException(status_code=404, detail="Patient record not found")
     return patient
@@ -158,7 +178,15 @@ def get_current_patient(claims: dict = Depends(current_claims)) -> dict:
 def get_current_doctor(claims: dict = Depends(current_claims)) -> dict:
     if claims.get("app_metadata", {}).get("role") != "doctor":
         raise HTTPException(status_code=403, detail="Doctor access required")
-    doctor = _profile_client().table("doctors").select("*").eq("id", claims["sub"]).maybe_single().execute().data
+    doctor = (
+        _profile_client()
+        .table("doctors")
+        .select("*")
+        .eq("id", claims["sub"])
+        .maybe_single()
+        .execute()
+        .data
+    )
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor record not found")
     return doctor

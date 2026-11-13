@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -5,12 +7,37 @@ import '../models/entities.dart';
 import '../providers/app_providers.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ui.dart';
+import '../utils/appointment_visibility.dart';
 
-class HomeScreen extends ConsumerWidget {
+class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  Timer? _appointmentRefreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _appointmentRefreshTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) {
+        if (mounted) setState(() {});
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _appointmentRefreshTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final profile = ref.watch(patientProfileProvider);
     final appointments = ref.watch(appointmentsLiveProvider);
     final medicines = ref.watch(medicinesProvider);
@@ -60,7 +87,10 @@ class HomeScreen extends ConsumerWidget {
                 onRetry: () => ref.invalidate(appointmentsLiveProvider),
               ),
               data: (items) {
-                final upcoming = filterUpcomingAppointments(items);
+                final upcoming = upcomingAppointments(
+                  items.cast<LiveAppointment>(),
+                  DateTime.now(),
+                );
                 if (upcoming.isEmpty) {
                   return _EmptyCard(
                     icon: Icons.calendar_today_outlined,
@@ -233,16 +263,19 @@ class _CareSummary extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final upcomingAppointmentCount = appointments.when(
+      data: (items) => items is List
+          ? upcomingAppointments(items.cast<LiveAppointment>(), DateTime.now())
+              .length
+              .toString()
+          : '0',
+      loading: () => '…',
+      error: (_, __) => '—',
+    );
     String count(AsyncValue<dynamic> value) => value.when(
         data: (items) => items is List ? '${items.length}' : '0',
         loading: () => '…',
         error: (_, __) => '—');
-    final upcomingCount = appointments.when(
-      data: (items) =>
-          '${filterUpcomingAppointments((items as List).whereType<LiveAppointment>()).length}',
-      loading: () => '…',
-      error: (_, __) => '—',
-    );
     return SoftCard(
       color: isDark ? const Color(0xFF202C43) : const Color(0xFFEAF2FF),
       child: Row(children: [
@@ -257,7 +290,7 @@ class _CareSummary extends StatelessWidget {
                   color: scheme.onSurface, fontWeight: FontWeight.w800)),
           const SizedBox(height: 5),
           Text(
-              '$upcomingCount upcoming appointments • ${count(medicines)} medicines • ${count(reports)} reports',
+              '$upcomingAppointmentCount upcoming appointments • ${count(medicines)} medicines • ${count(reports)} reports',
               style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12)),
         ])),
       ]),

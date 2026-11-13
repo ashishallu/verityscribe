@@ -39,22 +39,81 @@ def patient_context(client: Client, patient_id: str) -> dict[str, list[dict[str,
         "allergies": ("allergies", "id,allergen,reaction,severity"),
         "chronic_conditions": ("chronic_conditions", "id,condition_name,diagnosed_date,status"),
         "surgeries": ("surgeries", "id,surgery_name,surgery_date,outcome"),
+        "vitals": ("vitals", "*"),
+        "reports": ("reports", "id,report_type,report_date,findings,recommendations"),
+        "consultations": ("consultations", "id,summary,diagnosis,approved_at,created_at"),
     }
     for key, (table, columns) in queries.items():
         try:
-            context[key] = client.table(table).select(columns).eq("patient_id", patient_id).limit(50).execute().data or []
+            rows = client.table(table).select(columns).eq("patient_id", patient_id).limit(20).execute().data or []
+            if key == "consultations":
+                rows = [row for row in rows if row.get("approved_at")]
+            context[key] = rows
         except Exception as exc:
             # Some installations may not have every optional history module.
             # Keep model context minimal and don't log patient content.
             logger.info("Optional patient context unavailable: %s (%s)", table, type(exc).__name__)
             context[key] = []
     try:
+        profile = client.table("patients").select(
+            "date_of_birth,blood_group,height_cm,weight_kg"
+        ).eq("id", patient_id).maybe_single().execute().data or {}
+        context["patient_profile"] = [profile] if profile else []
+    except Exception as exc:
+        logger.info("Optional patient profile context unavailable (%s)", type(exc).__name__)
+        context["patient_profile"] = []
+    try:
         context["current_prescriptions"] = client.table("prescriptions").select(
             "id,prescription_date,expiry_date,notes,prescription_items(quantity,dosage,frequency,medicine:medicines(id,name,generic_name,strength))"
-        ).eq("patient_id", patient_id).order("prescription_date", desc=True).limit(20).execute().data or []
+        ).eq("patient_id", patient_id).order("prescription_date", desc=True).limit(12).execute().data or []
     except Exception as exc:
         logger.info("Optional patient context unavailable: prescriptions (%s)", type(exc).__name__)
         context["current_prescriptions"] = []
+    # Documents and OCR results are patient-owned evidence. Limit both rows and
+    # text sent to the model; never use a document id without the patient filter.
+    try:
+        documents = client.table("medical_documents").select(
+            "id,document_type,created_at"
+        ).eq("patient_id", patient_id).order("created_at", desc=True).limit(12).execute().data or []
+        document_ids = [str(row["id"]) for row in documents if row.get("id")]
+        extracted_by_id: dict[str, dict[str, Any]] = {}
+        if document_ids:
+            extracted = client.table("patient_embeddings").select(
+                "source_document_id,content,structured_results,created_at"
+            ).eq("patient_id", patient_id).in_("source_document_id", document_ids).order(
+                "created_at", desc=True
+            ).limit(12).execute().data or []
+            for row in extracted:
+                source_id = str(row.get("source_document_id") or "")
+                if source_id and source_id not in extracted_by_id:
+                    extracted_by_id[source_id] = row
+        uploaded_reports = []
+        text_budget = 10000
+        for document in documents:
+            source_id = str(document.get("id") or "")
+            extracted = extracted_by_id.get(source_id)
+            if not extracted:
+                continue
+            text = str(extracted.get("content") or "")[: min(1800, text_budget)]
+            text_budget -= len(text)
+            if isinstance(extracted.get("structured_results"), str):
+                try:
+                    structured = json.loads(extracted["structured_results"])
+                except (TypeError, ValueError):
+                    structured = []
+            else:
+                structured = extracted.get("structured_results") or []
+            uploaded_reports.append({
+                **document,
+                "extracted_text": text,
+                "structured_results": structured[:40] if isinstance(structured, list) else [],
+            })
+            if text_budget <= 0:
+                break
+        context["uploaded_reports"] = uploaded_reports
+    except Exception as exc:
+        logger.info("Optional uploaded report context unavailable (%s)", type(exc).__name__)
+        context["uploaded_reports"] = []
     return context
 
 

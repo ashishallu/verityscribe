@@ -74,6 +74,26 @@ class _UploadClient extends http.BaseClient {
     final body = utf8.encode(jsonEncode({
       'data': {
         'message': 'Saved privately.',
+        'summary': {
+          'document_type': 'prescription',
+          'title': 'Prescription',
+          'provider': 'Not specified',
+          'document_date': 'Not specified',
+          'reason': 'Not specified',
+          'summary': 'One medicine is listed.',
+          'documented_diagnoses': [],
+          'clinical_findings': [],
+          'medications': [
+            {'name': 'Drug A', 'dosage': '5 mg'}
+          ],
+          'test_results': [],
+          'recommended_tests': [],
+          'follow_up': [],
+          'warnings': [],
+          'missing_information': [],
+          'source_references': [],
+        },
+        'extracted_text': 'Drug A 5 mg',
         'document': {'id': 'document-1'},
       }
     }));
@@ -171,6 +191,10 @@ void main() {
         reportType: 'prescription', filename: 'sample.png', bytes: [1, 2, 3]);
     expect(uploadClient.lastRequest?.fields['session_id'], _sessionA);
     expect(notifier.state.sessionDocuments.single.id, 'document-1');
+    final result = notifier.state.messages.last;
+    expect(result.documentSummary?.title, 'Prescription');
+    expect(result.documentSummary?.medications.single.dosage, '5 mg');
+    expect(result.extractedText, 'Drug A 5 mg');
   });
 
   test('invalid ID returned from session creation is not submitted', () async {

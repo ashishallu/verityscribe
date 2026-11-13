@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'package:http/http.dart' as http;
 import '../constants/endpoints.dart';
 
@@ -44,7 +45,7 @@ class HttpApiClient implements ApiClient {
 
   Uri _uri(String path) => Uri.parse('$apiBaseUrl$path');
   Future<ApiResponse<T>> _request<T>(
-      Future<http.Response> Function() call) async {
+      String path, Future<http.Response> Function() call) async {
     try {
       // A cold free-tier backend can take longer than a normal interactive
       // request to wake. The server now batches appointment relationships,
@@ -60,25 +61,37 @@ class HttpApiClient implements ApiClient {
         }
       }
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ApiException(response.body, statusCode: response.statusCode);
+        developer.log(
+            'API request failed: $path returned HTTP ${response.statusCode}',
+            name: 'verity.api');
+        throw ApiException('The server returned HTTP ${response.statusCode}.',
+            statusCode: response.statusCode);
       }
       return ApiResponse<T>(jsonDecode(response.body) as T,
           statusCode: response.statusCode);
     } on TimeoutException {
-      throw const ApiException('The service is taking too long. Please retry.');
-    } on http.ClientException {
-      throw const ApiException('You appear to be offline.');
+      developer.log('API request timed out after 30 seconds: $path',
+          name: 'verity.api');
+      throw ApiException(
+          'The API request for $path timed out after 30 seconds.');
+    } on http.ClientException catch (error) {
+      developer.log('API connection failed for $path (${error.runtimeType})',
+          name: 'verity.api');
+      throw ApiException(
+          'Could not connect to the API for $path. Check service availability, network access, and browser permissions.');
     }
   }
 
   @override
   Future<ApiResponse<T>> get<T>(String path) async => _request<T>(
-      () async => _client.get(_uri(path), headers: await _headers()));
+      path, () async => _client.get(_uri(path), headers: await _headers()));
   @override
   Future<ApiResponse<T>> post<T>(
           String path, Map<String, dynamic> body) async =>
-      _request<T>(() async => _client.post(_uri(path),
-          headers: await _headers(), body: jsonEncode(body)));
+      _request<T>(
+          path,
+          () async => _client.post(_uri(path),
+              headers: await _headers(), body: jsonEncode(body)));
 }
 
 class ApiService {

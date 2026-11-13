@@ -20,7 +20,7 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
   Duration recordingDuration = Duration.zero;
   DateTime? recordingStarted;
   List<Map<String, dynamic>> medicines = [];
-  Map<String, dynamic>? selected, aiDraft;
+  Map<String, dynamic>? selected, aiDraft, asrDraft, savedTranscript;
   final chatQuestion = TextEditingController();
   String? chatAnswer;
   bool chatLoading = false;
@@ -89,19 +89,48 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
 
   Future<void> uploadRecording() async {
     if (audioPath == null || consultationId == null || saving) return;
-    setState(() { saving = true; voiceStatus = 'UPLOADING'; error = null; });
+    setState(() { saving = true; voiceStatus = 'UPLOADING'; error = null; asrDraft = null; savedTranscript = null; });
     try {
       final result = await widget.repo.uploadVoice(consultationId!, audioPath!);
       final data = Map<String, dynamic>.from((result['data'] as Map?) ?? result);
       final transcript = data['transcript'];
-      if (transcript is Map) { transcriptId.text = transcript['id'].toString(); voiceStatus = 'TRANSCRIBED'; }
-      else { voiceStatus = 'ERROR'; error = 'Transcription is temporarily unavailable. You can retry or continue manually.'; }
+      asrDraft = data['asr'] is Map ? Map<String, dynamic>.from(data['asr'] as Map) : null;
+      if (transcript is Map) {
+        savedTranscript = Map<String, dynamic>.from(transcript);
+        transcriptId.text = transcript['id'].toString();
+        voiceStatus = 'TRANSCRIBED';
+      }
+      else { voiceStatus = 'ERROR'; error = 'No model returned a usable transcript. Review the provider statuses below, then retry or continue manually.'; }
       setState(() {});
     } catch (_) { setState(() { voiceStatus = 'ERROR'; error = 'Upload failed. You can retry or record again.'; }); }
     finally { if (mounted) setState(() => saving = false); }
   }
 
   Widget draftValue(String label, dynamic value) => Padding(padding: const EdgeInsets.only(top: 6), child: Text('$label: ${value ?? 'No data'}'));
+
+  List<Widget> _asrPredictionWidgets() {
+    final predictions = (asrDraft?['predictions'] as List? ?? const [])
+        .whereType<Map>()
+        .map((value) => Map<String, dynamic>.from(value))
+        .toList();
+    if (predictions.isEmpty) {
+      return [
+        const Text('ASR model predictions were not included in this response.'),
+      ];
+    }
+    return predictions.map((prediction) {
+      final success = '${prediction['status'] ?? ''}'.toUpperCase() == 'SUCCESS';
+      return Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${prediction['model'] ?? 'ASR model'} • ${success ? '${prediction['latency_ms'] ?? 0} ms' : 'unavailable'}', style: const TextStyle(fontWeight: FontWeight.w700)),
+          SelectableText(success
+              ? '${prediction['text'] ?? ''}'
+              : 'No transcript returned (${prediction['error_code'] ?? 'provider unavailable'}).'),
+        ]),
+      );
+    }).toList();
+  }
 
   @override Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('Clinical workspace')),
@@ -116,6 +145,20 @@ class _ClinicalWorkspaceState extends State<ClinicalWorkspace> {
       if (consultationId != null) ...[
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('AI Assistant — Patient Context Active', style: TextStyle(fontWeight: FontWeight.w800)), TextField(controller: chatQuestion, decoration: const InputDecoration(labelText: 'Ask about this patient')), FilledButton(onPressed: chatLoading ? null : askAi, child: Text(chatLoading ? 'Thinking…' : 'Ask AI')), if (chatAnswer != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(chatAnswer!))]))),
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('Voice consultation', style: TextStyle(fontWeight: FontWeight.w800)), Text(voiceStatus ?? 'IDLE'), if (recordingStarted != null) const Text('Recording…'), if (recordingStarted == null && audioPath == null) FilledButton(onPressed: startRecording, child: const Text('Start recording')), if (recordingStarted != null) Wrap(spacing: 8, children: [FilledButton(onPressed: stopRecording, child: const Text('Stop')), OutlinedButton(onPressed: cancelRecording, child: const Text('Cancel'))]), if (audioPath != null && recordingStarted == null) Wrap(spacing: 8, children: [Text('Duration: ${recordingDuration.inSeconds}s'), FilledButton(onPressed: saving ? null : uploadRecording, child: const Text('Upload')), OutlinedButton(onPressed: () async { await cancelRecording(); await startRecording(); }, child: const Text('Record again'))])]))),
+        if (asrDraft != null) Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('VOICE TRANSCRIPT — REVIEW BEFORE USE', style: TextStyle(fontWeight: FontWeight.w800)),
+          Text('Execution: ${asrDraft!['execution_status'] ?? 'not reported'}'),
+          Text('Comparison: ${asrDraft!['reconciliation_status'] ?? 'not reported'}'),
+          const SizedBox(height: 8),
+          const Text('Saved transcript', style: TextStyle(fontWeight: FontWeight.w700)),
+          SelectableText('${savedTranscript?['transcript_text'] ?? 'No transcript returned'}'),
+          const Divider(), const Text('Model predictions', style: TextStyle(fontWeight: FontWeight.w700)),
+          ..._asrPredictionWidgets(),
+          if ((asrDraft!['conflicts'] as List? ?? const []).isNotEmpty) ...[
+            const Divider(), const Text('Differences to verify', style: TextStyle(fontWeight: FontWeight.w700)),
+            ...((asrDraft!['conflicts'] as List).map((item) => Text('• $item'))),
+          ],
+        ]))),
         Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('AI-GENERATED DRAFT — REQUIRES DOCTOR REVIEW', style: TextStyle(fontWeight: FontWeight.w800, color: Colors.deepPurple)),
           TextField(controller: transcriptId, decoration: const InputDecoration(labelText: 'Verified transcript ID')),

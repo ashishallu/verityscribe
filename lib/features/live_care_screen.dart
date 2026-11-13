@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../providers/app_providers.dart';
 import '../models/entities.dart';
+import '../core/services/api_service.dart';
 
 class AppointmentBookingScreen extends ConsumerStatefulWidget {
   const AppointmentBookingScreen({super.key});
@@ -26,6 +27,12 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
       timeText = TextEditingController();
   bool submitting = false, showPayment = false, booked = false;
   String? error;
+
+  String _directoryError(Object error) {
+    if (error is ApiException) return error.message;
+    return 'The directory could not be loaded. Check your connection and retry.';
+  }
+
   @override
   void dispose() {
     reason.dispose();
@@ -69,11 +76,12 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
         setState(() => booked = true);
       }
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         setState(() {
           submitting = false;
           error = 'Unable to book the appointment. Please try another time.';
         });
+      }
     }
   }
 
@@ -91,7 +99,7 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                 (department == null || d.departmentId == department!.id))
             .toList() ??
         <DoctorDirectoryItem>[];
-    if (booked)
+    if (booked) {
       return Scaffold(
           backgroundColor: const Color(0xFFF5F7FC),
           body: Center(
@@ -122,13 +130,14 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                         width: double.infinity,
                         child: FilledButton.icon(
                             onPressed: () {
-                              ref.refresh(appointmentsLiveProvider.future);
+                              ref.invalidate(appointmentsLiveProvider);
                               context.go('/home');
                             },
                             icon: const Icon(Icons.home_outlined),
                             label: const Text('Return to home'))),
                   ]))));
-    if (showPayment)
+    }
+    if (showPayment) {
       return Scaffold(
           appBar: AppBar(title: const Text('Confirm and pay')),
           body: ListView(padding: const EdgeInsets.all(20), children: [
@@ -159,6 +168,7 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                     : () => setState(() => showPayment = false),
                 child: const Text('Back'))
           ]));
+    }
     return Scaffold(
         backgroundColor: const Color(0xFFF5F7FC),
         appBar: AppBar(
@@ -180,7 +190,9 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                     const _FieldTitle('Hospital'),
                     hospitals.when(
                         loading: () => const LinearProgressIndicator(),
-                        error: (e, _) => const Text('Unable to load hospitals'),
+                        error: (e, _) => _DirectoryLoadFailure(
+                            message: _directoryError(e),
+                            onRetry: () => ref.invalidate(hospitalsProvider)),
                         data: (items) => DropdownButtonFormField<Hospital>(
                             initialValue: hospital,
                             items: items
@@ -200,8 +212,14 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                     const _FieldTitle('Department'),
                     departments.when(
                         loading: () => const LinearProgressIndicator(),
-                        error: (e, _) =>
-                            const Text('Unable to load departments'),
+                        error: (e, _) => _DirectoryLoadFailure(
+                            message: _directoryError(e),
+                            onRetry: () {
+                              if (hospital != null) {
+                                ref.invalidate(
+                                    departmentsProvider(hospital!.id));
+                              }
+                            }),
                         data: (items) => DropdownButtonFormField<Department>(
                             initialValue: department,
                             items: items
@@ -219,17 +237,26 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                                 prefixIcon: Icon(Icons.category_outlined)))),
                     const SizedBox(height: 18),
                     const _FieldTitle('Doctor'),
-                    DropdownButtonFormField<DoctorDirectoryItem>(
-                        initialValue: doctor,
-                        items: filtered
-                            .map((x) => DropdownMenuItem(
-                                value: x,
-                                child: Text('${x.name} • ${x.specialization}')))
-                            .toList(),
-                        onChanged: (x) => setState(() => doctor = x),
-                        decoration: const InputDecoration(
-                            hintText: 'Select available doctor',
-                            prefixIcon: Icon(Icons.person_outline))),
+                    doctors.when(
+                        loading: () => const LinearProgressIndicator(),
+                        error: (e, _) => _DirectoryLoadFailure(
+                              message: _directoryError(e),
+                              onRetry: () =>
+                                  ref.invalidate(doctorsDirectoryProvider),
+                            ),
+                        data: (_) =>
+                            DropdownButtonFormField<DoctorDirectoryItem>(
+                                initialValue: doctor,
+                                items: filtered
+                                    .map((x) => DropdownMenuItem(
+                                        value: x,
+                                        child: Text(
+                                            '${x.name} • ${x.specialization}')))
+                                    .toList(),
+                                onChanged: (x) => setState(() => doctor = x),
+                                decoration: const InputDecoration(
+                                    hintText: 'Select available doctor',
+                                    prefixIcon: Icon(Icons.person_outline)))),
                     if (doctor != null)
                       Text(
                           '${doctor!.hospital} • ${doctor!.department} • ₹${doctor!.fee}'),
@@ -312,11 +339,12 @@ class _AppointmentBookingState extends ConsumerState<AppointmentBookingScreen> {
                               ]),
                             )),
                           );
-                          if (picked != null)
+                          if (picked != null) {
                             setState(() {
                               time = picked;
                               timeText.text = picked.format(context);
                             });
+                          }
                         },
                         child: InputDecorator(
                           decoration: const InputDecoration(
@@ -588,4 +616,28 @@ class _Error extends StatelessWidget {
             Text(message, textAlign: TextAlign.center),
             TextButton(onPressed: retry, child: const Text('Retry'))
           ])));
+}
+
+class _DirectoryLoadFailure extends StatelessWidget {
+  const _DirectoryLoadFailure({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(message,
+              style: TextStyle(color: Theme.of(context).colorScheme.error)),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh_rounded),
+              label: const Text('Retry'),
+            ),
+          ),
+        ],
+      );
 }

@@ -170,7 +170,7 @@ class _RecordingScreenState extends ConsumerState<RecordingScreen>
                   ?.copyWith(fontWeight: FontWeight.w800)),
           const SizedBox(height: 6),
           const Text(
-              'Two ASR passes run in parallel. When both return a transcript, a reconciliation step compares them before clinician review.',
+              'Five configured ASR models run in parallel. Available transcripts are compared before clinician review; model access and provider availability can affect how many return.',
               style: TextStyle(color: AppTheme.muted, height: 1.45)),
           const SizedBox(height: 20),
           appointments.when(
@@ -479,7 +479,7 @@ class _SessionReviewScreenState extends ConsumerState<SessionReviewScreen> {
 
   Widget _predictionCard(ASRModelPrediction prediction) {
     final successful = widget.result!.predictions
-        .where((item) => item.status == 'success')
+        .where((item) => item.status.toUpperCase() == 'SUCCESS')
         .toList();
     final tokenCounts = <String, int>{};
     for (final item in successful) {
@@ -495,7 +495,7 @@ class _SessionReviewScreenState extends ConsumerState<SessionReviewScreen> {
         .allMatches(transcript.text.toLowerCase())
         .map((match) => match.group(0)!)
         .toSet();
-    final statusColor = prediction.status == 'success'
+    final statusColor = prediction.status.toUpperCase() == 'SUCCESS'
         ? Colors.teal
         : Theme.of(context).colorScheme.error;
     final predictionStyle = Theme.of(context).textTheme.bodyMedium?.copyWith(
