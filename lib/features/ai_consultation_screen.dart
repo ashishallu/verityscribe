@@ -848,9 +848,9 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         encoder: AudioEncoder.pcm16bits,
         sampleRate: 16000,
         numChannels: 1,
-        echoCancel: true,
-        noiseSuppress: true,
-        autoGain: true,
+        echoCancel: false,
+        noiseSuppress: false,
+        autoGain: false,
       ));
       _recordVoiceLatency('microphone_stream_started');
       if (generation != _voiceLifecycleGeneration ||
@@ -880,9 +880,20 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               channel.sink.add(chunk);
             }
             transmittedChunkCount++;
+            // Measure PCM16 amplitude locally; never log or retain audio data.
+            var peakSample = 0;
+            for (var i = 0; i < chunk.length - 1; i += 2) {
+              var sample = chunk[i] | (chunk[i + 1] << 8);
+              if (sample >= 32768) sample -= 65536;
+              final absoluteSample = sample.abs();
+              if (absoluteSample > peakSample) peakSample = absoluteSample;
+            }
             if (transmittedChunkCount % 20 == 0) {
+              final status = peakSample < 100
+                  ? 'SILENCE (peak=$peakSample) - Check Windows/Chrome mic device!'
+                  : 'AUDIO DETECTED (peak=$peakSample)';
               debugPrint(
-                  'AI Virtual mic streaming: chunk #$transmittedChunkCount (${chunk.length} bytes)');
+                  'AI Virtual mic: chunk #$transmittedChunkCount | $status');
             }
             if (_activeTurnMilestones.add('local_audio_processing')) {
               debugPrint(
