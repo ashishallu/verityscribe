@@ -173,12 +173,13 @@ def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc
             self.audio.append(data)
 
         async def receive(self):
-            if not getattr(self, "sent_start", False):
-                self.sent_start = True
-                return {"type": "websocket.receive", "text": '{"type":"start_input"}'}
-            if not getattr(self, "sent_audio", False):
-                self.sent_audio = True
-                return {"type": "websocket.receive", "bytes": b"\x10\x00\x20\x00"}
+            if not getattr(self, "sent_audio_1", False):
+                self.sent_audio_1 = True
+                # 4,000 PCM16 samples at amplitude 2,000 = 250 ms of voice.
+                return {"type": "websocket.receive", "bytes": b"\xd0\x07" * 4000}
+            if not getattr(self, "sent_audio_2", False):
+                self.sent_audio_2 = True
+                return {"type": "websocket.receive", "bytes": b"\xd0\x07" * 4000}
             if not getattr(self, "sent_end_input", False):
                 self.sent_end_input = True
                 return {"type": "websocket.receive", "text": '{"type":"end_input"}'}
@@ -335,9 +336,9 @@ def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc
     assert any(event["type"] == "session_saved" for event in fake_socket.events)
     assert queues[0].activity_starts == 1
     assert queues[0].activity_ends == 1
-    assert len(queues[0].audio) == 1
+    assert len(queues[0].audio) == 2
     assert {row["role"] for row in persisted} == {"patient", "assistant"}
-    assert queues[0].audio[0].data == b"\x10\x00\x20\x00"
+    assert all(blob.data == b"\xd0\x07" * 4000 for blob in queues[0].audio)
     assert queues[0].audio[0].mime_type == "audio/pcm;rate=16000"
     assert len(queues[0].contents) == 2  # Kickoff and in-session typed message.
     assert queues[0].contents[1].parts[0].text == "What should I know?"

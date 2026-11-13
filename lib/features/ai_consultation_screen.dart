@@ -161,6 +161,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   Map<String, dynamic>? _directGeminiConfig;
   bool _voiceInputActivityActive = false;
   int _voiceInputSilenceSamples = 0;
+  int _voiceInputSpeechSamples = 0;
+  int _voiceInputConsecutiveVoiceChunks = 0;
   String _directPatientTurn = '';
   String _directAssistantTurn = '';
   String? _directTurnKey;
@@ -841,6 +843,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       _voiceReconnectAttempts = 0;
       _voiceInputActivityActive = false;
       _voiceInputSilenceSamples = 0;
+      _voiceInputSpeechSamples = 0;
+      _voiceInputConsecutiveVoiceChunks = 0;
       if (mounted) {
         setState(() {
           _connected = true;
@@ -855,8 +859,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         sampleRate: 16000,
         numChannels: 1,
         echoCancel: false,
-        noiseSuppress: false,
-        autoGain: false,
+        noiseSuppress: true,
+        autoGain: true,
       ));
       _recordVoiceLatency('microphone_stream_started');
       if (generation != _voiceLifecycleGeneration ||
@@ -881,25 +885,31 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               if (absoluteSample > peakSample) peakSample = absoluteSample;
             }
 
-            // Client-side turn boundaries for the ADK proxy. Direct Gemini
-            // keeps its configured native server-side VAD.
-            if (peakSample > 400) {
-              if (!_voiceInputActivityActive && !_directGemini) {
-                channel.sink.add(jsonEncode({'type': 'start_input'}));
-              }
-              _voiceInputActivityActive = true;
-              _voiceInputSilenceSamples = 0;
-            } else if (_voiceInputActivityActive) {
-              _voiceInputSilenceSamples += chunk.length ~/ 2;
-              // Count PCM samples, not chunks: record_web's default chunk size
-              // varies, so this gives a reliable ~1.3 second silence window.
-              if (_voiceInputSilenceSamples >= 20800) {
-                _voiceInputActivityActive = false;
+            // Require sustained voiced energy so clicks or room noise do not
+            // count as a spoken turn. Count samples because browser chunk sizes
+            // vary; 8,000 samples is 0.5s and 24,000 is 1.5s at 16kHz.
+            final chunkSamples = chunk.length ~/ 2;
+            if (peakSample >= 1200) {
+              _voiceInputConsecutiveVoiceChunks++;
+              _voiceInputSpeechSamples += chunkSamples;
+              if (_voiceInputConsecutiveVoiceChunks >= 2 &&
+                  _voiceInputSpeechSamples >= 8000) {
+                _voiceInputActivityActive = true;
                 _voiceInputSilenceSamples = 0;
-                if (!_directGemini) {
-                  debugPrint(
-                      'AI Virtual: speech pause detected (~1.3s), ending input turn');
-                  channel.sink.add(jsonEncode({'type': 'end_input'}));
+              }
+            } else {
+              _voiceInputConsecutiveVoiceChunks = 0;
+              _voiceInputSpeechSamples = 0;
+              if (_voiceInputActivityActive) {
+                _voiceInputSilenceSamples += chunkSamples;
+                if (_voiceInputSilenceSamples >= 24000) {
+                  _voiceInputActivityActive = false;
+                  _voiceInputSilenceSamples = 0;
+                  if (!_directGemini) {
+                    debugPrint(
+                        'AI Virtual: speech ended (1.5s silence), submitting turn');
+                    channel.sink.add(jsonEncode({'type': 'end_input'}));
+                  }
                 }
               }
             }
@@ -919,9 +929,11 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             }
             transmittedChunkCount++;
             if (transmittedChunkCount % 20 == 0) {
-              final status = peakSample < 100
-                  ? 'SILENCE (peak=$peakSample) - Check Windows/Chrome mic device!'
-                  : 'AUDIO DETECTED (peak=$peakSample)';
+              final status = peakSample < 300
+                  ? 'IDLE / ROOM NOISE (peak=$peakSample)'
+                  : (peakSample >= 1200
+                      ? 'VOICE SPOKEN (peak=$peakSample)'
+                      : 'SOFT AUDIO (peak=$peakSample)');
               debugPrint(
                   'AI Virtual mic: chunk #$transmittedChunkCount | $status');
             }
@@ -1460,6 +1472,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         }
         _voiceInputActivityActive = false;
         _voiceInputSilenceSamples = 0;
+        _voiceInputSpeechSamples = 0;
+        _voiceInputConsecutiveVoiceChunks = 0;
         if (mounted) setState(() => _recording = false);
       } else {
         await _recorder.resume();
