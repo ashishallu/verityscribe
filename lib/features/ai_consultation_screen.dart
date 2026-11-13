@@ -400,12 +400,13 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       _voiceLatencyMilestones.clear();
       _recordVoiceLatency('start_button_pressed');
     }
-    // Begin browser audio initialization inside the Start gesture, but overlap
-    // it with the consented appointment/session request instead of serializing
-    // two independent setup operations on the critical path.
+    // Ensure player is open inside the explicit user gesture, but do NOT start
+    // the stream without data. _queueLiveAudio starts playback when chunks arrive.
     Object? audioOutputError;
     final Future<void> audioOutputReady = _virtual
-        ? _startLivePlayerStream().catchError((Object error) {
+        ? _ensureLivePlayer()
+            .timeout(const Duration(seconds: 2))
+            .catchError((Object error) {
             audioOutputError = error;
           })
         : Future<void>.value();
@@ -428,8 +429,9 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         },
       );
       if (_virtual) _recordVoiceLatency('consultation_session_created');
-      await audioOutputReady;
-      if (audioOutputError != null) throw audioOutputError!;
+      try {
+        await audioOutputReady.timeout(const Duration(seconds: 2));
+      } catch (_) {}
       if (_virtual) _recordVoiceLatency('audio_output_initialized');
       if (mounted) setState(() => _loadSession(_data(response.data)));
       // Starting an appointment can return its existing durable session.
