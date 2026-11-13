@@ -1955,6 +1955,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                     const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                 child: Row(children: [
                   IconButton(
+                      tooltip: 'Back',
                       onPressed: () => context.pop(),
                       icon: const Icon(Icons.arrow_back_ios_new_rounded)),
                   const Expanded(
@@ -1964,6 +1965,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                   fontSize: 18, fontWeight: FontWeight.w600)))),
                   Text(_duration, style: const TextStyle(fontFeatures: [])),
                   PopupMenuButton<String>(
+                      tooltip: 'More voice options',
                       icon: const Icon(Icons.more_vert),
                       itemBuilder: (_) => const [
                             PopupMenuItem(
@@ -2005,13 +2007,17 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             _IridescentVoiceOrb(
                 size: orbSize, speaking: _speaking, listening: _recording),
             const SizedBox(height: 24),
-            SizedBox(
-              height: 74,
+            ConstrainedBox(
+              constraints: const BoxConstraints(minHeight: 74),
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 28),
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                 child: Center(
                   child: _showCaptions && _liveTranscript.isNotEmpty
-                      ? Column(
+                      ? Semantics(
+                          liveRegion: true,
+                          container: true,
+                          label: '$_captionSpeaker: $_liveTranscript',
+                          child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
                             Text(_captionSpeaker,
@@ -2023,7 +2029,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                 )),
                             const SizedBox(height: 5),
                             Text(_liveTranscript,
-                                maxLines: 2,
+                                maxLines: 4,
                                 overflow: TextOverflow.ellipsis,
                                 textAlign: TextAlign.center,
                                 style: const TextStyle(
@@ -2031,7 +2037,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                     height: 1.35,
                                     color: Color(0xFF454968))),
                           ],
-                        )
+                        ))
                       : const Text(
                           'Speak your thoughts freely and get personalized guidance',
                           textAlign: TextAlign.center,

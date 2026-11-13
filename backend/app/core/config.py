@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     # may override either model through their process environment.
     gemini_live_model: str = "gemini-3.8-live"
     gemini_live_voice: str = "Aoede"
-    gemini_live_silence_duration_ms: int = 600
+    # Shorter end-of-speech detection improves turn latency while retaining
+    # enough silence to avoid cutting off natural pauses.
+    gemini_live_silence_duration_ms: int = 450
     gemini_summary_model: str = "gemini-3.8-flash"
     cors_origins: str = DEFAULT_CORS_ORIGINS
     # Resolve backend/.env regardless of caller cwd. Pydantic Settings gives

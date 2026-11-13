@@ -360,13 +360,9 @@ def _fallback_clinical_summary(messages: list[dict[str, Any]], *, interview_comp
         reported.append(content)
         q = previous_question
         previous_question = ""
-        # Keep the verbatim answer in the raw messages table. Mixed-script
-        # fragments from live ASR are not silently transliterated into facts.
-        summary_content = re.sub(r"[\u0900-\u0DFF]+", "[unclear speech fragment]", content).strip().rstrip(" .!?;:")
-        if summary_content != content and "The transcript contains a speech-recognition fragment in another script; confirm its meaning with the patient." not in uncertainties:
-            uncertainties.append("The transcript contains a speech-recognition fragment in another script; confirm its meaning with the patient.")
-        if summary_content == "[unclear speech fragment]":
-            continue
+        # Preserve the patient's original language and code-switching in the
+        # fallback summary. Never classify non-Latin text as recognition noise.
+        summary_content = content.strip().rstrip(" .!?;:")
         if re.search(r"\b(surgery|operation|operated|arthroscopy|replacement)\b", content, re.I):
             categorized["relevant_history"].append(content)
             detail_lines.append(f"Relevant history: the patient reports {summary_content}")
@@ -411,9 +407,22 @@ def _fallback_clinical_summary(messages: list[dict[str, Any]], *, interview_comp
             categorized["additional_notes"].append(content)
             detail_lines.append(f"Additional patient-reported detail: '{summary_content}'")
     completion = "complete" if interview_complete else "ended_early"
-    clinical_summary = ". ".join(detail_lines)
-    if clinical_summary and not clinical_summary.endswith((".", "!", "?")):
-        clinical_summary += "."
+    narrative = ". ".join(detail_lines)
+    if narrative and not narrative.endswith((".", "!", "?")):
+        narrative += "."
+    # Keep the doctor-facing fallback in the same eight-section shape as the
+    # generated note. Unknowns are explicit; assistant questions are never
+    # copied into patient findings.
+    clinical_summary = "\n".join((
+        "### 1. Chief Complaint\n" + (categorized["symptoms"][0] if categorized["symptoms"] else "Not discussed."),
+        "### 2. History of Present Illness\n" + (narrative or "Not discussed."),
+        "### 3. Relevant Medical History\n" + ("; ".join(categorized["relevant_history"]) or "Not discussed."),
+        "### 4. Clinical Findings\nNo examination findings or vital signs were recorded in this consultation.",
+        "### 5. Assessment\nClinical assessment pending physician review; no diagnosis generated.",
+        "### 6. Treatment Plan\nNo clinician-approved treatment plan recorded.",
+        "### 7. Advice and Follow-up\nNo clinician advice or follow-up was recorded.",
+        "### 8. Additional Notes\n" + ("Clarify: " + "; ".join(uncertainties) if uncertainties else "Other clinical details not discussed."),
+    ))
     return {
         "clinical_summary": clinical_summary or "No patient statements were captured. Clinician review is required.",
         "chief_complaint": reported[0] if reported else None,
@@ -742,9 +751,18 @@ def persist_direct_live_turn(session_id: str, payload: DirectLiveTurnRequest, cl
             continue
         existing = by_role.get(role)
         if existing:
+            # Gemini may revise a partial transcription before finalizing the
+            # same turn. Update its idempotency-keyed row instead of rejecting
+            # the corrected transcript as a conflicting duplicate.
             if existing.get("content") != content:
-                raise HTTPException(status_code=409, detail="The turn key was already used")
-            saved.append(existing)
+                updated = client.table("ai_consultation_messages").update({
+                    "content": content,
+                }).eq("session_id", session_id).eq(
+                    "request_key", payload.request_key
+                ).eq("role", role).execute().data or []
+                saved.append(updated[0] if updated else {**existing, "content": content})
+            else:
+                saved.append(existing)
             continue
         try:
             inserted = client.table("ai_consultation_messages").insert({

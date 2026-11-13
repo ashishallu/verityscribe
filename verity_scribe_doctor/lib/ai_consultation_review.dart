@@ -168,12 +168,18 @@ class _AIConsultationReviewScreenState
                             horizontal: 10, vertical: 7),
                         decoration: BoxDecoration(
                             color: incomplete
-                                ? Colors.orange.withValues(alpha: .12)
+                                ? const Color(0xFFFFFBEB)
                                 : _reviewBlue.withValues(alpha: .09),
                             borderRadius: BorderRadius.circular(10)),
                         child: Text(incomplete
                             ? 'INCOMPLETE — do not treat unknowns as negative findings'
-                            : 'DRAFT — verify against source conversation and record')),
+                            : 'DRAFT — verify against source conversation and record',
+                            style: TextStyle(
+                              color: incomplete
+                                  ? const Color(0xFFB45309)
+                                  : _reviewBlue,
+                              fontWeight: FontWeight.w700,
+                            ))) ,
                     _items(
                         'Presenting complaint',
                         summary['chief_complaint'] == null
@@ -312,11 +318,14 @@ class _AIConsultationReviewScreenState
           padding: const EdgeInsets.all(16),
           child:
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title,
+            Semantics(
+              header: true,
+              child: Text(title,
                 style: const TextStyle(
                     color: _reviewBlue,
                     fontWeight: FontWeight.w800,
                     fontSize: 16)),
+            ),
             const SizedBox(height: 12),
             ...children.map((child) => Padding(
                 padding: const EdgeInsets.only(bottom: 8), child: child))

@@ -5,7 +5,7 @@ import 'dart:convert';
 /// Raw audio frames (or malformed frames) return null for the caller to handle.
 String? decodeLiveGeminiJsonFrame(List<int> bytes) {
   try {
-    final text = utf8.decode(bytes, allowMalformed: false);
+    final text = utf8.decode(bytes, allowMalformed: true);
     if (!text.trimLeft().startsWith('{')) return null;
     final decoded = jsonDecode(text);
     return decoded is Map<String, dynamic> ? text : null;
