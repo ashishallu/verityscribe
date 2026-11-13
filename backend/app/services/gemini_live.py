@@ -354,7 +354,7 @@ class GeminiLiveService:
         parsed["completion_status"] = "complete" if interview_complete else "ended_early"
         return parsed
 
-    def run_config(self):
+    def run_config(self, *, manual_vad: bool = False):
         from google.adk.agents.run_config import RunConfig, StreamingMode
         from google.genai import types
         return RunConfig(
@@ -370,7 +370,7 @@ class GeminiLiveService:
             output_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
+                    disabled=manual_vad,
                     prefix_padding_ms=150,
                     silence_duration_ms=max(350, min(self.silence_duration_ms, 2000)),
                 )

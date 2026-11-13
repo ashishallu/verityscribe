@@ -159,6 +159,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   bool _directGemini = false;
   bool _directGeminiPermanentlyUnavailable = false;
   Map<String, dynamic>? _directGeminiConfig;
+  bool _voiceInputActivityActive = false;
+  int _voiceInputSilenceSamples = 0;
   String _directPatientTurn = '';
   String _directAssistantTurn = '';
   String? _directTurnKey;
@@ -837,6 +839,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       }
       _voiceSessionReady = true;
       _voiceReconnectAttempts = 0;
+      _voiceInputActivityActive = false;
+      _voiceInputSilenceSamples = 0;
       if (mounted) {
         setState(() {
           _connected = true;
@@ -867,8 +871,40 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         (chunk) {
           _recordVoiceLatency('first_microphone_chunk_captured');
           if (_recording && _voiceChannel == channel) {
-            _recordVoiceLatency('first_microphone_chunk_transmitted');
             final localProcessing = Stopwatch()..start();
+            // Measure PCM16 amplitude locally; never log or retain audio data.
+            var peakSample = 0;
+            for (var i = 0; i < chunk.length - 1; i += 2) {
+              var sample = chunk[i] | (chunk[i + 1] << 8);
+              if (sample >= 32768) sample -= 65536;
+              final absoluteSample = sample.abs();
+              if (absoluteSample > peakSample) peakSample = absoluteSample;
+            }
+
+            // Client-side turn boundaries for the ADK proxy. Direct Gemini
+            // keeps its configured native server-side VAD.
+            if (peakSample > 400) {
+              if (!_voiceInputActivityActive && !_directGemini) {
+                channel.sink.add(jsonEncode({'type': 'start_input'}));
+              }
+              _voiceInputActivityActive = true;
+              _voiceInputSilenceSamples = 0;
+            } else if (_voiceInputActivityActive) {
+              _voiceInputSilenceSamples += chunk.length ~/ 2;
+              // Count PCM samples, not chunks: record_web's default chunk size
+              // varies, so this gives a reliable ~1.3 second silence window.
+              if (_voiceInputSilenceSamples >= 20800) {
+                _voiceInputActivityActive = false;
+                _voiceInputSilenceSamples = 0;
+                if (!_directGemini) {
+                  debugPrint(
+                      'AI Virtual: speech pause detected (~1.3s), ending input turn');
+                  channel.sink.add(jsonEncode({'type': 'end_input'}));
+                }
+              }
+            }
+
+            _recordVoiceLatency('first_microphone_chunk_transmitted');
             if (_directGemini) {
               channel.sink.add(jsonEncode({
                 'realtimeInput': {
@@ -882,14 +918,6 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               channel.sink.add(chunk);
             }
             transmittedChunkCount++;
-            // Measure PCM16 amplitude locally; never log or retain audio data.
-            var peakSample = 0;
-            for (var i = 0; i < chunk.length - 1; i += 2) {
-              var sample = chunk[i] | (chunk[i + 1] << 8);
-              if (sample >= 32768) sample -= 65536;
-              final absoluteSample = sample.abs();
-              if (absoluteSample > peakSample) peakSample = absoluteSample;
-            }
             if (transmittedChunkCount % 20 == 0) {
               final status = peakSample < 100
                   ? 'SILENCE (peak=$peakSample) - Check Windows/Chrome mic device!'
@@ -1423,7 +1451,15 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     try {
       if (_recording) {
         await _recorder.pause();
-        _voiceChannel?.sink.add(jsonEncode({'type': 'end_input'}));
+        if (_directGemini) {
+          _voiceChannel?.sink.add(jsonEncode({
+            'realtimeInput': {'audioStreamEnd': true},
+          }));
+        } else {
+          _voiceChannel?.sink.add(jsonEncode({'type': 'end_input'}));
+        }
+        _voiceInputActivityActive = false;
+        _voiceInputSilenceSamples = 0;
         if (mounted) setState(() => _recording = false);
       } else {
         await _recorder.resume();

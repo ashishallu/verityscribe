@@ -1120,7 +1120,8 @@ async def voice_stream(websocket: WebSocket, session_id: str):
             handler=clinical_handler, completion_handler=mark_interview_complete,
         )
         live = gemini_live.runner.run_live(user_id=user_id, session_id=session_id,
-                                           live_request_queue=queue, run_config=gemini_live.run_config())
+                                           live_request_queue=queue,
+                                           run_config=gemini_live.run_config(manual_vad=True))
         live_iterator = live.__aiter__()
         # Native-audio Live models wait for an input turn before speaking. Give
         # the agent a one-time kickoff after explicit patient consent so Start
@@ -1216,6 +1217,7 @@ async def voice_stream(websocket: WebSocket, session_id: str):
 
     async def browser_to_gemini():
         nonlocal first_patient_audio_logged
+        manual_input_active = False
         startup_index = 0
         while True:
             if startup_index < len(startup_messages):
@@ -1227,6 +1229,10 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                 return
             frame = message.get("bytes")
             if frame is not None:
+                # In manual-VAD mode, audio outside an explicit activity is
+                # discarded so silence cannot reopen or extend a turn.
+                if not manual_input_active:
+                    continue
                 if not first_patient_audio_logged:
                     first_patient_audio_logged = True
                     logger.info(
@@ -1246,6 +1252,16 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                     continue
                 if command.get("type") == "end":
                     return
+                if command.get("type") == "start_input":
+                    if not manual_input_active:
+                        queue.send_activity_start()
+                        manual_input_active = True
+                    continue
+                if command.get("type") == "end_input":
+                    if manual_input_active:
+                        queue.send_activity_end()
+                        manual_input_active = False
+                    continue
                 if command.get("type") == "text" and isinstance(command.get("text"), str):
                     prompt = command["text"].strip()[:4000]
                     if prompt:

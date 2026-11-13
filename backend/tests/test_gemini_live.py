@@ -99,6 +99,10 @@ def test_adk_live_run_config():
     assert vad is not None
     assert vad.disabled is False
     assert vad.silence_duration_ms == 700
+    manual_run_config = service.run_config(manual_vad=True)
+    manual_vad_config = manual_run_config.realtime_input_config.automatic_activity_detection
+    assert manual_vad_config is not None
+    assert manual_vad_config.disabled is True
     # The installed Gemini API SDK rejects session_resumption.transparent.
     # Omit it unless the provider API explicitly supports this option.
     assert run_config.session_resumption is None
