@@ -403,12 +403,12 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
     // Ensure player is open inside the explicit user gesture, but do NOT start
     // the stream without data. _queueLiveAudio starts playback when chunks arrive.
-    Object? audioOutputError;
     final Future<void> audioOutputReady = _virtual
         ? _ensureLivePlayer()
             .timeout(const Duration(seconds: 2))
             .catchError((Object error) {
-            audioOutputError = error;
+            debugPrint(
+                'AI Virtual audio output init failed: ${error.runtimeType}');
           })
         : Future<void>.value();
     // This runs directly in the explicit consent/start gesture. Browser
