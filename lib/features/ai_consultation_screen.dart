@@ -818,6 +818,15 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       }
       _voiceSessionReady = true;
       _voiceReconnectAttempts = 0;
+      // Mark capture active before opening the browser stream so its first
+      // AudioWorklet chunks are not discarded by the listener's state guard.
+      if (mounted) {
+        setState(() {
+          _connected = true;
+          _recording = true;
+          _error = null;
+        });
+      }
       final audio = await _recorder.startStream(const RecordConfig(
         encoder: AudioEncoder.pcm16bits,
         sampleRate: 16000,
@@ -825,10 +834,6 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         echoCancel: true,
         noiseSuppress: true,
         autoGain: true,
-        // record_web measures this in target-rate samples. 640 samples at
-        // 16 kHz is 40 ms (rather than the previous 256 ms), keeping speech
-        // input responsive enough for Gemini Live's VAD and turn detection.
-        streamBufferSize: 640,
       ));
       _recordVoiceLatency('microphone_stream_started');
       if (generation != _voiceLifecycleGeneration ||
