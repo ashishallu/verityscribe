@@ -157,6 +157,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   StreamSubscription<dynamic>? _voiceSubscription;
   WebSocketChannel? _voiceChannel;
   bool _directGemini = false;
+  bool _directGeminiPermanentlyUnavailable = false;
   Map<String, dynamic>? _directGeminiConfig;
   String _directPatientTurn = '';
   String _directAssistantTurn = '';
@@ -292,6 +293,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   void _loadSession(Map<String, dynamic> data) {
     final session = _body(data['session']);
     _sessionId = session['id'].toString();
+    // The direct credential capability is cached only for this consultation.
+    _directGeminiPermanentlyUnavailable = false;
     _messages
       ..clear()
       ..addAll((data['messages'] as List? ?? const []).map((e) => _body(e)));
@@ -674,16 +677,20 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       Map<String, dynamic>? directCredential;
       Future<Map<String, dynamic>?>? directCredentialRequest;
       Object? directCredentialError;
-      if (!forceAdkFallback) {
+      if (!forceAdkFallback && !_directGeminiPermanentlyUnavailable) {
         _recordVoiceLatency('direct_live_credential_requested');
         directCredentialRequest = () async {
           try {
             final response = await ref.read(apiClientProvider).post<dynamic>(
                 '/ai-consultations/$_sessionId/live-credential', const {});
             final credential = _data(response.data);
-            return (credential['credential']?.toString() ?? '').isEmpty
-                ? null
-                : credential;
+            if ((credential['credential']?.toString() ?? '').isEmpty) {
+              _directGeminiPermanentlyUnavailable = true;
+              debugPrint(
+                  'Direct Gemini credential unavailable: empty_credential');
+              return null;
+            }
+            return credential;
           } catch (error) {
             if (error is ApiException &&
                 (error.statusCode == 401 || error.statusCode == 403)) {
@@ -694,6 +701,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             // direct client is being validated on this branch.
             debugPrint(
                 'Direct Gemini credential unavailable: ${error.runtimeType}');
+            _directGeminiPermanentlyUnavailable = true;
             return null;
           }
         }();
@@ -775,6 +783,14 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           unawaited(_recoverLiveVoice());
         },
         onDone: () {
+          final closeReason = (channel.closeReason ?? '')
+              .replaceAll(RegExp(r'[\r\n\x00-\x1F]'), ' ')
+              .trim();
+          final safeCloseReason = closeReason.length > 120
+              ? '${closeReason.substring(0, 120)}…'
+              : closeReason;
+          debugPrint(
+              'AI Virtual WebSocket closed closeCode=${channel.closeCode} closeReason=$safeCloseReason');
           if (!(_voiceReadyAck?.isCompleted ?? true)) {
             _voiceReadyAck?.completeError(
                 StateError('Gemini Live closed before startup completed'));
@@ -785,7 +801,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               setState(() {
                 _recording = false;
                 _speaking = false;
-                _error = 'The live voice connection closed. Reconnecting…';
+                _error =
+                    'The live voice connection closed (code ${channel.closeCode}). Reconnecting…';
               });
             }
             unawaited(_recoverLiveVoice());
@@ -818,6 +835,15 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       }
       _voiceSessionReady = true;
       _voiceReconnectAttempts = 0;
+      if (mounted) {
+        setState(() {
+          _connected = true;
+          _recording = true;
+          _error = null;
+        });
+      }
+
+      // Use record_web's standard AudioWorklet buffer sizing on web.
       final audio = await _recorder.startStream(const RecordConfig(
         encoder: AudioEncoder.pcm16bits,
         sampleRate: 16000,
@@ -825,10 +851,6 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         echoCancel: true,
         noiseSuppress: true,
         autoGain: true,
-        // record_web measures this in target-rate samples. 640 samples at
-        // 16 kHz is 40 ms (rather than the previous 256 ms), keeping speech
-        // input responsive enough for Gemini Live's VAD and turn detection.
-        streamBufferSize: 640,
       ));
       _recordVoiceLatency('microphone_stream_started');
       if (generation != _voiceLifecycleGeneration ||
@@ -838,6 +860,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         await _recorder.stop();
         return;
       }
+      var transmittedChunkCount = 0;
       _audioSubscription = audio.listen(
         (chunk) {
           _recordVoiceLatency('first_microphone_chunk_captured');
@@ -856,25 +879,24 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             } else {
               channel.sink.add(chunk);
             }
+            transmittedChunkCount++;
+            if (transmittedChunkCount % 20 == 0) {
+              debugPrint(
+                  'AI Virtual mic streaming: chunk #$transmittedChunkCount (${chunk.length} bytes)');
+            }
             if (_activeTurnMilestones.add('local_audio_processing')) {
               debugPrint(
                   'AI Virtual latency stage=local_audio_processing processing_us=${localProcessing.elapsedMicroseconds}');
             }
           }
         },
-        onError: (_) {
+        onError: (err) {
+          debugPrint('Microphone stream error: ${err.runtimeType}');
           if (mounted) {
             setState(() => _error = 'Microphone audio could not be streamed.');
           }
         },
       );
-      if (mounted) {
-        setState(() {
-          _connected = true;
-          _recording = true;
-          _error = null;
-        });
-      }
     } catch (error) {
       _voiceSessionReady = false;
       _voiceReadyAck = null;
@@ -951,6 +973,14 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     if (raw is! String) return;
     try {
       final decoded = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      final eventType = decoded['type']?.toString() ??
+          (decoded.containsKey('serverContent')
+              ? 'server_content'
+              : decoded.containsKey('setupComplete')
+                  ? 'setup_complete'
+                  : 'unknown');
+      // Do not log raw payloads: they can contain patient speech or clinical data.
+      debugPrint('AI Virtual server voice event type=$eventType');
       if (_directGemini) {
         final localEventProcessing = Stopwatch()..start();
         _handleDirectGeminiEvent(decoded);
