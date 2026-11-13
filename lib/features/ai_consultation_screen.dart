@@ -160,9 +160,6 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   bool _directGeminiPermanentlyUnavailable = false;
   Map<String, dynamic>? _directGeminiConfig;
   bool _voiceInputActivityActive = false;
-  int _voiceInputSilenceSamples = 0;
-  int _voiceInputSpeechSamples = 0;
-  int _voiceInputConsecutiveVoiceChunks = 0;
   String _directPatientTurn = '';
   String _directAssistantTurn = '';
   String? _directTurnKey;
@@ -842,9 +839,6 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       _voiceSessionReady = true;
       _voiceReconnectAttempts = 0;
       _voiceInputActivityActive = false;
-      _voiceInputSilenceSamples = 0;
-      _voiceInputSpeechSamples = 0;
-      _voiceInputConsecutiveVoiceChunks = 0;
       if (mounted) {
         setState(() {
           _connected = true;
@@ -858,7 +852,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         encoder: AudioEncoder.pcm16bits,
         sampleRate: 16000,
         numChannels: 1,
-        echoCancel: false,
+        echoCancel: true,
         noiseSuppress: true,
         autoGain: true,
       ));
@@ -885,43 +879,24 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
               if (absoluteSample > peakSample) peakSample = absoluteSample;
             }
 
-            // Require sustained voiced energy so clicks or room noise do not
-            // count as a spoken turn. Count samples because browser chunk sizes
-            // vary; 8,000 samples is 0.5s and 24,000 is 1.5s at 16kHz.
-            final chunkSamples = chunk.length ~/ 2;
-            if (peakSample >= 1200) {
-              _voiceInputConsecutiveVoiceChunks++;
-              _voiceInputSpeechSamples += chunkSamples;
-              if (_voiceInputConsecutiveVoiceChunks >= 2 &&
-                  _voiceInputSpeechSamples >= 8000) {
-                _voiceInputActivityActive = true;
-                _voiceInputSilenceSamples = 0;
-              }
-            } else {
-              _voiceInputConsecutiveVoiceChunks = 0;
-              _voiceInputSpeechSamples = 0;
-              if (_voiceInputActivityActive) {
-                _voiceInputSilenceSamples += chunkSamples;
-                if (_voiceInputSilenceSamples >= 24000) {
-                  _voiceInputActivityActive = false;
-                  _voiceInputSilenceSamples = 0;
-                  if (!_directGemini) {
-                    debugPrint(
-                        'AI Virtual: speech ended (1.5s silence), submitting turn');
-                    channel.sink.add(jsonEncode({'type': 'end_input'}));
-                  }
-                }
-              }
+            // Live VAD owns turn boundaries. Keep this local signal purely
+            // presentational so pauses do not interrupt natural speech.
+            final isVoicing = peakSample >= 1000;
+            if (isVoicing != _voiceInputActivityActive) {
+              _voiceInputActivityActive = isVoicing;
+              if (mounted) setState(() {});
             }
 
             _recordVoiceLatency('first_microphone_chunk_transmitted');
             if (_directGemini) {
               channel.sink.add(jsonEncode({
                 'realtimeInput': {
-                  'audio': {
-                    'mimeType': 'audio/pcm;rate=16000',
-                    'data': base64Encode(chunk),
-                  }
+                  'mediaChunks': [
+                    {
+                      'mimeType': 'audio/pcm;rate=16000',
+                      'data': base64Encode(chunk),
+                    }
+                  ],
                 }
               }));
             } else {
@@ -1467,13 +1442,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           _voiceChannel?.sink.add(jsonEncode({
             'realtimeInput': {'audioStreamEnd': true},
           }));
-        } else {
-          _voiceChannel?.sink.add(jsonEncode({'type': 'end_input'}));
         }
         _voiceInputActivityActive = false;
-        _voiceInputSilenceSamples = 0;
-        _voiceInputSpeechSamples = 0;
-        _voiceInputConsecutiveVoiceChunks = 0;
         if (mounted) setState(() => _recording = false);
       } else {
         await _recorder.resume();
@@ -2083,9 +2053,11 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                     : _voiceSessionReady
                                         ? _speaking
                                             ? 'Verity is speaking…'
-                                            : _recording
-                                                ? 'Listening…'
-                                                : 'Connected'
+                                            : _voiceInputActivityActive
+                                                ? 'Listening to you…'
+                                                : _recording
+                                                    ? 'Listening…'
+                                                    : 'Connected'
                                         : _error != null
                                             ? 'Voice connection needs attention'
                                             : 'Connecting…',

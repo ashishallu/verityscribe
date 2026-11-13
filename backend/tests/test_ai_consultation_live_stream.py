@@ -180,9 +180,6 @@ def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc
             if not getattr(self, "sent_audio_2", False):
                 self.sent_audio_2 = True
                 return {"type": "websocket.receive", "bytes": b"\xd0\x07" * 4000}
-            if not getattr(self, "sent_end_input", False):
-                self.sent_end_input = True
-                return {"type": "websocket.receive", "text": '{"type":"end_input"}'}
             if not getattr(self, "sent_text", False):
                 self.sent_text = True
                 return {"type": "websocket.receive", "text": '{"type":"text","text":"What should I know?"}'}
@@ -283,7 +280,7 @@ def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc
             return events()
 
         def run_config(self, *, manual_vad=False):
-            assert manual_vad is True
+            assert manual_vad is False
             return object()
 
     async def inline_threadpool(function, *args, **kwargs):
@@ -334,8 +331,8 @@ def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc
     assert b"\x01\x00\x02\x00" in fake_socket.audio
     assert any(event["type"] == "turn_complete" for event in fake_socket.events)
     assert any(event["type"] == "session_saved" for event in fake_socket.events)
-    assert queues[0].activity_starts == 1
-    assert queues[0].activity_ends == 1
+    assert queues[0].activity_starts == 0
+    assert queues[0].activity_ends == 0
     assert len(queues[0].audio) == 2
     assert {row["role"] for row in persisted} == {"patient", "assistant"}
     assert all(blob.data == b"\xd0\x07" * 4000 for blob in queues[0].audio)
@@ -441,7 +438,7 @@ def test_hang_up_during_gemini_startup_closes_queue_and_session(monkeypatch):
             return events()
 
         def run_config(self, *, manual_vad=False):
-            assert manual_vad is True
+            assert manual_vad is False
             return object()
 
     async def inline_threadpool(function, *args, **kwargs):

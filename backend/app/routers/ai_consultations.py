@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import re
-import struct
 import time
 import uuid
 import base64
@@ -1122,7 +1121,7 @@ async def voice_stream(websocket: WebSocket, session_id: str):
         )
         live = gemini_live.runner.run_live(user_id=user_id, session_id=session_id,
                                            live_request_queue=queue,
-                                           run_config=gemini_live.run_config(manual_vad=True))
+                                           run_config=gemini_live.run_config(manual_vad=False))
         live_iterator = live.__aiter__()
         # Native-audio Live models wait for an input turn before speaking. Give
         # the agent a one-time kickoff after explicit patient consent so Start
@@ -1218,10 +1217,6 @@ async def voice_stream(websocket: WebSocket, session_id: str):
 
     async def browser_to_gemini():
         nonlocal first_patient_audio_logged
-        manual_input_active = False
-        candidate_voice_frames: list[bytes] = []
-        candidate_voice_samples = 0
-        candidate_voice_chunks = 0
         startup_index = 0
         while True:
             if startup_index < len(startup_messages):
@@ -1236,47 +1231,13 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                 if len(frame) > 256 * 1024:
                     await close_socket(4400, "Audio frame too large")
                     return
-                # The browser sends raw PCM continuously. Detect a sustained
-                # voice onset here because the Flutter protocol deliberately
-                # does not send a separate start_input command. Buffer onset
-                # frames so Gemini receives the beginning of the utterance.
-                if not manual_input_active:
-                    complete_pcm = frame[:len(frame) - (len(frame) % 2)]
-                    peak_sample = max(
-                        (abs(sample) for (sample,) in struct.iter_unpack("<h", complete_pcm)),
-                        default=0,
-                    )
-                    if peak_sample >= 1200:
-                        candidate_voice_frames.append(frame)
-                        candidate_voice_samples += len(complete_pcm) // 2
-                        candidate_voice_chunks += 1
-                        if candidate_voice_chunks < 2 or candidate_voice_samples < 8000:
-                            continue
-                    else:
-                        candidate_voice_frames.clear()
-                        candidate_voice_samples = 0
-                        candidate_voice_chunks = 0
-                        continue
-
-                    queue.send_activity_start()
-                    manual_input_active = True
-                    frames_to_send = candidate_voice_frames
-                    candidate_voice_frames = []
-                    candidate_voice_samples = 0
-                    candidate_voice_chunks = 0
-                else:
-                    frames_to_send = [frame]
-
                 if not first_patient_audio_logged:
                     first_patient_audio_logged = True
                     logger.info(
                         "AI Virtual latency stage=first_patient_audio_received elapsed_ms=%d frame_bytes=%d",
                         round((time.perf_counter() - voice_started_at) * 1000), len(frame),
                     )
-                for audio_frame in frames_to_send:
-                    queue.send_realtime(types.Blob(
-                        data=audio_frame, mime_type="audio/pcm;rate=16000",
-                    ))
+                queue.send_realtime(types.Blob(data=frame, mime_type="audio/pcm;rate=16000"))
                 continue
             text = message.get("text")
             if text:
@@ -1286,13 +1247,10 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                     continue
                 if command.get("type") == "end":
                     return
-                if command.get("type") == "end_input":
-                    if manual_input_active:
-                        queue.send_activity_end()
-                        manual_input_active = False
-                    candidate_voice_frames.clear()
-                    candidate_voice_samples = 0
-                    candidate_voice_chunks = 0
+                # Backward compatibility for clients that still send manual
+                # turn markers. Gemini's configured server-side VAD now owns
+                # activity boundaries.
+                if command.get("type") in {"start_input", "end_input"}:
                     continue
                 if command.get("type") == "text" and isinstance(command.get("text"), str):
                     prompt = command["text"].strip()[:4000]
