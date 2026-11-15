@@ -322,6 +322,11 @@ def test_live_websocket_streams_audio_and_cleans_up(monkeypatch, disconnect, rpc
     assert len(queues[0].audio) == 1
     assert queues[0].audio[0].data == b"\x10\x00\x20\x00"
     assert queues[0].audio[0].mime_type == "audio/pcm;rate=16000"
+    assert "AI Virtual audio stage=fastapi_received frames=1" in caplog.text
+    assert "AI Virtual audio stage=gemini_forwarded frames=1" in caplog.text
+    assert "AI Virtual audio stage=gemini_input_recognized" in caplog.text
+    assert "frames_received=1 frames_forwarded=1" in caplog.text
+    assert "AI Virtual audio stage=browser_forwarded frames=1" in caplog.text
     assert len(queues[0].contents) == 2  # Kickoff and in-session typed message.
     assert queues[0].contents[1].parts[0].text == "What should I know?"
     assert queues[0].closed

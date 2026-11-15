@@ -1,6 +1,10 @@
 import unittest
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import httpx
 from fastapi import HTTPException
 
 from app.core import security
@@ -40,7 +44,7 @@ class _Query:
         if self.table_name == "departments":
             return _Response([{"id": "department-1", "name": "Medicine"}], 1)
         if self.table_name == "profiles":
-            return _Response({"hospital_id": "hospital-1"})
+            return _Response({"hospital_id": "hospital-1", "role": "patient"})
         if self.table_name == "doctors":
             return _Response([{
                 "id": "doctor-1", "profiles": {"first_name": "A"},
@@ -64,11 +68,62 @@ class DirectoryEndpointTests(unittest.TestCase):
         integration._directory_db.cache_clear()
         security._auth_client.cache_clear()
         security._role_client.cache_clear()
+        security._clear_profile_role_cache()
 
     def tearDown(self):
         integration._directory_db.cache_clear()
         security._auth_client.cache_clear()
         security._role_client.cache_clear()
+        security._clear_profile_role_cache()
+
+    def test_canonical_profile_role_is_reused_during_concurrent_page_requests(self):
+        client = _Client()
+        with patch.object(security.time, "monotonic", side_effect=[100.0, 100.0, 101.0]):
+            self.assertEqual(security._profile_role(client, "patient-1"), "patient")
+            self.assertEqual(security._profile_role(client, "patient-1"), "patient")
+
+        role_queries = [query for query in client.queries if query.table_name == "profiles"]
+        self.assertEqual(len(role_queries), 1)
+        self.assertEqual(role_queries[0].filters["id"], "patient-1")
+
+    def test_concurrent_requests_share_access_token_validation(self):
+        started = threading.Event()
+        release = threading.Event()
+        user = type("User", (), {"id": "patient-1"})()
+
+        class Auth:
+            calls = 0
+
+            def get_user(self, _token):
+                self.calls += 1
+                started.set()
+                release.wait(timeout=2)
+                return type("Response", (), {"user": user})()
+
+        client = type("Client", (), {"auth": Auth()})()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(security._validated_user, client, "test-token")
+            self.assertTrue(started.wait(timeout=1))
+            second = pool.submit(security._validated_user, client, "test-token")
+            time.sleep(0.05)
+            release.set()
+            self.assertIs(first.result(timeout=1), user)
+            self.assertIs(second.result(timeout=1), user)
+
+        self.assertEqual(client.auth.calls, 1)
+
+    def test_auth_stage_retries_a_transient_transport_error_once(self):
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectTimeout("temporary test failure")
+            return "ok"
+
+        self.assertEqual(security._retry_transport_once(operation), "ok")
+        self.assertEqual(attempts, 2)
 
     def test_authentication_clients_use_bounded_transport_and_postgrest_timeouts(self):
         options = security._client_options()

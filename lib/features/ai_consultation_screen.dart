@@ -1,8 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
-
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_sound/flutter_sound.dart';
@@ -10,7 +9,6 @@ import 'package:go_router/go_router.dart';
 import 'package:record/record.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-import '../core/constants/endpoints.dart';
 import '../core/services/api_service.dart';
 import '../core/services/live_audio_playback_queue.dart';
 import '../core/services/live_gemini_frame.dart';
@@ -146,6 +144,12 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   final _scroll = ScrollController();
   final List<Map<String, dynamic>> _messages = [];
   int _turnAudioBytes = 0;
+  int _micAudioChunksCaptured = 0;
+  int _micAudioBytesCaptured = 0;
+  int _micAudioChunksSent = 0;
+  int _micAudioBytesSent = 0;
+  int _liveAudioChunksReceived = 0;
+  int _liveAudioBytesReceived = 0;
   Timer? _clock;
   Timer? _playbackCompletionTimer;
   Timer? _completionTimer;
@@ -156,6 +160,22 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
   StreamSubscription<Uint8List>? _audioSubscription;
   StreamSubscription<dynamic>? _voiceSubscription;
   WebSocketChannel? _voiceChannel;
+  final List<Uint8List> _pendingVoiceAudioChunks = [];
+  int _pendingVoiceAudioBytes = 0;
+  final List<Uint8List> _speechPreRollFrames = [];
+  int _speechPreRollBytes = 0;
+  bool _speechGateOpen = false;
+  int _speechGateSilenceMs = 0;
+  static const int _speechGateOpenPeak = 800;
+  static const int _speechGateContinuePeak = 600;
+  static const int _speechGateSilenceTailMs = 700;
+  static const int _speechGatePreRollBytes = 6400; // 200 ms @ 16 kHz PCM16 mono.
+  bool _voiceTransportReady = false;
+  bool _directGeminiSetupComplete = false;
+  // Keep at most about two seconds of 16 kHz mono PCM while the direct
+  // credential/socket setup completes; never replay a long stale microphone
+  // backlog into a newly opened Gemini turn.
+  static const int _maxPendingVoiceAudioBytes = 64 * 1024;
   bool _directGemini = false;
   Map<String, dynamic>? _directGeminiConfig;
   String _directPatientTurn = '';
@@ -629,10 +649,210 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
   }
 
-  Future<void> _beginLiveVoice({
-    bool forceAdkFallback = false,
-    Future<bool>? microphonePermission,
-  }) async {
+  Future<void> _startMicrophoneCapture(int generation) async {
+    if (_audioSubscription != null || _recording) return;
+    final audio = await _recorder.startStream(RecordConfig(
+      encoder: AudioEncoder.pcm16bits,
+      sampleRate: 16000,
+      numChannels: 1,
+      // Avoid browser echo cancellation while assistant audio is playing, but
+      // let the browser suppress room noise and apply microphone auto gain.
+      // PCM is already signed little-endian PCM16; do not amplify samples a
+      // second time in Dart because that would clip otherwise valid speech.
+      echoCancel: !kIsWeb,
+      noiseSuppress: true,
+      autoGain: true,
+    ));
+    _recordVoiceLatency('microphone_stream_started');
+    if (generation != _voiceLifecycleGeneration || _stoppingVoice || _ended) {
+      await _recorder.stop();
+      return;
+    }
+    // Set this before subscribing: record_web may emit its first worklet frame
+    // immediately, and that frame must not be dropped by the listener guard.
+    if (mounted) {
+      setState(() {
+        _recording = true;
+        _error = null;
+      });
+    } else {
+      _recording = true;
+    }
+    _audioSubscription = audio.listen(
+      _handleMicrophoneChunk,
+      onError: (Object error) {
+        debugPrint('AI Virtual microphone stream error: ${error.runtimeType}');
+        if (mounted) {
+          setState(() => _error = 'Microphone audio could not be streamed.');
+        }
+      },
+    );
+  }
+
+  void _handleMicrophoneChunk(Uint8List chunk) {
+    _recordVoiceLatency('first_microphone_chunk_captured');
+    if (!_recording || chunk.isEmpty) return;
+    _micAudioChunksCaptured++;
+    _micAudioBytesCaptured += chunk.length;
+    var peakSample = 0;
+    var sumSquares = 0.0;
+    var sampleCount = 0;
+    for (var i = 0; i + 1 < chunk.length; i += 2) {
+      var sample = chunk[i] | (chunk[i + 1] << 8);
+      if (sample >= 32768) sample -= 65536;
+      final magnitude = sample.abs();
+      if (magnitude > peakSample) peakSample = magnitude;
+      sumSquares += sample * sample;
+      sampleCount++;
+    }
+    final pcmRms = sampleCount == 0
+        ? 0
+        : math.sqrt(sumSquares / sampleCount).round();
+    // Round up so short frames still contribute their full duration to the
+    // silence tail (16 kHz * 2 bytes/sample = 32,000 bytes/second).
+    final frameDurationMs = math.max(
+      1,
+      (chunk.length * 1000 + 31999) ~/ 32000,
+    ).toInt();
+    final framesToTransmit = <Uint8List>[];
+    var speechEndDetected = false;
+    var speechEndSilenceMs = 0;
+
+    if (!_speechGateOpen) {
+      final buffered = Uint8List.fromList(chunk);
+      _speechPreRollFrames.add(buffered);
+      _speechPreRollBytes += buffered.length;
+      while (_speechPreRollBytes > _speechGatePreRollBytes &&
+          _speechPreRollFrames.isNotEmpty) {
+        final excessBytes = _speechPreRollBytes - _speechGatePreRollBytes;
+        final oldest = _speechPreRollFrames.removeAt(0);
+        if (excessBytes >= oldest.length) {
+          _speechPreRollBytes -= oldest.length;
+          continue;
+        }
+        // PCM16 frames must remain sample-aligned. Trim just the excess from
+        // the oldest frame instead of dropping a whole frame (which shortened
+        // the intended 200 ms pre-roll by up to one worklet buffer).
+        final trimBytes = math.min(
+          oldest.length - 2,
+          (excessBytes + 1) & ~1,
+        );
+        _speechPreRollFrames.insert(
+          0,
+          Uint8List.sublistView(oldest, trimBytes),
+        );
+        _speechPreRollBytes -= trimBytes;
+        break;
+      }
+      if (peakSample >= _speechGateOpenPeak) {
+        _speechGateOpen = true;
+        _speechGateSilenceMs = 0;
+        debugPrint(
+            'AI Virtual speech_gate=open peak_pcm16=$peakSample pre_roll_frames=${_speechPreRollFrames.length}');
+        framesToTransmit.addAll(_speechPreRollFrames);
+        _speechPreRollFrames.clear();
+        _speechPreRollBytes = 0;
+      }
+    } else {
+      // Once speech opens the gate, transmit every subsequent frame—including
+      // quiet syllables and a silence tail—until the lower Schmitt threshold
+      // remains quiet long enough for Gemini's server VAD to close the turn.
+      framesToTransmit.add(chunk);
+      if (peakSample >= _speechGateContinuePeak) {
+        _speechGateSilenceMs = 0;
+      } else {
+        _speechGateSilenceMs += frameDurationMs;
+        if (_speechGateSilenceMs >= _speechGateSilenceTailMs) {
+          _speechGateOpen = false;
+          speechEndDetected = true;
+          speechEndSilenceMs = _speechGateSilenceMs;
+          _speechGateSilenceMs = 0;
+          _speechPreRollFrames.clear();
+          _speechPreRollBytes = 0;
+        }
+      }
+    }
+
+    for (final frame in framesToTransmit) {
+      _queueOrTransmitMicrophoneFrame(frame);
+    }
+    if (_micAudioChunksCaptured == 1 || _micAudioChunksCaptured % 20 == 0) {
+      debugPrint(
+          'AI Virtual audio stage=flutter_captured chunks=$_micAudioChunksCaptured bytes=$_micAudioBytesCaptured frame_bytes=${chunk.length} peak_pcm16=$peakSample rms_pcm16=$pcmRms gate=${_speechGateOpen ? 'open' : 'closed'} transmitted_frames=$_micAudioChunksSent');
+    }
+    if (speechEndDetected) {
+      debugPrint(
+          'AI Virtual speech_gate=speech_end peak_pcm16=$peakSample transmitted_frames=$_micAudioChunksSent silence_tail_ms=$speechEndSilenceMs');
+    }
+  }
+
+  void _queueOrTransmitMicrophoneFrame(Uint8List chunk) {
+    final channel = _voiceChannel;
+    if (channel == null ||
+        !_voiceTransportReady ||
+        !_directGemini ||
+        !_directGeminiSetupComplete) {
+      // Keep only a bounded startup window while credentials/transport settle.
+      // PCM is discarded from the oldest edge if startup is unusually slow.
+      final copy = Uint8List.fromList(chunk);
+      _pendingVoiceAudioChunks.add(copy);
+      _pendingVoiceAudioBytes += copy.length;
+      while (_pendingVoiceAudioBytes > _maxPendingVoiceAudioBytes &&
+          _pendingVoiceAudioChunks.isNotEmpty) {
+        _pendingVoiceAudioBytes -= _pendingVoiceAudioChunks.removeAt(0).length;
+      }
+      return;
+    }
+    _transmitMicrophoneChunk(channel, chunk);
+  }
+
+  void _resetSpeechGate() {
+    _speechPreRollFrames.clear();
+    _speechPreRollBytes = 0;
+    _speechGateOpen = false;
+    _speechGateSilenceMs = 0;
+  }
+
+  void _transmitMicrophoneChunk(WebSocketChannel channel, Uint8List chunk) {
+    if (!_recording || !_directGemini || _voiceChannel != channel) return;
+    final localProcessing = Stopwatch()..start();
+    _recordVoiceLatency('first_microphone_chunk_transmitted');
+    _micAudioChunksSent++;
+    _micAudioBytesSent += chunk.length;
+    channel.sink.add(jsonEncode({
+      'realtimeInput': {
+        'audio': {
+          'mimeType': 'audio/pcm;rate=16000',
+          'data': base64Encode(chunk),
+        }
+      }
+    }));
+    if (_micAudioChunksSent == 1 || _micAudioChunksSent % 20 == 0) {
+      debugPrint(
+          'AI Virtual audio stage=flutter_sent chunks=$_micAudioChunksSent bytes=$_micAudioBytesSent frame_bytes=${chunk.length} transport=direct_gemini');
+    }
+    if (_activeTurnMilestones.add('local_audio_processing')) {
+      debugPrint(
+          'AI Virtual latency stage=local_audio_processing processing_us=${localProcessing.elapsedMicroseconds}');
+    }
+  }
+
+  void _flushPendingMicrophoneChunks(WebSocketChannel channel) {
+    if (!_voiceTransportReady ||
+        !_directGeminiSetupComplete ||
+        _voiceChannel != channel ||
+        !_recording) {
+      return;
+    }
+    final pending = List<Uint8List>.of(_pendingVoiceAudioChunks);
+    _pendingVoiceAudioChunks.clear();
+    _pendingVoiceAudioBytes = 0;
+    for (final chunk in pending) {
+      _transmitMicrophoneChunk(channel, chunk);
+    }
+  }
+
+  Future<void> _beginLiveVoice({Future<bool>? microphonePermission}) async {
     if (_sessionId == null ||
         _voiceChannel != null ||
         _voiceStarting ||
@@ -660,12 +880,23 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
     _voiceStarting = true;
     _voiceAuthorizationRejected = false;
+    _micAudioChunksCaptured = 0;
+    _micAudioBytesCaptured = 0;
+    _micAudioChunksSent = 0;
+    _micAudioBytesSent = 0;
+    _liveAudioChunksReceived = 0;
+    _liveAudioBytesReceived = 0;
     if (_voiceLatency == null || !_voiceLatency!.isRunning) {
       _voiceLatency = Stopwatch()..start();
       _voiceLatencyMilestones.clear();
       _recordVoiceLatency('voice_start_retry');
     }
     final generation = ++_voiceLifecycleGeneration;
+    _pendingVoiceAudioChunks.clear();
+    _pendingVoiceAudioBytes = 0;
+    _resetSpeechGate();
+    _voiceTransportReady = false;
+    _directGeminiSetupComplete = false;
     _voiceSessionReady = false;
     _voiceCancelledBeforeReady = false;
     _liveServerStartupError = null;
@@ -674,30 +905,25 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       Map<String, dynamic>? directCredential;
       Future<Map<String, dynamic>?>? directCredentialRequest;
       Object? directCredentialError;
-      if (!forceAdkFallback) {
-        _recordVoiceLatency('direct_live_credential_requested');
-        directCredentialRequest = () async {
-          try {
-            final response = await ref.read(apiClientProvider).post<dynamic>(
-                '/ai-consultations/$_sessionId/live-credential', const {});
-            final credential = _data(response.data);
-            return (credential['credential']?.toString() ?? '').isEmpty
-                ? null
-                : credential;
-          } catch (error) {
-            if (error is ApiException &&
-                (error.statusCode == 401 || error.statusCode == 403)) {
-              directCredentialError = error;
-              return null;
-            }
-            // Keep the existing ADK proxy available as a rollback while the
-            // direct client is being validated on this branch.
-            debugPrint(
-                'Direct Gemini credential unavailable: ${error.runtimeType}');
-            return null;
+      _directGemini = true;
+      _recordVoiceLatency('direct_live_credential_requested');
+      directCredentialRequest = () async {
+        try {
+          final response = await ref.read(apiClientProvider).post<dynamic>(
+              '/ai-consultations/$_sessionId/live-credential', const {});
+          final credential = _data(response.data);
+          if ((credential['credential']?.toString() ?? '').isEmpty ||
+              (credential['model']?.toString() ?? '').isEmpty ||
+              credential['config'] is! Map) {
+            throw StateError(
+                'The backend returned an incomplete direct Gemini credential.');
           }
-        }();
-      }
+          return credential;
+        } catch (error) {
+          directCredentialError = error;
+          return null;
+        }
+      }();
       // Permission was requested synchronously from the user's Start gesture;
       // obtain the constrained credential in parallel with that prompt.
       final microphoneGranted =
@@ -711,47 +937,32 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             () => _error = 'Microphone permission is needed for AI Virtual.');
         return;
       }
-      if (directCredentialRequest != null) {
-        directCredential = await directCredentialRequest;
-      }
-      if (directCredentialError != null) throw directCredentialError!;
-      _recordVoiceLatency(directCredential == null
-          ? 'adk_fallback_selected'
-          : 'direct_live_credential_ready');
+      // Open capture as soon as permission is granted. Do not serialize it
+      // behind the credential request, WebSocket handshake, or Gemini's first
+      // response. Audio is buffered briefly until its authorized socket is
+      // ready, then streamed as PCM.
+      await _startMicrophoneCapture(generation);
       if (generation != _voiceLifecycleGeneration || _stoppingVoice || _ended) {
         return;
       }
-      final base = Uri.parse(apiBaseUrl);
-      late final Uri wsUri;
-      List<String> protocols = const [];
-      if (directCredential != null) {
-        _directGemini = true;
-        _directGeminiConfig =
-            Map<String, dynamic>.from(directCredential['config'] as Map);
-        wsUri = Uri.https(
-          'generativelanguage.googleapis.com',
-          '/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained',
-          {'access_token': directCredential['credential'].toString()},
-        ).replace(scheme: 'wss');
-      } else {
-        _directGemini = false;
-        _directGeminiConfig = null;
-        final ticketResponse = await ref.read(apiClientProvider).post<dynamic>(
-            '/ai-consultations/$_sessionId/voice-ticket', const {});
-        final ticket = _data(ticketResponse.data)['ticket'].toString();
-        if (ticket.isEmpty || ticket == 'null') {
-          throw StateError('Voice ticket missing');
-        }
-        wsUri = base.replace(
-          scheme: base.scheme == 'https' ? 'wss' : 'ws',
-          path: '${base.path}/ai-consultations/$_sessionId/voice-stream',
-          query: null,
-          fragment: null,
-        );
-        protocols = ['verityscribe-ticket.$ticket'];
+      directCredential = await directCredentialRequest;
+      if (directCredentialError != null) throw directCredentialError!;
+      if (directCredential == null) {
+        throw StateError('The backend did not issue a direct Gemini credential.');
       }
+      _recordVoiceLatency('direct_live_credential_ready');
+      if (generation != _voiceLifecycleGeneration || _stoppingVoice || _ended) {
+        return;
+      }
+      _directGeminiConfig =
+          Map<String, dynamic>.from(directCredential['config'] as Map);
+      final wsUri = Uri.https(
+        'generativelanguage.googleapis.com',
+        '/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained',
+        {'access_token': directCredential['credential'].toString()},
+      ).replace(scheme: 'wss');
       _recordVoiceLatency('websocket_connect_started');
-      final channel = WebSocketChannel.connect(wsUri, protocols: protocols);
+      final channel = WebSocketChannel.connect(wsUri);
       _voiceChannel = channel;
       _voiceReadyAck = Completer<void>();
       _voiceSubscription = channel.stream.listen(
@@ -769,7 +980,7 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
             setState(() {
               _recording = false;
               _error =
-                  'The live voice connection was interrupted. Reconnecting…';
+                  '${voiceHandshakeFailureMessage(error)} Reconnecting…';
             });
           }
           unawaited(_recoverLiveVoice());
@@ -792,14 +1003,15 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           }
         },
       );
-      // The transport handshake is not enough: wait until FastAPI has observed
-      // Gemini's first Live event before opening the microphone stream.
+      // The microphone is already capturing. Wait for the transport, then let
+      // the protocol-specific ready event release queued PCM in order.
       await channel.ready.timeout(const Duration(seconds: 15));
       _recordVoiceLatency('websocket_connected');
+      _voiceTransportReady = true;
       if (_directGemini) {
         channel.sink.add(jsonEncode({
           'setup': {
-            'model': 'models/${directCredential!['model']}',
+            'model': 'models/${directCredential['model']}',
             ...?_directGeminiConfig
           },
         }));
@@ -818,70 +1030,41 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       }
       _voiceSessionReady = true;
       _voiceReconnectAttempts = 0;
-      // Mark capture active before opening the browser stream so its first
-      // AudioWorklet chunks are not discarded by the listener's state guard.
       if (mounted) {
         setState(() {
           _connected = true;
-          _recording = true;
           _error = null;
         });
       }
-      final audio = await _recorder.startStream(const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-        echoCancel: true,
-        noiseSuppress: true,
-        autoGain: true,
-      ));
-      _recordVoiceLatency('microphone_stream_started');
-      if (generation != _voiceLifecycleGeneration ||
-          _stoppingVoice ||
-          _ended ||
-          _voiceChannel != channel) {
-        await _recorder.stop();
-        return;
-      }
-      _audioSubscription = audio.listen(
-        (chunk) {
-          _recordVoiceLatency('first_microphone_chunk_captured');
-          if (_recording && _voiceChannel == channel) {
-            _recordVoiceLatency('first_microphone_chunk_transmitted');
-            final localProcessing = Stopwatch()..start();
-            if (_directGemini) {
-              channel.sink.add(jsonEncode({
-                'realtimeInput': {
-                  'audio': {
-                    'mimeType': 'audio/pcm;rate=16000',
-                    'data': base64Encode(chunk),
+      _flushPendingMicrophoneChunks(channel);
+      if (_directGemini && _directGeminiSetupComplete) {
+        // Speak only after capture is already running and its buffered PCM has
+        // been handed to the Live socket, so the patient can talk immediately.
+        _directGreetingTurnPending = true;
+        channel.sink.add(jsonEncode({
+          'clientContent': {
+            'turns': [
+              {
+                'role': 'user',
+                'parts': [
+                  {
+                    'text':
+                        'Start with a brief, warm greeting and ask what I would like help with today.'
                   }
-                }
-              }));
-            } else {
-              channel.sink.add(chunk);
-            }
-            if (_activeTurnMilestones.add('local_audio_processing')) {
-              debugPrint(
-                  'AI Virtual latency stage=local_audio_processing processing_us=${localProcessing.elapsedMicroseconds}');
-            }
+                ]
+              }
+            ],
+            'turnComplete': true,
           }
-        },
-        onError: (_) {
-          if (mounted) {
-            setState(() => _error = 'Microphone audio could not be streamed.');
-          }
-        },
-      );
-      if (mounted) {
-        setState(() {
-          _connected = true;
-          _recording = true;
-          _error = null;
-        });
+        }));
       }
     } catch (error) {
       _voiceSessionReady = false;
+      _voiceTransportReady = false;
+      _directGeminiSetupComplete = false;
+      _pendingVoiceAudioChunks.clear();
+      _pendingVoiceAudioBytes = 0;
+      _resetSpeechGate();
       _voiceReadyAck = null;
       await _audioSubscription?.cancel();
       _audioSubscription = null;
@@ -894,8 +1077,14 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         await _voiceChannel?.sink.close();
       } catch (_) {}
       _voiceChannel = null;
-      final shouldTryAdkFallback =
-          _directGemini && !forceAdkFallback && !_voiceCancelledBeforeReady;
+      if (error is ApiException &&
+          (error.statusCode == 401 || error.statusCode == 403)) {
+        _voiceAuthorizationRejected = true;
+      }
+      final startupFailureMessage = _liveServerStartupError ??
+          (error is ApiException
+              ? error.message
+              : voiceHandshakeFailureMessage(error));
       _directGemini = false;
       _directGeminiConfig = null;
       if (mounted &&
@@ -906,24 +1095,10 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         setState(() {
           _connected = false;
           _recording = false;
-          _error = _liveServerStartupError ??
-              (error is ApiException &&
-                      (error.statusCode == 401 || error.statusCode == 403)
-                  ? 'The voice session could not be authorized. Sign in again and retry.'
-                  : voiceHandshakeFailureMessage(error));
+          _error = startupFailureMessage;
         });
       }
       _liveServerStartupError = null;
-      if (shouldTryAdkFallback &&
-          generation == _voiceLifecycleGeneration &&
-          !_stoppingVoice &&
-          !_ended) {
-        debugPrint(
-            'Direct Gemini websocket unavailable; trying the existing ADK fallback once.');
-        _voiceStarting = false;
-        await _beginLiveVoice(forceAdkFallback: true);
-        return;
-      }
     } finally {
       _voiceStarting = false;
     }
@@ -938,6 +1113,12 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           return;
         }
       }
+      _liveAudioChunksReceived++;
+      _liveAudioBytesReceived += raw.length;
+      if (_liveAudioChunksReceived == 1 || _liveAudioChunksReceived % 20 == 0) {
+        debugPrint(
+            'AI Virtual audio stage=flutter_received chunks=$_liveAudioChunksReceived bytes=$_liveAudioBytesReceived frame_bytes=${raw.length}');
+      }
       _queueLiveAudio(raw);
       return;
     }
@@ -949,6 +1130,12 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
           _handleLiveVoiceEvent(envelope);
           return;
         }
+      }
+      _liveAudioChunksReceived++;
+      _liveAudioBytesReceived += bytes.length;
+      if (_liveAudioChunksReceived == 1 || _liveAudioChunksReceived % 20 == 0) {
+        debugPrint(
+            'AI Virtual audio stage=flutter_received chunks=$_liveAudioChunksReceived bytes=$_liveAudioBytesReceived frame_bytes=${bytes.length}');
       }
       _queueLiveAudio(bytes);
       return;
@@ -1168,8 +1355,9 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
       _liveServerStartupError = switch (status) {
         'UNAUTHENTICATED' ||
         'PERMISSION_DENIED' =>
-          'Gemini did not authorize the secure live session. Retry or contact support.',
-        _ => 'Gemini could not start the secure live session. Please retry.',
+          'Gemini rejected the secure Live credential. Check the backend Google credential and Live API access, then retry.',
+        _ => voiceHandshakeFailureMessage(StateError(
+            'Gemini Live ${status ?? 'setup error'}: ${protocolError['message'] ?? 'provider rejected setup'}')),
       };
       if (!(_voiceReadyAck?.isCompleted ?? true)) {
         _voiceReadyAck!.completeError(StateError(_liveServerStartupError!));
@@ -1178,23 +1366,9 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
     if (envelope.containsKey('setupComplete')) {
       _recordVoiceLatency('gemini_ready');
-      _directGreetingTurnPending = true;
-      _voiceChannel?.sink.add(jsonEncode({
-        'clientContent': {
-          'turns': [
-            {
-              'role': 'user',
-              'parts': [
-                {
-                  'text':
-                      'Start with a brief, warm greeting and ask what I would like help with today.'
-                }
-              ]
-            }
-          ],
-          'turnComplete': true,
-        }
-      }));
+      _directGeminiSetupComplete = true;
+      final channel = _voiceChannel;
+      if (channel != null) _flushPendingMicrophoneChunks(channel);
       if (!(_voiceReadyAck?.isCompleted ?? true)) _voiceReadyAck?.complete();
       return;
     }
@@ -1207,6 +1381,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
     final interim = content['interimInputTranscription'];
     if (interim is Map && (interim['text']?.toString().isNotEmpty ?? false)) {
+      debugPrint(
+          'AI Virtual input stage=gemini_transcription_partial chars=${interim['text'].toString().length}');
       if (!_directCurrentInputHasInterim) {
         _activeVoiceTurn++;
         _activeTurnLatency = Stopwatch()..start();
@@ -1229,6 +1405,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     if (patientFinal is Map &&
         (patientFinal['text']?.toString().isNotEmpty ?? false)) {
       final finalText = patientFinal['text'].toString();
+      debugPrint(
+          'AI Virtual input stage=gemini_transcription_final chars=${finalText.length}');
       final isLateFinal = _directAwaitingInputTurnKeys.isNotEmpty;
       if (!isLateFinal &&
           !_directCurrentInputHasInterim &&
@@ -1293,8 +1471,16 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         final inlineData = part['inlineData'];
         if (inlineData is Map && inlineData['data'] is String) {
           try {
-            _queueLiveAudio(
-                Uint8List.fromList(base64Decode(inlineData['data'] as String)));
+            final audioBytes =
+                Uint8List.fromList(base64Decode(inlineData['data'] as String));
+            _liveAudioChunksReceived++;
+            _liveAudioBytesReceived += audioBytes.length;
+            if (_liveAudioChunksReceived == 1 ||
+                _liveAudioChunksReceived % 20 == 0) {
+              debugPrint(
+                  'AI Virtual audio stage=gemini_received chunks=$_liveAudioChunksReceived bytes=$_liveAudioBytesReceived frame_bytes=${audioBytes.length}');
+            }
+            _queueLiveAudio(audioBytes);
           } catch (_) {
             // Ignore malformed provider frames; never treat text as audio.
           }
@@ -1385,7 +1571,9 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     try {
       if (_recording) {
         await _recorder.pause();
-        _voiceChannel?.sink.add(jsonEncode({'type': 'end_input'}));
+        _voiceChannel?.sink.add(jsonEncode({
+          'realtimeInput': {'audioStreamEnd': true}
+        }));
         if (mounted) setState(() => _recording = false);
       } else {
         await _recorder.resume();
@@ -1518,6 +1706,11 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     } catch (_) {}
     _voiceSubscription = null;
     _voiceChannel = null;
+    _voiceTransportReady = false;
+    _directGeminiSetupComplete = false;
+    _pendingVoiceAudioChunks.clear();
+    _pendingVoiceAudioBytes = 0;
+    _resetSpeechGate();
     _voiceSaveAck = null;
     _voiceSessionReady = false;
     _directGemini = false;

@@ -96,10 +96,9 @@ def test_direct_credential_keeps_patient_context_server_side(monkeypatch):
         CreateAuthTokenConfig=construct,
     )
 
-    token = SimpleNamespace(
-        name="ephemeral-token-for-test",
-        expire_time=datetime(2030, 1, 1, tzinfo=timezone.utc),
-    )
+    # Match the installed Google GenAI SDK's AuthToken model, which currently
+    # returns only `name` even when expiration was supplied at creation.
+    token = SimpleNamespace(name="ephemeral-token-for-test")
 
     class Tokens:
         def create(self, *, config):
@@ -146,6 +145,7 @@ def test_direct_credential_keeps_patient_context_server_side(monkeypatch):
     serialized_response = json.dumps(response)
     assert response["credential"] == token.name
     assert response["model"] == live.model
+    assert datetime.fromisoformat(response["expires_at"]).tzinfo is not None
     assert "systemInstruction" not in response["config"]
     assert "system_instruction" not in response["config"]
     assert patient_marker not in serialized_response
@@ -180,3 +180,24 @@ def test_direct_turn_retry_is_idempotent(monkeypatch):
     assert len(client.messages) == 2
     assert len(first["data"]["messages"]) == 2
     assert len(second["data"]["messages"]) == 2
+
+
+def test_direct_credential_errors_are_actionable_without_provider_body():
+    class ProviderError(Exception):
+        code = 403
+
+    status, detail = ai_consultations._safe_live_credential_error(
+        ProviderError("sensitive provider response must not be returned")
+    )
+    assert status == 403
+    assert "credential" in detail
+    assert "sensitive provider response" not in detail
+
+
+def test_direct_credential_network_error_is_distinguished():
+    class ConnectError(Exception):
+        pass
+
+    status, detail = ai_consultations._safe_live_credential_error(ConnectError())
+    assert status is None
+    assert "network and DNS" in detail

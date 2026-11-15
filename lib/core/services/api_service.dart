@@ -64,7 +64,19 @@ class HttpApiClient implements ApiClient {
         developer.log(
             'API request failed: $path returned HTTP ${response.statusCode}',
             name: 'verity.api');
-        throw ApiException('The server returned HTTP ${response.statusCode}.',
+        var safeDetail = '';
+        try {
+          final body = jsonDecode(response.body);
+          if (body is Map && body['detail'] is String) {
+            safeDetail = (body['detail'] as String).trim();
+          }
+        } catch (_) {
+          // Do not include arbitrary response bodies in client-facing errors.
+        }
+        final message = safeDetail.isEmpty
+            ? 'The server returned HTTP ${response.statusCode}.'
+            : 'The server returned HTTP ${response.statusCode}: $safeDetail';
+        throw ApiException(message,
             statusCode: response.statusCode);
       }
       return ApiResponse<T>(jsonDecode(response.body) as T,

@@ -29,4 +29,12 @@ void main() {
       isFalse,
     );
   });
+
+  test('shows transport cause while redacting ephemeral credentials', () {
+    final message = voiceHandshakeFailureMessage(Exception(
+      'WebSocket failed for access_token=secret-token: Connection refused',
+    ));
+    expect(message, contains('Connection refused'));
+    expect(message, isNot(contains('secret-token')));
+  });
 }

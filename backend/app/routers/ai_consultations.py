@@ -159,6 +159,26 @@ def _safe_live_client_config(config: Any) -> dict[str, Any]:
     return serialized
 
 
+def _safe_live_credential_error(exc: Exception) -> tuple[int | None, str]:
+    """Map provider failures to actionable text without echoing provider bodies."""
+    raw_status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    try:
+        status = int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if status in {401, 403}:
+        return status, "Google rejected the server credential or it lacks Gemini Live access."
+    if status == 400:
+        return status, "Google rejected the Gemini Live model or session configuration."
+    if status == 404:
+        return status, "The configured Gemini Live model is unavailable to this Google API project."
+    if status == 429:
+        return status, "Gemini Live token creation is rate-limited or over quota."
+    if type(exc).__name__ in {"ConnectError", "ConnectTimeout", "ReadTimeout", "TimeoutException"}:
+        return status, "The backend could not reach Google's Gemini token service. Check backend network and DNS."
+    return status, "A secure direct Gemini session could not be prepared. Retry or check backend diagnostics."
+
+
 def _live_assistant_output(event: Any) -> tuple[Any | None, list[bytes]]:
     """Return current-turn caption/audio; discard stale output on interruption."""
     if bool(getattr(event, "interrupted", False)):
@@ -670,8 +690,13 @@ def create_direct_live_credential(session_id: str, claims: dict = Depends(curren
         context = patient_context(client, patient["id"])
         context_text = json.dumps(context, ensure_ascii=False, default=str)[:12000]
         instructions = (
-            "You are Verity, a concise AI medical intake assistant, not a clinician. Ask one relevant follow-up "
-            "at a time, adapt to patient answers, and do not diagnose or prescribe. Support English, Telugu, Hindi "
+            "You are Verity, a warm, concise medical intake assistant, not a clinician. Conduct a natural, adaptive "
+            "intake rather than following a fixed question list. Start by asking what is bothering the patient. "
+            "Then ask one focused follow-up at a time based on their answer: clarify location and side, onset and "
+            "duration, severity, frequency, what worsens or relieves it, associated symptoms, relevant prior "
+            "conditions or surgery, medicines, and allergies when relevant. Do not ask questions already answered; "
+            "acknowledge the answer and choose the next clinically relevant gap. Do not diagnose or prescribe. "
+            "Support English, Telugu, Hindi "
             "and code-switching; preserve the patient's language and ask for clarification rather than guessing "
             "unclear medical words, sides, numbers, medicines or procedures. Only the patient or verified record "
             "can establish patient facts. Never imply AI guidance was doctor-approved. If emergency symptoms are "
@@ -707,17 +732,26 @@ def create_direct_live_credential(session_id: str, claims: dict = Depends(curren
         ))
         serialized_config = _safe_live_client_config(live_config)
     except Exception as exc:
-        logger.exception("AI Virtual ephemeral credential creation failed error_type=%s", type(exc).__name__)
-        raise HTTPException(status_code=503, detail="A secure direct Gemini session could not be prepared") from exc
+        provider_status, safe_detail = _safe_live_credential_error(exc)
+        logger.exception(
+            "AI Virtual ephemeral credential creation failed error_type=%s provider_status=%s",
+            type(exc).__name__, provider_status or "unknown",
+        )
+        raise HTTPException(status_code=503, detail=safe_detail) from exc
     logger.info("AI Virtual direct credential issued model=%s", gemini_live.model)
+    # Google GenAI's AuthToken currently exposes only ``name``. The token's
+    # expiry is configured above, but some SDK versions do not echo it in the
+    # response model. Do not dereference an absent Pydantic field: token
+    # creation has already succeeded and the configured expiry is authoritative.
+    token_expire_time = getattr(token, "expire_time", None)
     return {"data": {
         "credential": token.name,
         "model": gemini_live.model,
         "config": serialized_config,
         "expires_at": (
-            token.expire_time.isoformat()
-            if hasattr(token.expire_time, "isoformat")
-            else str(token.expire_time or (now + timedelta(minutes=30)).isoformat())
+            token_expire_time.isoformat()
+            if hasattr(token_expire_time, "isoformat")
+            else str(token_expire_time or (now + timedelta(minutes=30)).isoformat())
         ),
     }}
 
@@ -974,6 +1008,12 @@ async def voice_stream(websocket: WebSocket, session_id: str):
     voice_started_at = time.perf_counter()
     first_patient_audio_logged = False
     first_gemini_audio_logged = False
+    patient_audio_frames_received = 0
+    patient_audio_bytes_received = 0
+    patient_audio_frames_forwarded = 0
+    patient_audio_bytes_forwarded = 0
+    assistant_audio_frames_forwarded = 0
+    assistant_audio_bytes_forwarded = 0
     live_turn_index = 0
     live_turn_started_at: float | None = None
     live_turn_ended_at: float | None = None
@@ -1198,6 +1238,8 @@ async def voice_stream(websocket: WebSocket, session_id: str):
 
     async def browser_to_gemini():
         nonlocal first_patient_audio_logged
+        nonlocal patient_audio_frames_received, patient_audio_bytes_received
+        nonlocal patient_audio_frames_forwarded, patient_audio_bytes_forwarded
         startup_index = 0
         while True:
             if startup_index < len(startup_messages):
@@ -1209,16 +1251,38 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                 return
             frame = message.get("bytes")
             if frame is not None:
+                patient_audio_frames_received += 1
+                patient_audio_bytes_received += len(frame)
                 if not first_patient_audio_logged:
                     first_patient_audio_logged = True
                     logger.info(
                         "AI Virtual latency stage=first_patient_audio_received elapsed_ms=%d frame_bytes=%d",
                         round((time.perf_counter() - voice_started_at) * 1000), len(frame),
                     )
+                if patient_audio_frames_received == 1 or patient_audio_frames_received % 20 == 0:
+                    logger.info(
+                        "AI Virtual audio stage=fastapi_received frames=%d bytes=%d frame_bytes=%d",
+                        patient_audio_frames_received, patient_audio_bytes_received, len(frame),
+                    )
                 if len(frame) > 256 * 1024:
                     await close_socket(4400, "Audio frame too large")
                     return
-                queue.send_realtime(types.Blob(data=frame, mime_type="audio/pcm;rate=16000"))
+                try:
+                    queue.send_realtime(types.Blob(data=frame, mime_type="audio/pcm;rate=16000"))
+                except Exception as exc:
+                    logger.exception(
+                        "AI Virtual audio stage=gemini_forward_failed frame=%d error_type=%s",
+                        patient_audio_frames_received, type(exc).__name__,
+                    )
+                    raise
+                patient_audio_frames_forwarded += 1
+                patient_audio_bytes_forwarded += len(frame)
+                if (patient_audio_frames_forwarded == 1 or
+                        patient_audio_frames_forwarded % 20 == 0):
+                    logger.info(
+                        "AI Virtual audio stage=gemini_forwarded frames=%d bytes=%d frame_bytes=%d",
+                        patient_audio_frames_forwarded, patient_audio_bytes_forwarded, len(frame),
+                    )
                 continue
             text = message.get("text")
             if text:
@@ -1241,6 +1305,7 @@ async def voice_stream(websocket: WebSocket, session_id: str):
 
     async def gemini_to_browser():
         nonlocal input_partial, assistant_partial, current_turn_key, first_gemini_audio_logged
+        nonlocal assistant_audio_frames_forwarded, assistant_audio_bytes_forwarded
         nonlocal live_turn_index, live_turn_started_at, live_turn_ended_at
         nonlocal live_turn_first_response_logged, live_turn_first_audio_logged
         async def events():
@@ -1287,7 +1352,24 @@ async def voice_stream(websocket: WebSocket, session_id: str):
                 # Forward native Gemini PCM chunks immediately; Flutter feeds
                 # these into its PCM stream player without waiting for turn end.
                 await send_bytes(audio_chunk)
+                assistant_audio_frames_forwarded += 1
+                assistant_audio_bytes_forwarded += len(audio_chunk)
+                if (assistant_audio_frames_forwarded == 1 or
+                        assistant_audio_frames_forwarded % 20 == 0):
+                    logger.info(
+                        "AI Virtual audio stage=browser_forwarded frames=%d bytes=%d frame_bytes=%d",
+                        assistant_audio_frames_forwarded, assistant_audio_bytes_forwarded, len(audio_chunk),
+                    )
             if event.input_transcription and event.input_transcription.text:
+                # Transcription is the provider-level acknowledgement that
+                # Gemini received and recognized patient audio. Never log text.
+                logger.info(
+                    "AI Virtual audio stage=gemini_input_recognized chars=%d final=%s frames_received=%d frames_forwarded=%d",
+                    len(event.input_transcription.text),
+                    bool(event.input_transcription.finished),
+                    patient_audio_frames_received,
+                    patient_audio_frames_forwarded,
+                )
                 if not input_partial:
                     live_turn_index += 1
                     live_turn_started_at = time.perf_counter()
