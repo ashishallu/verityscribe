@@ -1822,6 +1822,37 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
     }
   }
 
+  Future<void> _retryFailedSummary() async {
+    if (_sessionId == null || _loading) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final response = await ref.read(apiClientProvider).post<dynamic>(
+        '/ai-consultations/$_sessionId/end',
+        const {},
+      );
+      if (mounted) setState(() => _loadSession(_data(response.data)));
+    } catch (_) {
+      // Read the durable state in case the server saved the regenerated draft
+      // but the HTTP acknowledgement was lost.
+      try {
+        final response = await ref
+            .read(apiClientProvider)
+            .get<dynamic>('/ai-consultations/$_sessionId');
+        if (mounted) setState(() => _loadSession(_data(response.data)));
+      } catch (_) {
+        if (mounted) {
+          setState(() => _error =
+              'The saved conversation is safe, but its summary could not be refreshed. Please retry.');
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
   String get _duration {
     final seconds = (_startedAt == null
             ? 0
@@ -1893,8 +1924,17 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
         }.contains(_finalizationState)) {
       final incomplete =
           _finalizationState == ConsultationFinalizationState.incomplete;
-      final summaryFallback =
-          _summary?['summary_generation_status'] == 'failed';
+      final savedSummaryText =
+          (_summary?['clinical_summary'] ?? '').toString().toLowerCase();
+      final chatSummaryUnreadable = !_virtual &&
+          (savedSummaryText.trimLeft().startsWith('```') ||
+              savedSummaryText.trimLeft().startsWith('{'));
+      final summaryFallback = _summary?['summary_generation_status'] == 'failed' ||
+          chatSummaryUnreadable ||
+          savedSummaryText.startsWith('presenting concern:') ||
+          savedSummaryText.contains('additional patient-reported detail:') ||
+          savedSummaryText.startsWith(
+              'patient-reported statements preserved for clinician review:');
       final interviewEndedEarly = _summary?['interview_state'] == 'ended_early';
       return Scaffold(
         appBar: AppBar(title: Text(title)),
@@ -1930,10 +1970,19 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                               style: TextStyle(
                                   fontSize: 18, fontWeight: FontWeight.w700)),
                           const SizedBox(height: 10),
+                          if (summaryFallback) ...[
+                            const Text(
+                              'The AI summary could not be generated yet. Your original conversation is saved; retry to create the organized doctor summary.',
+                              style: TextStyle(color: Color(0xFF8A4B00), height: 1.4),
+                            ),
+                            const SizedBox(height: 8),
+                          ],
                           Text(
-                              (_summary!['clinical_summary'] ??
-                                      'Your conversation was saved. A concise summary is not available yet; your doctor can review the recorded details.')
-                                  .toString(),
+                              chatSummaryUnreadable
+                                  ? 'The conversation is saved, but the summary could not be formatted for display. Retry to generate a readable doctor-review summary.'
+                                  : (_summary!['clinical_summary'] ??
+                                          'Your conversation was saved. A concise summary is not available yet; your doctor can review the recorded details.')
+                                      .toString(),
                               style: const TextStyle(height: 1.5)),
                           if ((_summary!['uncertainties'] as List? ?? const [])
                               .isNotEmpty) ...[
@@ -1958,10 +2007,20 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                                 color: Color(0xFF626786), height: 1.4),
                           ),
                         ]))),
+          if (summaryFallback)
+            FilledButton.icon(
+              onPressed: _loading ? null : _retryFailedSummary,
+              icon: const Icon(Icons.refresh_rounded),
+              label: Text(_loading ? 'Generating summary…' : 'Retry AI summary'),
+            ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(_error!, style: const TextStyle(color: Colors.red)),
+          ],
           OutlinedButton.icon(
-              onPressed: () => context.go('/appointments'),
-              icon: const Icon(Icons.calendar_month),
-              label: const Text('Back to appointments')),
+              onPressed: () => context.go('/home'),
+              icon: const Icon(Icons.home_outlined),
+              label: const Text('Back to home')),
         ]),
       );
     }
@@ -2129,7 +2188,8 @@ class _AIConsultationScreenState extends ConsumerState<AIConsultationScreen> {
                       onPressed: _end,
                       tooltip: 'End consultation',
                       icon: const Icon(Icons.check_circle_outline,
-                          color: Colors.redAccent)),
+                          color: Colors.redAccent),
+                    ),
                 ]))),
       ]);
 

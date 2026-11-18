@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 import base64
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -289,6 +290,24 @@ def _summary_is_persisted(session: dict[str, Any]) -> bool:
     )
 
 
+def _summary_needs_regeneration(session: dict[str, Any]) -> bool:
+    """Recognize failed and older transcript-like fallback drafts for retry."""
+    summary = session.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    if summary.get("summary_generation_status") == "failed":
+        return True
+    text = str(summary.get("clinical_summary", "")).casefold()
+    return (
+        text.lstrip().startswith(("```", "{"))
+        or any(marker in text for marker in (
+        "presenting concern:",
+        "additional patient-reported detail:",
+        "patient-reported statements preserved for clinician review:",
+        ))
+    )
+
+
 def _persisted_summary_matches(session: dict[str, Any], summary: dict[str, Any]) -> bool:
     """Confirm a write by reading the durable row when its response is ambiguous."""
     stored = session.get("summary")
@@ -357,16 +376,22 @@ def _processing_is_stale(session: dict[str, Any], *, now: datetime | None = None
 
 
 def _fallback_clinical_summary(messages: list[dict[str, Any]], *, interview_complete: bool) -> dict[str, Any]:
-    """Build a concise clinician-readable fallback from question/answer context."""
+    """Build a categorized factual fallback without rewriting multilingual text."""
     reported: list[str] = []
-    detail_lines: list[str] = []
     uncertainties: list[str] = []
+    unanswered_questions: list[str] = []
     categorized: dict[str, list[str]] = {
         "symptoms": [], "onset_duration": [], "severity_frequency": [],
         "associated_symptoms": [], "relevant_history": [], "medications": [],
         "allergies": [], "additional_notes": [],
     }
     previous_question = ""
+    assistant_texts: list[str] = []
+    answered_question = False
+
+    def normalized(value: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", value.casefold())).strip()
+
     for row in messages:
         content = str(row.get("content", "")).strip()[:2000]
         role = row.get("role")
@@ -374,68 +399,90 @@ def _fallback_clinical_summary(messages: list[dict[str, Any]], *, interview_comp
             continue
         if role == "assistant":
             previous_question = content.lower()
+            assistant_texts.append(content)
+            if "?" in content:
+                answered_question = False
             continue
         if role != "patient":
             continue
+        # Gemini output can leak through browser speakers into the microphone.
+        # Ignore only near-verbatim, substantial assistant echoes; keep the raw
+        # message in storage and flag it for clinician confirmation.
+        content_norm = normalized(content)
+        if len(content_norm) >= 32 and any(
+            SequenceMatcher(None, content_norm, normalized(candidate)).ratio() >= 0.88
+            for candidate in assistant_texts[-12:]
+        ):
+            note = "A patient-channel transcript turn closely matched assistant speech and was excluded from extracted facts; verify against the recording."
+            if note not in uncertainties:
+                uncertainties.append(note)
+            continue
+        if re.fullmatch(r"(?i)(?:ok|okay|got it|sure|thank you|thanks)[.! ]*", content):
+            continue
+        answered_question = True
         reported.append(content)
         q = previous_question
         previous_question = ""
-        # Keep the verbatim answer in the raw messages table. Mixed-script
-        # fragments from live ASR are not silently transliterated into facts.
-        summary_content = re.sub(r"[\u0900-\u0DFF]+", "[unclear speech fragment]", content).strip().rstrip(" .!?;:")
-        if summary_content != content and "The transcript contains a speech-recognition fragment in another script; confirm its meaning with the patient." not in uncertainties:
-            uncertainties.append("The transcript contains a speech-recognition fragment in another script; confirm its meaning with the patient.")
-        if summary_content == "[unclear speech fragment]":
-            continue
+        # Preserve multilingual wording verbatim; do not guess a translation.
+        summary_content = content.rstrip(" .!?;:")
+        if re.search(r"[^\x00-\x7F]", content):
+            note = "Some patient-reported wording is multilingual; confirm its meaning with the patient if clinically relevant."
+            if note not in uncertainties:
+                uncertainties.append(note)
         if re.search(r"\b(surgery|operation|operated|arthroscopy|replacement)\b", content, re.I):
-            categorized["relevant_history"].append(content)
-            detail_lines.append(f"Relevant history: the patient reports {summary_content}")
+            categorized["relevant_history"].append(summary_content)
             continue
-        if not detail_lines:
-            categorized["symptoms"].append(content)
-            detail_lines.append(f"Presenting concern: the patient reports {summary_content}")
-        elif any(term in q for term in ("which side", "right or left", "one or both", "which joint", "which knee", "where exactly", "where is the pain", "what area")):
-            categorized["additional_notes"].append(f"Location/laterality: {content}")
-            detail_lines.append(f"Location/laterality: the patient reports {summary_content}")
+        if any(term in q for term in ("which side", "right or left", "one or both", "which joint", "which knee", "where exactly", "where is the pain", "what area")):
+            categorized["additional_notes"].append(f"Location/laterality: {summary_content}")
         elif any(term in q for term in ("1 to 10", "1-10", "1–10", "one to ten", "rate", "severity", "how severe", "pain score")):
-            categorized["severity_frequency"].append(content)
+            value = summary_content
             rating = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", summary_content)
             if rating and any(term in q for term in ("1 to 10", "1-10", "1–10", "one to ten", "scale")):
-                detail_lines.append(
-                    f"Severity: patient rated the symptom {rating.group(1)}/10 when asked for a 1-10 rating"
-                )
-            else:
-                detail_lines.append(f"Severity/detail: the patient's response was '{summary_content}'")
+                value = f"Patient-rated severity {rating.group(1)}/10"
+            categorized["severity_frequency"].append(value)
         elif any(term in q for term in ("other symptom", "associated symptom", "anything else", "what else", "along with")):
-            categorized["associated_symptoms"].append(content)
-            detail_lines.append(f"Additional symptoms: the patient reports '{summary_content}'")
+            categorized["associated_symptoms"].append(summary_content)
         elif any(term in q for term in ("how long", "when did", "how many days", "since when", "duration", "started", "begin")):
-            categorized["onset_duration"].append(content)
-            detail_lines.append(f"Onset/duration: the patient reports '{summary_content}'")
+            categorized["onset_duration"].append(summary_content)
         elif any(term in q for term in ("constant", "how often", "frequency", "come and go", "pattern")):
-            categorized["severity_frequency"].append(content)
-            detail_lines.append(f"Pattern/frequency: the patient reports '{summary_content}'")
+            categorized["severity_frequency"].append(summary_content)
         elif any(term in q for term in ("describe", "what does it feel", "what is the pain like", "character", "quality")):
-            categorized["symptoms"].append(content)
-            detail_lines.append(f"Pain character: the patient describes it as “{summary_content}”")
+            categorized["symptoms"].append(summary_content)
         elif any(term in q for term in ("medical history", "medical conditions", "past history", "health conditions")):
-            categorized["relevant_history"].append(content)
-            detail_lines.append(f"Relevant history: the patient reports '{summary_content}'")
+            categorized["relevant_history"].append(summary_content)
         elif any(term in q for term in ("medication", "medicines", "taking any drugs")):
-            categorized["medications"].append(content)
-            detail_lines.append(f"Current medication: the patient reports '{summary_content}'")
+            categorized["medications"].append(summary_content)
         elif any(term in q for term in ("allerg", "allergic")):
-            categorized["allergies"].append(content)
-            detail_lines.append(f"Allergies: the patient's response was '{summary_content}'")
+            categorized["allergies"].append(summary_content)
         else:
-            categorized["additional_notes"].append(content)
-            detail_lines.append(f"Additional patient-reported detail: '{summary_content}'")
+            has_clinical_entry = any(categorized.values())
+            (categorized["additional_notes"] if has_clinical_entry else categorized["symptoms"]).append(summary_content)
+    # Remove duplicates without changing original wording or script.
+    for key, values in categorized.items():
+        seen: set[str] = set()
+        categorized[key] = [v for v in values if not (normalized(v) in seen or seen.add(normalized(v)))]
+    if previous_question and not answered_question and "?" in previous_question:
+        unanswered_questions.append(previous_question.strip())
+
+    problem = categorized["symptoms"][0] if categorized["symptoms"] else None
+    sections = [
+        ("Problem", problem),
+        ("Symptoms and course", "; ".join(
+            categorized["symptoms"][1:] + categorized["onset_duration"] +
+            categorized["severity_frequency"] + categorized["associated_symptoms"] +
+            categorized["additional_notes"]
+        ) or None),
+        ("Medications", "; ".join(categorized["medications"]) or "Not reported"),
+        ("Relevant history and allergies", "; ".join(
+            categorized["relevant_history"] + categorized["allergies"]
+        ) or "Not reported"),
+        ("Clarifications needed", "; ".join(unanswered_questions + uncertainties) or "None identified from the available transcript"),
+        ("Status", "Interview completed; clinician review required" if interview_complete else "Ended early; clinician review required"),
+    ]
+    clinical_summary = "\n".join(f"{label}: {value}" for label, value in sections if value)
     completion = "complete" if interview_complete else "ended_early"
-    clinical_summary = ". ".join(detail_lines)
-    if clinical_summary and not clinical_summary.endswith((".", "!", "?")):
-        clinical_summary += "."
     return {
-        "clinical_summary": clinical_summary or "No patient statements were captured. Clinician review is required.",
+        "clinical_summary": clinical_summary if reported else "Problem: No patient statements captured.\nStatus: Clinician review required.",
         "chief_complaint": reported[0] if reported else None,
         **categorized,
         "positive_findings": [],
@@ -443,7 +490,7 @@ def _fallback_clinical_summary(messages: list[dict[str, Any]], *, interview_comp
         "risk_indicators": [],
         "follow_up_recommendations": [],
         "items_for_doctor_review": ["Review the attributed patient statements; structured summary generation was unavailable."],
-        "unanswered_questions": [],
+        "unanswered_questions": unanswered_questions,
         "uncertainties": uncertainties + ["Clinical fields not explicitly extracted are unknown, not confirmed absent."],
         "draft_prescription": None,
         "review_required": True,
@@ -1504,7 +1551,12 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
     patient = get_current_patient(claims)
     client = db()
     session = _session_or_404(client, session_id, patient_id=patient["id"])
-    if session["status"] in {"awaiting_doctor_review", "approved", "rejected", "completed", "incomplete"}:
+    retry_failed_ai_summary = bool(
+        session.get("mode") in {"ai_virtual", "ai_chat"}
+        and session.get("status") == "awaiting_doctor_review"
+        and _summary_needs_regeneration(session)
+    )
+    if session["status"] in {"awaiting_doctor_review", "approved", "rejected", "completed", "incomplete"} and not retry_failed_ai_summary:
         # Preserve idempotency, and backfill persistence identifiers for older
         # summaries when the patient retries after a lost acknowledgement.
         if not _summary_is_persisted(session) and isinstance(session.get("summary"), dict):

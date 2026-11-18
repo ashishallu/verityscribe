@@ -10,6 +10,7 @@ import os
 import random
 import re
 import traceback
+import time
 from time import perf_counter
 from time import sleep
 from uuid import uuid4
@@ -18,10 +19,19 @@ from urllib.request import Request, urlopen
 
 from huggingface_hub import InferenceClient
 from .document_ocr import extract_image_text
+from ..core.config import settings
 
 
 logger = logging.getLogger(__name__)
 _ASR_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="cloudflare-asr")
+
+
+def _cloudflare_credentials() -> tuple[str, str]:
+    """Read Cloudflare secrets from process env or the backend dotenv settings."""
+    config = settings()
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or config.cloudflare_account_id.strip()
+    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip() or config.cloudflare_api_token.strip()
+    return account_id, token
 
 
 @dataclass(frozen=True)
@@ -119,10 +129,14 @@ class AIProvider:
     ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "@cf/deepgram/nova-3")
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "@cf/openai/whisper-large-v3-turbo")
     LLM_MODEL = "Qwen/Qwen3-8B"
-    # Chat and report summaries use the existing Cloudflare account/token. Do
+    # Chat and report summarization use the existing Cloudflare account/token. Do
     # not fall back to Hugging Face: its routed inference returned HTTP 402 in
     # production after free credits were exhausted.
     CHAT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
+    # Separate clinical-summary fallback model. The chat model above is kept
+    # stable for existing AI Chat callers; this model replaces it only for
+    # consultation summaries and can be overridden during model rollouts.
+    SUMMARY_MODEL = os.getenv("CLOUDFLARE_SUMMARY_MODEL", "@cf/qwen/qwen3.8-27b")
     DEFAULT_ASR_MODELS = (
         # Four user-verified working Cloudflare routes. Keep their weights and
         # wire formats stable; Flux was removed after repeated Gateway 401s.
@@ -169,7 +183,7 @@ class AIProvider:
                     )
                 if model not in {entry[0] for entry in self.DEFAULT_ASR_MODELS}:
                     raise RuntimeError("ASR model is not on the approved zero-cost Cloudflare allowlist")
-                if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
+                if not all(_cloudflare_credentials()):
                     raise RuntimeError("Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
                 configs.append({
                     "model": model,
@@ -181,7 +195,7 @@ class AIProvider:
                 raise RuntimeError("ASR model ids must be unique")
             return configs
 
-        if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
+        if not all(_cloudflare_credentials()):
             raise RuntimeError("Cloudflare ASR requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
         return [
             {
@@ -215,7 +229,7 @@ class AIProvider:
         if not source_text:
             raise ValueError("Document text is empty")
 
-        if not os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() or not os.getenv("CLOUDFLARE_API_TOKEN", "").strip():
+        if not all(_cloudflare_credentials()):
             raise RuntimeError("Cloudflare Workers AI document summarizer is not configured")
 
         timeout = max(10.0, min(60.0, float(os.getenv("AI_DOCUMENT_SUMMARY_TIMEOUT_SECONDS", "35"))))
@@ -363,8 +377,7 @@ class AIProvider:
         return self._transcribe_with_cloudflare(audio, model, timeout)
 
     def _transcribe_with_cloudflare(self, audio: bytes, model: str, timeout: float) -> str:
-        account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-        token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        account_id, token = _cloudflare_credentials()
         if not account_id or not token:
             raise RuntimeError("Cloudflare ASR credentials are not configured")
 
@@ -826,29 +839,167 @@ class AIProvider:
         timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
         return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=260)
 
-    def answer_consultation(self, prompt: str) -> str:
-        """Keep intake replies short so the patient is not left waiting."""
-        timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
-        return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=140)
+    def answer_consultation(
+        self, prompt: str, *, intake_reply: bool = False, chat_summary: bool = False,
+    ) -> str:
+        """Generate text-consultation output; voice summaries use their own provider path."""
+        config = settings()
+        api_key = config.google_api_key.strip()
+        if not api_key:
+            raise RuntimeError("Gemini text chat is not configured")
+        try:
+            from google import genai
+            from google.genai import types
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(
+                    timeout=35000,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Gemini text chat client initialization failed ({type(exc).__name__})") from exc
 
-    def _cloudflare_chat(self, prompt: str, *, timeout: float, max_tokens: int) -> str:
+        for attempt in range(3):
+            try:
+                output_limit = 4096 if chat_summary else 1024 if intake_reply else 220
+                generation_config = {
+                    "temperature": 0.2,
+                    # Gemini 3 reasoning tokens count against this limit. The
+                    # previous 220-token summary limit was exhausted before the
+                    # model could complete the requested structured JSON.
+                    "max_output_tokens": output_limit,
+                }
+                if chat_summary:
+                    generation_config["response_mime_type"] = "application/json"
+                response = client.models.generate_content(
+                    model=config.gemini_chat_model,
+                    contents=prompt,
+                    config=generation_config,
+                )
+                answer = getattr(response, "text", None)
+                candidates = getattr(response, "candidates", None) or []
+                candidate = candidates[0] if candidates else None
+                finish_reason = getattr(candidate, "finish_reason", None)
+                finish_name = (
+                    getattr(finish_reason, "name", None)
+                    or str(finish_reason or "unknown").rsplit(".", 1)[-1]
+                ).upper()
+                usage = getattr(response, "usage_metadata", None)
+                if intake_reply or chat_summary:
+                    logger.info(
+                        "ai_chat_generation profile=%s model=%s attempt=%d text_chars=%d finish=%s output_tokens=%s thought_tokens=%s",
+                        "summary" if chat_summary else "intake",
+                        config.gemini_chat_model,
+                        attempt + 1,
+                        len(answer) if isinstance(answer, str) else 0,
+                        finish_name,
+                        getattr(usage, "candidates_token_count", None),
+                        getattr(usage, "thoughts_token_count", None),
+                    )
+                    if finish_name == "MAX_TOKENS":
+                        logger.warning(
+                            "ai_chat_generation profile=%s truncated by token limit; using text fallback",
+                            "summary" if chat_summary else "intake",
+                        )
+                        try:
+                            return self._cloudflare_chat(
+                                prompt,
+                                timeout=max(10.0, min(35.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "25")))),
+                                max_tokens=1000 if chat_summary else 512,
+                                disable_reasoning=True,
+                            )
+                        except Exception as fallback_exc:
+                            raise RuntimeError(
+                                "Gemini text chat returned a truncated reply; "
+                                f"Cloudflare text fallback failed ({type(fallback_exc).__name__})"
+                            ) from fallback_exc
+                if not isinstance(answer, str) or not answer.strip():
+                    raise RuntimeError("Gemini text chat returned an empty answer")
+                return answer.strip()
+            except Exception as exc:
+                response_obj = getattr(exc, "response", None)
+                status = (
+                    getattr(exc, "code", None)
+                    or getattr(exc, "status_code", None)
+                    or getattr(response_obj, "status_code", None)
+                )
+                try:
+                    status = int(status)
+                except (TypeError, ValueError):
+                    status = None
+                if status not in {429, 503, 504}:
+                    raise RuntimeError(
+                        f"Gemini text chat request failed ({type(exc).__name__})"
+                    ) from exc
+                if attempt == 2:
+                    try:
+                        # Text-only appointment intake fallback; AI Virtual uses
+                        # a separate Gemini Live path and never calls this method.
+                        return self._cloudflare_chat(
+                            prompt,
+                            timeout=max(10.0, min(35.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "25")))),
+                            max_tokens=1000 if chat_summary else 512,
+                            disable_reasoning=True,
+                        )
+                    except Exception as fallback_exc:
+                        raise RuntimeError(
+                            "Gemini text chat temporarily unavailable after 3 attempts; "
+                            f"Cloudflare text fallback failed ({type(fallback_exc).__name__})"
+                        ) from fallback_exc
+
+                headers = getattr(response_obj, "headers", {}) or {}
+                retry_after = headers.get("Retry-After") or headers.get("retry-after")
+                try:
+                    delay = min(20.0, max(0.0, float(retry_after))) if retry_after else None
+                except (TypeError, ValueError):
+                    delay = None
+                if delay is None:
+                    delay = min(4.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+                time.sleep(delay)
+
+    def summarize_consultation(self, prompt: str) -> str:
+        """Use the configured Cloudflare text model only if Gemini summary fails."""
+        config = settings()
+        timeout = max(10.0, min(60.0, float(os.getenv("AI_SUMMARY_TIMEOUT_SECONDS", "40"))))
+        model = config.cloudflare_summary_model.strip() or self.SUMMARY_MODEL
+        return self._cloudflare_chat(
+            prompt, timeout=timeout, max_tokens=900, model=model,
+            # Qwen 3.8 may return reasoning without user-visible content when
+            # its thinking budget consumes the response budget. Constrain its
+            # documented reasoning effort and disable extended thinking so
+            # summaries return the final JSON payload within the output budget.
+            disable_reasoning=True,
+            reasoning_effort="low",
+        )
+
+    def _cloudflare_chat(
+        self, prompt: str, *, timeout: float, max_tokens: int,
+        model: str | None = None, disable_reasoning: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> str:
         """Generate chat/report text through Workers AI, without paid fallbacks."""
-        account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-        token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        account_id, token = _cloudflare_credentials()
         if not account_id or not token:
             raise RuntimeError("Cloudflare Workers AI is not configured")
 
         url = (
             "https://api.cloudflare.com/client/v4/accounts/"
-            f"{account_id}/ai/run/{self.CHAT_MODEL}"
+            f"{account_id}/ai/run/{model or self.CHAT_MODEL}"
         )
+        user_prompt = f"{prompt.rstrip()}\n/no_think" if disable_reasoning else prompt
+        payload = {
+            "messages": [{"role": "user", "content": user_prompt}],
+            "temperature": 0.1,
+            "max_tokens": max(64, min(1000, max_tokens)),
+        }
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
         request = Request(
             url,
-            data=json.dumps({
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": max(64, min(1000, max_tokens)),
-            }).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
@@ -869,6 +1020,18 @@ class AIProvider:
             raise RuntimeError("Cloudflare Workers AI returned an unsuccessful response")
         result = body.get("result")
         answer = result.get("response") if isinstance(result, dict) else None
+        # Workers AI models may return either the legacy `response` field or
+        # the OpenAI-compatible `choices[0].message.content` shape. Qwen 3
+        # currently uses the latter; treating its HTTP 200 as an empty answer
+        # incorrectly makes the AI Chat fallback look unavailable.
+        if not isinstance(answer, str) or not answer.strip():
+            choices = result.get("choices") if isinstance(result, dict) else None
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str):
+                    answer = content
         if not isinstance(answer, str) or not answer.strip():
             raise RuntimeError("Cloudflare Workers AI returned an empty answer")
         return answer.strip()

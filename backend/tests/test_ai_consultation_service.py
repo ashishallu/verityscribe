@@ -1,5 +1,6 @@
 import unittest
 import uuid
+import json
 from unittest.mock import patch
 from datetime import datetime, timezone
 
@@ -91,7 +92,7 @@ class AIConsultationServiceTests(unittest.TestCase):
     self.assertFalse(ai_consultation.emergency_warning("My ankle aches after running"))
 
   def test_summary_never_returns_a_prescription_or_unverified_cases(self):
-    with patch.object(ai_consultation.ai_provider, "answer", return_value='{"clinical_summary":"Patient reports headache","draft_prescription":{"medicine":"made up"},"similar_cases":{"matches":["made up"]}}'):
+    with patch.object(ai_consultation.ai_provider, "answer_consultation", return_value='{"clinical_summary":"Patient reports headache","draft_prescription":{"medicine":"made up"},"similar_cases":{"matches":["made up"]}}'):
       result = ai_consultation.generate_summary(
           _Client(), patient_id="patient-test", hospital_id="hospital-test", mode="ai_chat",
           appointment={"id": "appointment-test", "consultation_type": "ai_chat"}, messages=[],
@@ -102,10 +103,81 @@ class AIConsultationServiceTests(unittest.TestCase):
     self.assertEqual(result["similar_cases"], {"status": "not_consented", "matches": []})
     self.assertTrue(result["review_required"])
 
+  def test_chat_summary_parses_json_fenced_output(self):
+    response = '```json\n{"clinical_summary":"Patient reports fever for two days.","symptoms":[]}\n```'
+    with patch.object(ai_consultation.ai_provider, "answer_consultation", return_value=response) as generate:
+      result = ai_consultation.generate_summary(
+          _Client(), patient_id="patient-test", hospital_id="hospital-test", mode="ai_chat",
+          appointment={"id": "appointment-test", "consultation_type": "ai_chat"}, messages=[],
+          similar_case_consent=False,
+      )
+    self.assertEqual(result["clinical_summary"], "Patient reports fever for two days.")
+    generate.assert_called_once()
+    self.assertTrue(generate.call_args.kwargs["chat_summary"])
+
+  def test_chat_summary_rejects_truncated_json_for_router_fallback(self):
+    with patch.object(ai_consultation.ai_provider, "answer_consultation", return_value='```json\n{"clinical_summary":"') as generate:
+      with self.assertRaisesRegex(RuntimeError, "invalid structured output"):
+        ai_consultation.generate_summary(
+            _Client(), patient_id="patient-test", hospital_id="hospital-test", mode="ai_chat",
+            appointment={"id": "appointment-test", "consultation_type": "ai_chat"}, messages=[],
+            similar_case_consent=False,
+        )
+    generate.assert_called_once()
+    self.assertTrue(generate.call_args.kwargs["chat_summary"])
+
+  def test_chat_summary_rejects_nested_json_inside_summary_text(self):
+    response = json.dumps({
+      "clinical_summary": '```json\\n{\\n  "problem": "fever"\\n}\\n```',
+      "symptoms": [{"name": "fever"}],
+    })
+    with (
+      patch.object(ai_consultation.ai_provider, "answer_consultation", return_value=response),
+      patch.object(ai_consultation.ai_provider, "summarize_consultation", side_effect=RuntimeError("unavailable")),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "non-readable structured output"):
+        ai_consultation.generate_summary(
+            _Client(), patient_id="patient-test", hospital_id="hospital-test", mode="ai_chat",
+            appointment={"id": "appointment-test", "consultation_type": "ai_chat"},
+            messages=[{"id": "m1", "role": "patient", "content": "I have a fever"}],
+            similar_case_consent=False,
+        )
+
+  def test_ai_chat_summary_uses_configured_provider_when_gemini_is_unreachable(self):
+    response = '{"clinical_summary":"Patient reports fever for three days.","symptoms":[{"name":"fever"}]}'
+    with (
+      patch.object(ai_consultation.ai_provider, "answer_consultation", side_effect=RuntimeError("Gemini connect failed")),
+      patch.object(ai_consultation.ai_provider, "summarize_consultation", return_value=response) as fallback,
+    ):
+      result = ai_consultation.generate_summary(
+          _Client(), patient_id="patient-test", hospital_id="hospital-test", mode="ai_chat",
+          appointment={"id": "appointment-test", "consultation_type": "ai_chat"},
+          messages=[{"id": "m1", "role": "patient", "content": "I have a fever"}],
+          similar_case_consent=False,
+      )
+    self.assertEqual(result["clinical_summary"], "Patient reports fever for three days.")
+    fallback.assert_called_once()
+
+  def test_ai_chat_prompt_requests_one_question_per_reply(self):
+    with (
+      patch.object(ai_consultation, "patient_context", return_value={}),
+      patch.object(ai_consultation, "_patient_name_terms", return_value=set()),
+      patch.object(ai_consultation, "_retrieve_similar_cases", return_value=[]),
+      patch.object(ai_consultation.ai_provider, "answer_consultation", return_value="When did it start?") as generate,
+    ):
+      reply = ai_consultation.generate_reply(
+          _Client(), patient_id="patient-test", hospital_id="hospital-test",
+          similar_case_consent=False, mode="ai_chat", history=[], message="I have a fever",
+      )
+    self.assertEqual(reply, "When did it start?")
+    prompt = generate.call_args.args[0]
+    self.assertIn("Ask exactly one relevant follow-up question per response", prompt)
+    generate.assert_called_once_with(prompt, intake_reply=True)
+
   def test_similar_case_retrieval_uses_symptom_terms_and_authenticated_scope(self):
     client = _Client(case_matches=[{"symptom_terms": ["headache", "nausea"], "similarity": 0.5}])
     response = '{"clinical_summary":"Headache and nausea","symptoms":[{"name":"Headache"},{"name":"Nausea"}]}'
-    with patch.object(ai_consultation.ai_provider, "answer", return_value=response):
+    with patch.object(ai_consultation.ai_provider, "answer_consultation", return_value=response):
       result = ai_consultation.generate_summary(
           client, patient_id="patient-current", hospital_id="hospital-current", mode="ai_chat",
           appointment={"id": "appointment-current", "consultation_type": "ai_chat"},

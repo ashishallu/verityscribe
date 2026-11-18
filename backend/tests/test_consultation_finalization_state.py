@@ -29,11 +29,11 @@ def test_fallback_summary_keeps_severity_and_other_answers_in_context():
     ], interview_complete=False)
 
     assert summary["chief_complaint"] == "I have a headache."
-    assert "7/10" in summary["clinical_summary"]
-    assert "Onset/duration" in summary["clinical_summary"]
-    assert "Pattern/frequency" in summary["clinical_summary"]
-    assert "Additional symptoms" in summary["clinical_summary"]
-    assert summary["severity_frequency"] == ["It has been constant.", "7"]
+    assert "Patient-rated severity 7/10" in summary["clinical_summary"]
+    assert "Symptoms and course:" in summary["clinical_summary"]
+    assert "Medications: Not reported" in summary["clinical_summary"]
+    assert "Vomiting, just two days back" in summary["clinical_summary"]
+    assert summary["severity_frequency"] == ["It has been constant", "Patient-rated severity 7/10"]
     assert summary["interview_state"] == "ended_early"
 
 
@@ -52,12 +52,27 @@ def test_fallback_summary_contextualizes_joint_pain_side_duration_and_prior_surg
     ], interview_complete=False)
 
     text = summary["clinical_summary"]
-    assert "Presenting concern" in text and "leg pain" in text
-    assert "Location/laterality" in text and "right" in text
-    assert "Onset/duration" in text and "Three or four days" in text
+    assert "Problem: I have been having leg pain" in text
+    assert "Location/laterality: Just the right one" in text
+    assert "Three or four days ago" in text
     assert "knee surgery three years ago" in text
-    assert "ಕಂಟೆಂಟ್" not in text
-    assert any("speech-recognition fragment" in item for item in summary["uncertainties"])
+    assert "ಕಂಟೆಂಟ್" in text
+    assert any("multilingual" in item for item in summary["uncertainties"])
+
+
+def test_fallback_summary_excludes_assistant_echo_but_preserves_raw_multilingual_facts():
+    echo = "Hello, I am Verity. Please tell me what is bothering you today so I can help you."
+    summary = ai_consultations._fallback_clinical_summary([
+        {"role": "assistant", "content": echo},
+        {"role": "patient", "content": echo},
+        {"role": "assistant", "content": "What symptom would you like to discuss?"},
+        {"role": "patient", "content": "మోకాలి నొప్పి"},
+    ], interview_complete=False)
+
+    assert summary["chief_complaint"] == "మోకాలి నొప్పి"
+    assert echo not in summary["clinical_summary"]
+    assert "మోకాలి నొప్పి" in summary["clinical_summary"]
+    assert any("matched assistant speech" in item for item in summary["uncertainties"])
 
 
 class _Query:
@@ -153,6 +168,24 @@ class ConsultationFinalizationStateTests(unittest.TestCase):
         for summary in [None, _summary(), {**_summary(), 'summary_id': 'sum-3'}, {**_summary(), 'summary_id': 'sum-4', 'session_id': 'other'}]:
             self.assertEqual(ai_consultations._finalization_state({**base, 'summary': summary})['state'], 'unknown')
 
+    def test_legacy_transcript_fallback_is_marked_for_summary_retry(self):
+        session = {
+            'mode': 'ai_virtual',
+            'status': 'awaiting_doctor_review',
+            'summary': {
+                'clinical_summary': 'Presenting concern: the patient reports headache. Additional patient-reported detail: okay.'
+            },
+        }
+        self.assertTrue(ai_consultations._summary_needs_regeneration(session))
+
+    def test_ai_chat_raw_json_summary_is_marked_for_retry(self):
+        session = {
+            'mode': 'ai_chat',
+            'status': 'awaiting_doctor_review',
+            'summary': {'clinical_summary': '```json\\n{ "problem": "fever" }\\n```'},
+        }
+        self.assertTrue(ai_consultations._summary_needs_regeneration(session))
+
     def test_generation_failure_persists_factual_incomplete_fallback(self):
         session = {'id': 's-1', 'patient_id': 'p-1', 'appointment_id': 'a-1', 'hospital_id': 'h-1', 'mode': 'ai_virtual', 'status': 'in_progress', 'summary': {'interview_complete': True}}
         messages = [{'id': 'm-1', 'session_id': 's-1', 'role': 'patient', 'content': 'My headache began two days ago.'}]
@@ -170,9 +203,34 @@ class ConsultationFinalizationStateTests(unittest.TestCase):
             self.assertEqual(generate.call_count, 1)
 
             retry = ai_consultations.end_consultation('s-1', claims)
-            self.assertEqual(retry['data']['finalization']['state'], 'incomplete')
-            self.assertEqual(retry['data']['session']['summary']['summary_id'], draft['summary_id'])
-            self.assertEqual(generate.call_count, 1)
+            self.assertEqual(retry['data']['finalization']['state'], 'completed')
+            self.assertNotEqual(retry['data']['session']['summary']['summary_id'], draft['summary_id'])
+            self.assertNotEqual(retry['data']['session']['summary'].get('summary_generation_status'), 'failed')
+            self.assertEqual(generate.call_count, 2)
+
+    def test_legacy_transcript_draft_is_regenerated_with_gemini_on_retry(self):
+        session = {
+            'id': 's-legacy', 'patient_id': 'p-1', 'appointment_id': 'a-1',
+            'hospital_id': 'h-1', 'mode': 'ai_virtual', 'status': 'awaiting_doctor_review',
+            'summary': {
+                'summary_id': 'old-summary', 'session_id': 's-legacy',
+                'clinical_summary': 'Presenting concern: the patient reports headache. Additional patient-reported detail: okay.',
+                'interview_complete': True,
+            },
+        }
+        messages = [{'id': 'm-1', 'session_id': 's-legacy', 'role': 'patient', 'content': 'Headache for three days.'}]
+        client = _Client(session, messages, {'id': 'a-1'})
+        claims = {'sub': 'auth-p-1', 'app_metadata': {'role': 'patient'}}
+        with patch.object(ai_consultations, 'db', return_value=client), \
+             patch.object(ai_consultations, 'get_current_patient', return_value={'id': 'p-1'}), \
+             patch.object(ai_consultations, 'patient_context', return_value={}), \
+             patch.object(ai_consultations.gemini_live, 'generate_consultation_summary', return_value=_summary()) as generate:
+            result = ai_consultations.end_consultation('s-legacy', claims)
+
+        self.assertEqual(result['data']['session']['summary']['clinical_summary'], _summary()['clinical_summary'])
+        self.assertNotEqual(result['data']['session']['summary']['summary_id'], 'old-summary')
+        self.assertEqual(result['data']['finalization']['state'], 'completed')
+        generate.assert_called_once()
 
     def test_summary_persistence_failure_stays_failed_not_completed(self):
         session = {'id': 's-1', 'patient_id': 'p-1', 'appointment_id': 'a-1', 'hospital_id': 'h-1', 'mode': 'ai_virtual', 'status': 'in_progress'}

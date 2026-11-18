@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     supabase_jwt_secret: str = ""
     huggingface_token: str = ""
     google_api_key: str = ""
+    cloudflare_account_id: str = ""
+    cloudflare_api_token: str = ""
+    cloudflare_summary_model: str = "@cf/qwen/qwen3.8-27b"
+    gemini_chat_model: str = "gemini-3.8-flash"
     # Defaults align with the current Gemini Live implementation; deployments
     # may override either model through their process environment.
     gemini_live_model: str = "gemini-3.8-live"

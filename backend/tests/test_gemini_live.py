@@ -1,6 +1,7 @@
 from unittest.mock import patch
 from types import SimpleNamespace
 import json
+import httpx
 
 from app.core.config import Settings
 from app.services import gemini_live as gemini_live_module
@@ -108,18 +109,24 @@ def test_virtual_summary_uses_gemini_json_and_preserves_incomplete_state():
     service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
     service.runner = object()
     service.sessions = object()
-    service.types = SimpleNamespace(GenerateContentConfig=lambda **kwargs: kwargs)
+    service.google_api_key = "test-key-not-real"
     request = {}
 
-    class Models:
-        def generate_content(self, **kwargs):
-            request.update(kwargs)
-            return SimpleNamespace(text=json.dumps({
-                "clinical_summary": "Patient-reported headache for two days.",
-                "chief_complaint": "Headache",
-            }))
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps({
+                "clinical_summary": "Problem: Knee pain.",
+                "chief_complaint": "Knee pain",
+            })}]}}]}
 
-    service.summary_client = SimpleNamespace(models=Models())
+    def post(url, **kwargs):
+        request.update({"url": url, **kwargs})
+        return Response()
+
+    service.summary_client = object()
     service.summary_model = "test-fast-summary-model"
     transcript = [
         {"role": "patient", "content": f"Earlier detail {index}: right knee pain."}
@@ -129,31 +136,217 @@ def test_virtual_summary_uses_gemini_json_and_preserves_incomplete_state():
         {"role": "assistant", "content": "Did you have surgery on that knee?"},
         {"role": "patient", "content": "Yes, three years ago."},
     ])
-    summary = service.generate_consultation_summary(
-        transcript=transcript,
-        patient_context={"allergies": []}, appointment={"id": "appt-1"},
-        interview_complete=False,
-    )
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post):
+        summary = service.generate_consultation_summary(
+            transcript=transcript,
+            patient_context={"allergies": []}, appointment={"id": "appt-1"},
+            interview_complete=False,
+        )
 
     assert gemini_live_module.SUMMARY_MODEL == "gemini-3.8-flash"
-    assert request["model"] == "test-fast-summary-model"
-    assert request["config"]["response_mime_type"] == "application/json"
-    # Gemini 3.8 Flash no longer accepts legacy sampling parameters such as
-    # temperature; sending one makes structured summaries fail and invokes
-    # the low-quality factual fallback instead.
-    assert "temperature" not in request["config"]
+    assert request["url"].endswith("/models/test-fast-summary-model:generateContent")
+    assert request["headers"]["x-goog-api-key"] == "test-key-not-real"
+    config = request["json"]["generationConfig"]
+    assert config["responseMimeType"] == "application/json"
+    assert config["maxOutputTokens"] == 1800
+    assert config["thinkingConfig"]["thinkingLevel"] == "MEDIUM"
+    assert "temperature" not in config
+    assert summary["clinical_summary"] == "Problem: Knee pain."
+    assert summary["summary_generation_provider"] == "gemini"
     assert summary["interview_complete"] is False
     assert summary["review_required"] is True
     assert summary["draft_prescription"] is None
-    serialized = request["contents"]
+    serialized = request["json"]["contents"][0]["parts"][0]["text"]
     assert "Earlier detail 0" in serialized
     assert "Earlier detail 104" in serialized
     assert "three years ago" in serialized
-    assert "assistant messages are questions/context only" in serialized.lower()
-    assert "Consultation Summary (2-3 coherent paragraphs)" in serialized
-    assert "Doctor's Advice & Treatment Plan" in serialized
-    assert "Final Impression must say clinical assessment pending" in serialized
-    assert "Do not expose ASR placeholders" in serialized
+    assert "interviewer turns are question/context only" in serialized.lower()
+    assert "Problem; Symptoms and course" in serialized
+    assert "Medications" in serialized
+    assert "physician review is mandatory" in serialized.lower()
+    assert "entire" not in serialized.lower()  # concise summary contract, not an exhaustive narrative
+
+
+def test_virtual_summary_uses_cloudflare_when_gemini_times_out():
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-key-not-real"
+    service.summary_model = "test-fast-summary-model"
+    cloudflare_summary = json.dumps({
+        "clinical_summary": "Problem: Headache. Symptoms and course: 3 days, 7/10.",
+        "chief_complaint": "Headache",
+        "severity_frequency": ["Pain rated 7/10"],
+    })
+    with patch.object(gemini_live_module.httpx, "post", side_effect=httpx.ReadTimeout("provider timeout")), \
+         patch("app.services.ai_service.ai_provider.summarize_consultation", return_value=cloudflare_summary) as fallback:
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "Headache for 3 days, pain is 7 out of 10"}],
+            patient_context={}, appointment={"id": "fictional-appointment"},
+            interview_complete=False,
+        )
+
+    assert result["summary_generation_provider"] == "cloudflare"
+    assert result["clinical_summary"].startswith("Problem: Headache")
+    assert result["interview_complete"] is False
+    assert result["review_required"] is True
+    assert result["draft_prescription"] is None
+    prompt = fallback.call_args.args[0]
+    assert "Never fill gaps" in prompt
+    assert "Headache for 3 days" in prompt
+
+
+def test_virtual_summary_uses_cloudflare_for_nested_json_in_gemini_summary():
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-key-not-real"
+    service.summary_model = "test-fast-summary-model"
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            nested = json.dumps({"clinical_summary": '```json\\n{ "problem": "fever" }\\n```'})
+            return {"candidates": [{"content": {"parts": [{"text": nested}]}}]}
+
+    cloudflare_summary = json.dumps({
+        "clinical_summary": "Problem: Patient-reported fever.",
+        "symptoms": ["Fever"],
+    })
+    with patch.object(gemini_live_module.httpx, "post", return_value=Response()), \
+         patch("app.services.ai_service.ai_provider.summarize_consultation", return_value=cloudflare_summary) as fallback:
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "I have a fever"}],
+            patient_context={}, appointment={"id": "synthetic-appointment"},
+            interview_complete=True,
+        )
+
+    assert result["summary_generation_provider"] == "cloudflare"
+    assert result["clinical_summary"] == "Problem: Patient-reported fever."
+    fallback.assert_called_once()
+
+
+def test_virtual_summary_retries_transient_gateway_timeout_once():
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-key-not-real"
+    service.summary_model = "test-fast-summary-model"
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self.data = data or {}
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                response = httpx.Response(
+                    self.status_code,
+                    request=httpx.Request("POST", "https://example.test"),
+                    headers={"Retry-After": "3"},
+                )
+                raise httpx.HTTPStatusError(
+                    "gateway timeout", request=response.request, response=response
+                )
+        def json(self):
+            return self.data
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if len(calls) == 1:
+            return Response(504)
+        return Response(200, {"candidates": [{"content": {"parts": [{
+            "text": json.dumps({"clinical_summary": "Problem: Headache."})
+        }]}}]})
+
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post), \
+         patch.object(gemini_live_module.time, "sleep") as sleep:
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "Headache for two days"}],
+            patient_context={"allergies": [], "irrelevant_large_field": "should not be sent"},
+            appointment={"id": "appointment"}, interview_complete=True,
+        )
+    assert len(calls) == 2
+    sleep.assert_called_once_with(3.0)
+    assert result["clinical_summary"] == "Problem: Headache."
+    prompt = calls[-1][1]["json"]["contents"][0]["parts"][0]["text"]
+    assert "irrelevant_large_field" not in prompt
+    assert "Headache for two days" in prompt
+
+
+def test_virtual_summary_backs_off_after_read_timeout_before_retry():
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-key-not-real"
+    service.summary_model = "test-fast-summary-model"
+    calls = []
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{
+                "text": json.dumps({"clinical_summary": "Problem: Headache."})
+            }]}}]}
+
+    def post(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("temporary provider delay")
+        return Response()
+
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post), \
+         patch.object(gemini_live_module.time, "sleep") as sleep:
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "Headache for two days"}],
+            patient_context={}, appointment={"id": "appointment"},
+            interview_complete=False,
+        )
+
+    assert len(calls) == 2
+    sleep.assert_called_once_with(5.0)
+    assert result["clinical_summary"] == "Problem: Headache."
+
+
+def test_virtual_summary_does_not_retry_after_daily_quota_exhaustion():
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-key-not-real"
+    service.summary_model = "test-fast-summary-model"
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        response = httpx.Response(
+            429,
+            request=httpx.Request("POST", url),
+            json={"error": {
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "53925s",
+                }],
+            }},
+        )
+        response.raise_for_status()
+        return response
+
+    fallback_json = json.dumps({
+        "clinical_summary": "Problem: Headache.",
+        "chief_complaint": "Headache",
+    })
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post), \
+         patch("app.services.ai_service.ai_provider.summarize_consultation", return_value=fallback_json) as fallback:
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "Headache for three days"}],
+            patient_context={}, appointment={"id": "appointment"},
+            interview_complete=False,
+        )
+
+    assert len(calls) == 1
+    fallback.assert_called_once()
+    assert result["summary_generation_provider"] == "cloudflare"
+    assert result["review_required"] is True
 
 
 def test_summary_model_is_configurable_without_changing_live_model(monkeypatch):
