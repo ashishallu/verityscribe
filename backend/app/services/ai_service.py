@@ -839,6 +839,134 @@ class AIProvider:
         timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
         return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=260)
 
+    def answer_doctor_assistant(self, prompt: str) -> str:
+        """Generate doctor-assistant text with Gemini, without provider fallback.
+
+        This endpoint is separate from both patient chat and Gemini Live. A
+        temporary primary-model overloads are retried, then use a Gemini-only
+        backup model; no Cloudflare or mock response is used on this endpoint.
+        """
+        config = settings()
+        api_key = config.google_api_key.strip()
+        model = config.gemini_chat_model.strip()
+        # Keep a Gemini-only resilience path for the Doctor text assistant.
+        # The configured primary may be temporarily overloaded; this model was
+        # verified with the same local credential and a synthetic prompt.
+        fallback_model = "gemini-3.5-flash-lite"
+        if not api_key:
+            raise RuntimeError("Gemini doctor assistant is not configured")
+        if not model:
+            raise RuntimeError("Gemini doctor assistant model is not configured")
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(
+                    timeout=25000,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Gemini doctor assistant client initialization failed ({type(exc).__name__})"
+            ) from exc
+
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={"temperature": 0.2, "max_output_tokens": 700},
+                )
+                answer = getattr(response, "text", None)
+                if not isinstance(answer, str) or not answer.strip():
+                    raise RuntimeError("Gemini doctor assistant returned an empty response")
+                logger.info(
+                    "doctor_assistant_generation model=%s attempt=%d text_chars=%d",
+                    model,
+                    attempt + 1,
+                    len(answer),
+                )
+                return answer.strip()
+            except Exception as exc:
+                response_obj = getattr(exc, "response", None)
+                status = (
+                    getattr(exc, "code", None)
+                    or getattr(exc, "status_code", None)
+                    or getattr(response_obj, "status_code", None)
+                )
+                try:
+                    status = int(status)
+                except (TypeError, ValueError):
+                    status = None
+                if status not in {429, 503, 504}:
+                    raise RuntimeError(
+                        f"Gemini doctor assistant request failed ({type(exc).__name__})"
+                    ) from exc
+                if attempt == 2:
+                    if model == fallback_model:
+                        raise RuntimeError(
+                            f"Gemini doctor assistant is temporarily unavailable (HTTP {status})"
+                        ) from exc
+                    logger.warning(
+                        "doctor_assistant_model_fallback primary_model=%s fallback_model=%s status=%s",
+                        model,
+                        fallback_model,
+                        status,
+                    )
+                    try:
+                        fallback_response = client.models.generate_content(
+                            model=fallback_model,
+                            contents=prompt,
+                            config={"temperature": 0.2, "max_output_tokens": 700},
+                        )
+                    except Exception as fallback_exc:
+                        fallback_response_obj = getattr(fallback_exc, "response", None)
+                        fallback_status = (
+                            getattr(fallback_exc, "code", None)
+                            or getattr(fallback_exc, "status_code", None)
+                            or getattr(fallback_response_obj, "status_code", None)
+                        )
+                        try:
+                            fallback_status = int(fallback_status)
+                        except (TypeError, ValueError):
+                            fallback_status = None
+                        raise RuntimeError(
+                            "Gemini doctor assistant is temporarily unavailable "
+                            f"(primary HTTP {status}; fallback HTTP {fallback_status or 'error'})"
+                        ) from fallback_exc
+                    fallback_answer = getattr(fallback_response, "text", None)
+                    if not isinstance(fallback_answer, str) or not fallback_answer.strip():
+                        raise RuntimeError(
+                            "Gemini doctor assistant fallback returned an empty response"
+                        )
+                    logger.info(
+                        "doctor_assistant_generation model=%s fallback_for=%s text_chars=%d",
+                        fallback_model,
+                        model,
+                        len(fallback_answer),
+                    )
+                    return fallback_answer.strip()
+
+                headers = getattr(response_obj, "headers", {}) or {}
+                retry_after = headers.get("Retry-After") or headers.get("retry-after")
+                try:
+                    delay = min(12.0, max(0.0, float(retry_after))) if retry_after else None
+                except (TypeError, ValueError):
+                    delay = None
+                if delay is None:
+                    delay = min(4.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+                logger.warning(
+                    "doctor_assistant_retry model=%s attempt=%d status=%s delay_seconds=%.2f",
+                    model,
+                    attempt + 1,
+                    status,
+                    delay,
+                )
+                time.sleep(delay)
+
     def answer_consultation(
         self, prompt: str, *, intake_reply: bool = False, chat_summary: bool = False,
     ) -> str:
