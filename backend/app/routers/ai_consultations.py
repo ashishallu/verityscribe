@@ -520,6 +520,103 @@ def _response(client, session: dict[str, Any], *, include_similar_cases: bool = 
     }
 
 
+def _create_live_credential(client, patient: dict[str, Any], session: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Mint one constrained Gemini Live credential; the permanent API key stays server-side."""
+    if session.get("mode") != "ai_virtual" or not session.get("voice_consent_at"):
+        raise HTTPException(status_code=403, detail="Voice processing was not authorized for this session")
+    if session.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail="This consultation is not accepting voice")
+    appointment = _maybe_single_data(
+        client.table("appointments").select("id,appointment_date,appointment_time")
+        .eq("id", session["appointment_id"]).eq("patient_id", patient["id"])
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    ensure_appointment_not_expired(appointment)
+    if not gemini_live.initialize_client() or gemini_live.summary_client is None:
+        raise HTTPException(status_code=503, detail="Gemini Live is not configured")
+
+    started = time.perf_counter()
+    try:
+        types = gemini_live.types
+        context = patient_context(client, patient["id"])
+        context_text = json.dumps(context, ensure_ascii=False, default=str)[:12000]
+        instructions = (
+            "You are Verity, a transparent, warm, concise AI health-intake assistant preparing a draft for the patient's "
+            "human clinician. Speak naturally and professionally; do not use generic or repetitive disclaimers, and never "
+            "claim to be a human or licensed clinician. If asked whether you are human or a doctor, answer truthfully in one short sentence. "
+            "Conduct a natural, adaptive intake rather than following a fixed question list. Start with a brief greeting and ask what is bothering the patient. "
+            "Then ask one focused follow-up at a time based on their answer: clarify location and side, onset and duration, severity, frequency, "
+            "what worsens or relieves it, associated symptoms, and relevant prior conditions or surgery, medicines, and allergies when appropriate. "
+            "Do not ask questions already answered; acknowledge the answer and choose the next clinically relevant gap. Ask exactly one focused question per turn; never stack questions. "
+            "A few focused follow-ups are usually enough; do not force a question count. Once the relevant intake questions have been answered, thank "
+            "the patient, say the intake is ready for clinician review, and stop asking questions. Do not diagnose or prescribe. "
+            "Support English, Telugu, Hindi and code-switching; preserve the patient's language and ask for clarification rather than guessing "
+            "unclear medical words, sides, numbers, medicines or procedures. Only the patient or verified record can establish patient facts. "
+            "Never imply AI guidance was doctor-approved. If emergency symptoms are reported, direct the patient to urgent local care. "
+            "Verified record context follows: " + context_text
+        )
+        live_config = types.LiveConnectConfig(
+            response_modalities=[types.Modality.AUDIO],
+            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=gemini_live.voice),
+            )),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=40,
+                    silence_duration_ms=500,
+                ),
+            ),
+            system_instruction=types.Content(parts=[types.Part(text=instructions)]),
+        )
+        now = datetime.now(timezone.utc)
+        token = gemini_live.summary_client.auth_tokens.create(config=types.CreateAuthTokenConfig(
+            http_options=types.HttpOptions(api_version="v1alpha", timeout=30_000),
+            uses=1,
+            new_session_expire_time=now + timedelta(minutes=2),
+            expire_time=now + timedelta(minutes=30),
+            live_connect_constraints=types.LiveConnectConstraints(
+                model=gemini_live.model,
+                config=live_config,
+            ),
+        ))
+        serialized_config = _safe_live_client_config(live_config)
+    except Exception as exc:
+        provider_status, safe_detail = _safe_live_credential_error(exc)
+        logger.exception(
+            "AI Virtual ephemeral credential creation failed error_type=%s provider_status=%s",
+            type(exc).__name__, provider_status or "unknown",
+        )
+        raise HTTPException(status_code=503, detail=safe_detail) from exc
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    logger.info("AI Virtual direct credential issued model=%s mint_elapsed_ms=%d", gemini_live.model, elapsed_ms)
+    token_expire_time = getattr(token, "expire_time", None)
+    return ({
+        "credential": token.name,
+        "model": gemini_live.model,
+        "config": serialized_config,
+        "expires_at": (
+            token_expire_time.isoformat()
+            if hasattr(token_expire_time, "isoformat")
+            else str(token_expire_time or (now + timedelta(minutes=30)).isoformat())
+        ),
+    }, elapsed_ms)
+
+
+def _start_response(client, patient: dict[str, Any], session: dict[str, Any]):
+    data = _response(client, session)
+    if session.get("mode") == "ai_virtual" and session.get("voice_consent_at"):
+        credential, mint_ms = _create_live_credential(client, patient, session)
+        data["live_credential"] = credential
+        data["timings"] = {"credential_mint_ms": mint_ms}
+    return {"data": data}
+
+
 @router.post("/appointments/{appointment_id}/start")
 def start_consultation(appointment_id: str, payload: StartRequest, claims: dict = Depends(current_claims)):
     if claims.get("app_metadata", {}).get("role") != "patient":
@@ -547,7 +644,7 @@ def start_consultation(appointment_id: str, payload: StartRequest, claims: dict 
     if existing:
         if existing["status"] in {"approved", "rejected"}:
             raise HTTPException(status_code=409, detail="This consultation has already been reviewed")
-        return {"data": _response(client, existing)}
+        return _start_response(client, patient, existing)
     now = datetime.now(timezone.utc).isoformat()
     try:
         session = client.table("ai_consultation_sessions").insert({
@@ -567,7 +664,7 @@ def start_consultation(appointment_id: str, payload: StartRequest, claims: dict 
     greeting = "Hello, I’m Verity, an AI intake assistant. I’ll ask a few questions to help prepare a draft for your doctor to review. What would you like help with today?"
     if mode == "ai_chat" and not _messages(client, session["id"]):
         client.table("ai_consultation_messages").insert({"session_id": session["id"], "role": "assistant", "content": greeting}).execute()
-    return {"data": _response(client, session)}
+    return _start_response(client, patient, session)
 
 
 @router.get("/{session_id}")

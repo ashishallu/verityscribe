@@ -14,6 +14,17 @@ def test_gemini_live_stays_unconfigured_without_backend_key():
     assert not service.configured
 
 
+def test_summary_timeout_defaults_are_bounded_and_environment_overridable(monkeypatch):
+    monkeypatch.delenv("AI_SUMMARY_TIMEOUT_SECONDS", raising=False)
+    config = Settings(_env_file=None)
+    assert config.gemini_summary_primary_timeout_seconds == 8.0
+    assert config.gemini_summary_fallback_timeout_seconds == 8.0
+    assert config.ai_summary_timeout_seconds == 12.0
+
+    monkeypatch.setenv("AI_SUMMARY_TIMEOUT_SECONDS", "10")
+    assert Settings(_env_file=None).ai_summary_timeout_seconds == 10.0
+
+
 def test_live_model_defaults_to_documented_target_and_keeps_rollback(monkeypatch):
     monkeypatch.delenv("GEMINI_LIVE_MODEL", raising=False)
     assert Settings(_env_file=None).gemini_live_model == "gemini-3.8-live"
@@ -347,6 +358,45 @@ def test_virtual_summary_uses_gemini_flash_lite_after_primary_503():
     assert calls[1][0].endswith("/models/gemini-3.5-flash-lite:generateContent")
     assert calls[1][1]["json"]["contents"] == calls[0][1]["json"]["contents"]
     assert calls[1][1]["json"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "MINIMAL"
+    assert result["summary_generation_provider"] == "gemini_fallback"
+
+
+def test_virtual_summary_skips_primary_in_recent_429_cooldown(monkeypatch):
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-cooldown-key"
+    service.summary_model = "gemini-3.8-flash"
+    service.summary_fallback_model = "gemini-3.5-flash-lite"
+    from app.services import ai_service
+    cooldown_key = ai_service._gemini_quota_key(service.google_api_key, service.summary_model)
+    monkeypatch.setitem(
+        ai_service._GEMINI_QUOTA_COOLDOWNS,
+        cooldown_key,
+        ai_service.time.monotonic() + 60,
+    )
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        if "gemini-3.8-flash" in url:
+            raise AssertionError("A Gemini model in cooldown must not be called")
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"candidates": [{"content": {"parts": [{
+                "text": json.dumps({"clinical_summary": "Problem: Fever."})
+            }]}}]},
+        )
+
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post):
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "I have a fever."}],
+            patient_context={}, appointment={"id": "synthetic-appointment"},
+            interview_complete=True,
+        )
+
+    assert len(calls) == 1
+    assert calls[0].endswith("/models/gemini-3.5-flash-lite:generateContent")
     assert result["summary_generation_provider"] == "gemini_fallback"
     assert result["review_required"] is True
     assert result["draft_prescription"] is None

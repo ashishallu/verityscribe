@@ -46,8 +46,12 @@ class Settings(BaseSettings):
     gemini_live_silence_duration_ms: int = 600
     gemini_summary_model: str = "gemini-3.8-flash"
     gemini_summary_fallback_model: str = "gemini-3.5-flash-lite"
-    gemini_summary_primary_timeout_seconds: float = 15.0
-    gemini_summary_fallback_timeout_seconds: float = 20.0
+    gemini_summary_primary_timeout_seconds: float = 8.0
+    gemini_summary_fallback_timeout_seconds: float = 8.0
+    ai_summary_timeout_seconds: float = Field(
+        default=12.0,
+        validation_alias=AliasChoices("AI_SUMMARY_TIMEOUT_SECONDS"),
+    )
     cors_origins: str = DEFAULT_CORS_ORIGINS
     # Resolve backend/.env regardless of caller cwd. Pydantic Settings gives
     # process environment variables precedence over values loaded from dotenv.

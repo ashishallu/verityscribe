@@ -1399,7 +1399,7 @@ class AIProvider:
     def summarize_consultation(self, prompt: str) -> str:
         """Use the configured Cloudflare text model only if Gemini summary fails."""
         config = settings()
-        timeout = max(10.0, min(60.0, float(os.getenv("AI_SUMMARY_TIMEOUT_SECONDS", "40"))))
+        timeout = max(5.0, min(12.0, float(config.ai_summary_timeout_seconds)))
         model = config.cloudflare_summary_model.strip() or self.SUMMARY_MODEL
         return self._cloudflare_chat(
             prompt, timeout=timeout, max_tokens=900, model=model,
@@ -1448,9 +1448,27 @@ class AIProvider:
             with urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            # Status is useful for quota/permission diagnosis; never log or
-            # propagate the provider response body, which could contain data.
-            raise RuntimeError(f"Cloudflare Workers AI request failed (HTTP {exc.code})") from exc
+            # Keep only the provider's short error message for diagnostics.
+            # Never log request payloads, transcript text, or credentials.
+            try:
+                error_body = json.loads(exc.read().decode("utf-8"))
+                errors = error_body.get("errors", []) if isinstance(error_body, dict) else []
+                provider_message = "; ".join(
+                    str(item.get("message", "")) for item in errors
+                    if isinstance(item, dict) and item.get("message")
+                )
+            except Exception:
+                provider_message = ""
+            provider_message = " ".join(provider_message.split())[:300]
+            provider_message = re.sub(r"(?i)Bearer\s+\S+", "Bearer [REDACTED]", provider_message)
+            provider_message = re.sub(r"(?i)AIza[\w-]{20,}", "[REDACTED]", provider_message)
+            logger.warning(
+                "Cloudflare Workers AI request failed model=%s status=%s provider_message=%s",
+                selected_model, exc.code, provider_message or "unavailable",
+            )
+            raise RuntimeError(
+                f"Cloudflare Workers AI request failed (HTTP {exc.code}: {provider_message or 'provider error'})"
+            ) from exc
         except Exception as exc:
             raise RuntimeError(f"Cloudflare Workers AI request failed ({type(exc).__name__})") from exc
 

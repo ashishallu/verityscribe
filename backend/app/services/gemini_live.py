@@ -334,9 +334,22 @@ class GeminiLiveService:
         # Gemini is the preferred text summarizer. If its endpoint times out
         # or returns unusable output, the existing Cloudflare Workers AI text
         # service is a secondary summary provider; Live voice remains Gemini.
+        from .ai_service import (
+            _gemini_error_info,
+            _gemini_quota_cooldown_remaining,
+            _record_gemini_quota_cooldown,
+        )
+
         response_data = None
         gemini_error: Exception | None = None
-        for attempt in range(2):
+        primary_cooldown = _gemini_quota_cooldown_remaining(self.google_api_key, summary_model)
+        if primary_cooldown > 0:
+            logger.info(
+                "AI Virtual summary Gemini primary skipped model=%s reason=recent_429 cooldown_remaining_seconds=%.1f",
+                summary_model, primary_cooldown,
+            )
+            gemini_error = RuntimeError("Gemini summary model is in its recent-429 cooldown")
+        for attempt in range(0 if primary_cooldown > 0 else 2):
             started = time.perf_counter()
             try:
                 # google-genai 1.36 (the project's pinned SDK) does not expose
@@ -359,8 +372,8 @@ class GeminiLiveService:
                         },
                     },
                     timeout=httpx.Timeout(
-                        max(5.0, min(30.0, float(getattr(self, "summary_primary_timeout_seconds", 15.0)))),
-                        connect=10.0,
+                        max(5.0, min(8.0, float(getattr(self, "summary_primary_timeout_seconds", 8.0)))),
+                        connect=3.0,
                     ),
                 )
                 response.raise_for_status()
@@ -393,15 +406,18 @@ class GeminiLiveService:
                     except (AttributeError, ValueError):
                         pass
                 logger.warning(
-                    "AI Virtual clinical summary request failed model=%s status=%s provider_status=%s attempt=%d elapsed_ms=%d error_type=%s",
+                    "AI Virtual clinical summary request failed model=%s status=%s provider_status=%s attempt=%d elapsed_ms=%d error_type=%s provider_message=%s",
                     summary_model, status_code, provider_status, attempt + 1,
                     round((time.perf_counter() - started) * 1000), type(exc).__name__,
+                    _gemini_error_info(exc, self.google_api_key)[1],
                 )
                 retryable = (
                     status_code in {429, 500, 502, 503, 504}
                     or isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
                 )
                 gemini_error = exc
+                if status_code == 429:
+                    _record_gemini_quota_cooldown(self.google_api_key, summary_model)
                 if attempt == 0 and retryable:
                     # A non-streaming GenerateContent response can take a while
                     # to produce its first byte during provider load. Retrying
@@ -489,15 +505,17 @@ class GeminiLiveService:
             or getattr(gemini_error, "code", None)
             or getattr(gemini_error, "status_code", None)
         )
-        summary_error_retryable = (
-            summary_error_status in {429, 500, 502, 503, 504}
+        summary_error_retryable = primary_cooldown > 0 or (
+            summary_error_status in {400, 404, 429, 500, 502, 503, 504}
             or isinstance(gemini_error, (httpx.TimeoutException, httpx.TransportError))
         )
+        fallback_cooldown = _gemini_quota_cooldown_remaining(self.google_api_key, fallback_model)
         if (
             parsed is None
             and summary_error_retryable
             and fallback_model
             and fallback_model != summary_model
+            and fallback_cooldown <= 0
         ):
             fallback_started = time.perf_counter()
             try:
@@ -514,8 +532,8 @@ class GeminiLiveService:
                         },
                     },
                     timeout=httpx.Timeout(
-                        max(5.0, min(30.0, float(getattr(self, "summary_fallback_timeout_seconds", 20.0)))),
-                        connect=10.0,
+                        max(5.0, min(8.0, float(getattr(self, "summary_fallback_timeout_seconds", 8.0)))),
+                        connect=3.0,
                     ),
                 )
                 fallback_response.raise_for_status()
@@ -544,14 +562,26 @@ class GeminiLiveService:
                     or getattr(fallback_error, "status_code", None)
                 )
                 logger.warning(
-                    "AI Virtual Gemini summary fallback failed model=%s status=%s error_type=%s",
+                    "AI Virtual Gemini summary fallback failed model=%s status=%s error_type=%s provider_message=%s",
                     fallback_model, fallback_status or "unknown", type(fallback_error).__name__,
+                    _gemini_error_info(fallback_error, self.google_api_key)[1],
                 )
+                if fallback_status == 429:
+                    _record_gemini_quota_cooldown(self.google_api_key, fallback_model)
+
+        elif parsed is None and fallback_cooldown > 0:
+            logger.info(
+                "AI Virtual summary Gemini fallback skipped model=%s reason=recent_429 cooldown_remaining_seconds=%.1f",
+                fallback_model, fallback_cooldown,
+            )
 
         if parsed is None:
+            primary_status, primary_message, _ = _gemini_error_info(
+                gemini_error or RuntimeError("empty response"), self.google_api_key
+            )
             logger.warning(
-                "AI Virtual summary switching provider primary=gemini secondary=cloudflare error_type=%s",
-                type(gemini_error).__name__ if gemini_error else "empty_response",
+                "AI Virtual summary switching provider primary=gemini secondary=cloudflare status=%s provider_message=%s",
+                primary_status or "none", primary_message,
             )
             try:
                 from .ai_service import ai_provider
@@ -565,8 +595,9 @@ class GeminiLiveService:
                 )
             except Exception as fallback_error:
                 logger.warning(
-                    "AI Virtual secondary summary provider failed provider=cloudflare error_type=%s",
-                    type(fallback_error).__name__,
+                    "AI Virtual secondary summary provider failed provider=cloudflare model=%s error_type=%s error=%s",
+                    os.getenv("CLOUDFLARE_SUMMARY_MODEL", ai_provider.SUMMARY_MODEL),
+                    type(fallback_error).__name__, str(fallback_error)[:400],
                 )
                 raise RuntimeError(
                     "Gemini and Cloudflare could not generate a structured consultation summary"

@@ -290,12 +290,21 @@ def test_ai_consultation_modes_remain_startable_before_expiry(monkeypatch, mode)
 
     monkeypatch.setattr(ai_consultations, "get_current_patient", lambda _claims: {"id": "patient-1"})
     monkeypatch.setattr(ai_consultations, "db", lambda: Client())
+    if mode == "ai_virtual":
+        monkeypatch.setattr(
+            ai_consultations,
+            "_create_live_credential",
+            lambda *_args: ({"credential": "ephemeral-test", "model": "test-live", "config": {}}, 17),
+        )
     response = ai_consultations.start_consultation(
         "appointment-1",
         ai_consultations.StartRequest(consent=True, voice_consent=mode == "ai_virtual"),
         claims={"sub": "patient-1", "app_metadata": {"role": "patient"}},
     )
     assert response["data"]["session"]["mode"] == mode
+    if mode == "ai_virtual":
+        assert response["data"]["live_credential"]["credential"] == "ephemeral-test"
+        assert response["data"]["timings"]["credential_mint_ms"] == 17
 
 
 def test_hangup_before_first_transcript_saves_incomplete_review_draft(monkeypatch):
