@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -89,7 +90,8 @@ import java.util.UUID
 private data class IntakeChatBubble(
     val id: String,
     val isUser: Boolean,
-    val text: String
+    val text: String,
+    val requestKey: String? = null
 )
 
 private enum class AiChatPhase {
@@ -122,6 +124,7 @@ fun AppointmentAiChatScreen(
     var hasExplicitConsent by remember { mutableStateOf(false) }
     var isStartingSession by remember { mutableStateOf(false) }
     var sessionCanAcceptMessages by remember { mutableStateOf(false) }
+    var messageError by remember { mutableStateOf<String?>(null) }
 
     val userTurnCount = messages.count { it.isUser }
 
@@ -142,25 +145,34 @@ fun AppointmentAiChatScreen(
     fun sendMessage(rawText: String) {
         val trimmed = rawText.trim()
         if (trimmed.isEmpty() || isAiTyping || !hasExplicitConsent || !sessionCanAcceptMessages) return
-        messages.add(
-            IntakeChatBubble(
-                id = "u_${UUID.randomUUID()}",
-                isUser = true,
-                text = trimmed
+        val retry = pendingRequest?.takeIf { it.first == trimmed }
+        val requestKey = retry?.second ?: UUID.randomUUID().toString()
+        if (retry == null) {
+            messages.add(
+                IntakeChatBubble(
+                    id = "u_${UUID.randomUUID()}",
+                    isUser = true,
+                    text = trimmed,
+                    requestKey = requestKey
+                )
             )
-        )
+        }
         draft = ""
+        messageError = null
         isAiTyping = true
 
-        val requestKey = pendingRequest?.takeIf { it.first == trimmed }?.second ?: UUID.randomUUID().toString()
         pendingRequest = trimmed to requestKey
         onSendMessage(trimmed, requestKey) { reply, error ->
-            if (reply != null) pendingRequest = null
-            messages.add(IntakeChatBubble(
-                id = "a_${UUID.randomUUID()}",
-                isUser = false,
-                text = reply ?: error ?: "The AI reply is temporarily unavailable. Please try again shortly."
-            ))
+            if (reply != null) {
+                pendingRequest = null
+                messages.add(IntakeChatBubble(
+                    id = "a_${UUID.randomUUID()}",
+                    isUser = false,
+                    text = reply
+                ))
+            } else {
+                messageError = error ?: "The AI reply is temporarily unavailable. Retry your message."
+            }
             isAiTyping = false
         }
     }
@@ -279,7 +291,7 @@ fun AppointmentAiChatScreen(
                                         CircleShape
                                     )
                                     .border(1.dp, Color(0x66FFFFFF), CircleShape)
-                                    .clickable(enabled = !isFinalizing && !isAiTyping && sessionCanAcceptMessages) {
+                                    .clickable(enabled = !isFinalizing && sessionCanAcceptMessages) {
                                         isFinalizing = true
                                         onEndConsultation { summaryText, error ->
                                             finalSummary = summaryText
@@ -292,12 +304,24 @@ fun AppointmentAiChatScreen(
                                     .testTag("appt_ai_chat_end_conversation"),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text(
-                                    text = "End Conversation",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = PlatinumWhite
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                                ) {
+                                    if (isFinalizing) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(14.dp),
+                                            color = PlatinumWhite,
+                                            strokeWidth = 2.dp
+                                        )
+                                    }
+                                    Text(
+                                        text = if (isFinalizing) "Ending…" else "End Conversation",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = PlatinumWhite
+                                    )
+                                }
                             }
                         }
                     }
@@ -323,6 +347,27 @@ fun AppointmentAiChatScreen(
                                         style = MaterialTheme.typography.bodySmall,
                                         modifier = Modifier.padding(horizontal = 18.dp, vertical = 6.dp)
                                     )
+                                }
+                                messageError?.let { message ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 18.dp, vertical = 2.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = message,
+                                            color = Color(0xFFFFC078),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (pendingRequest != null) {
+                                            TextButton(
+                                                onClick = { pendingRequest?.first?.let(::sendMessage) },
+                                                enabled = !isAiTyping
+                                            ) { Text("Retry") }
+                                        }
+                                    }
                                 }
                                 LazyColumn(
                                     state = listState,
@@ -596,8 +641,20 @@ fun AppointmentAiChatScreen(
                                 sessionCanAcceptMessages = snapshot.status == "in_progress"
                                 messages.clear()
                                 messages.addAll(snapshot.messages.filter { it.content.isNotBlank() }.map {
-                                    IntakeChatBubble(it.id, it.role == "patient", it.content)
+                                    IntakeChatBubble(it.id, it.role == "patient", it.content, it.requestKey)
                                 })
+                                val completedRequestKeys = snapshot.messages
+                                    .filter { it.role == "assistant" }
+                                    .mapNotNull { it.requestKey }
+                                    .toSet()
+                                val retryablePatientTurn = snapshot.messages.lastOrNull {
+                                    it.role == "patient" &&
+                                        !it.requestKey.isNullOrBlank() &&
+                                        it.requestKey !in completedRequestKeys
+                                }
+                                pendingRequest = retryablePatientTurn?.let {
+                                    it.content to requireNotNull(it.requestKey)
+                                }
                                 finalSummary = snapshot.summary
                                 if (!snapshot.summary.isNullOrBlank()) phase = AiChatPhase.SUMMARY
                                 if (!sessionCanAcceptMessages && snapshot.summary.isNullOrBlank()) {

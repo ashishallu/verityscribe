@@ -132,12 +132,6 @@ fun AppointmentAiVirtualScreen(
         )
     }
     var voiceConsentAccepted by remember { mutableStateOf(false) }
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasMicPermission = granted
-    }
-
     var phase by remember { mutableStateOf(VirtualCallPhase.ACTIVE_CALL) }
     var isMuted by remember { mutableStateOf(false) }
     var isSpeakerOn by remember { mutableStateOf(true) }
@@ -148,11 +142,25 @@ fun AppointmentAiVirtualScreen(
     var connectionError by remember { mutableStateOf<String?>(null) }
     var generatedSummary by remember { mutableStateOf<String?>(null) }
     var isFinalizing by remember { mutableStateOf(false) }
+    var isStartingSession by remember { mutableStateOf(false) }
     var elapsedSeconds by remember { mutableIntStateOf(0) }
     var connectionAttempt by remember { mutableIntStateOf(0) }
     var sharedWithDoctor by remember { mutableStateOf(false) }
     var consultationSessionId by remember { mutableStateOf<String?>(null) }
     var liveClient by remember { mutableStateOf<GeminiLiveVoiceClient?>(null) }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasMicPermission = granted
+        if (granted) {
+            connectionError = null
+            connectionStatus = "Microphone permission granted · connecting"
+        } else {
+            connectionStatus = "Microphone permission required"
+            connectionError = "Microphone permission is required to start AI Virtual. Allow it and retry."
+        }
+    }
 
     val voiceTranscript = remember(appointment.id) { mutableStateListOf<String>() }
     var currentCaption by remember { mutableStateOf("Connecting securely to Gemini Live…") }
@@ -171,7 +179,8 @@ fun AppointmentAiVirtualScreen(
     }
 
     LaunchedEffect(appointment.id, hasMicPermission, phase, voiceConsentAccepted, connectionAttempt) {
-        if (!voiceConsentAccepted || !hasMicPermission || phase != VirtualCallPhase.ACTIVE_CALL || liveClient != null) return@LaunchedEffect
+        if (!voiceConsentAccepted || !hasMicPermission || phase != VirtualCallPhase.ACTIVE_CALL || liveClient != null || isStartingSession) return@LaunchedEffect
+        isStartingSession = true
         connectionStatus = "Connecting securely to Gemini Live…"
         connectionError = null
         try {
@@ -230,6 +239,8 @@ fun AppointmentAiVirtualScreen(
             connectionError = error.localizedMessage?.takeIf(String::isNotBlank)
                 ?: "Could not connect to Gemini Live. Check the connection and retry."
             connectionStatus = "Connection unavailable"
+        } finally {
+            isStartingSession = false
         }
     }
 
@@ -526,7 +537,12 @@ fun AppointmentAiVirtualScreen(
                                             liveClient?.close()
                                             liveClient = null
                                             connectionError = null
-                                            connectionAttempt += 1
+                                            if (!hasMicPermission) {
+                                                connectionStatus = "Requesting microphone permission…"
+                                                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                            } else {
+                                                connectionAttempt += 1
+                                            }
                                         },
                                         modifier = Modifier.align(Alignment.CenterHorizontally).testTag("virtual_call_retry_connection")
                                     ) { Text("Retry Gemini Live connection") }

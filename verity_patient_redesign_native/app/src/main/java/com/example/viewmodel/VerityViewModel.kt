@@ -648,10 +648,10 @@ class VerityViewModel(application: Application) : AndroidViewModel(application) 
                 val recovered = runCatching { readAiConsultationSnapshot(sessionId) }.getOrNull()
                 val messages = recovered?.messages.orEmpty()
                 val patientIndex = messages.indexOfLast {
-                    it.role == "patient" && (it.requestKey == requestKey || it.content == message)
+                    it.role == "patient" && it.requestKey == requestKey && it.content == message
                 }
                 val recoveredReply = messages.drop(patientIndex + 1)
-                    .firstOrNull { it.role == "assistant" }?.content
+                    .firstOrNull { it.role == "assistant" && it.requestKey == requestKey }?.content
                 if (patientIndex >= 0 && !recoveredReply.isNullOrBlank()) onResult(recoveredReply, null)
                 else onResult(null, sendError.localizedMessage ?: "AI consultation is unavailable.")
             }
@@ -731,21 +731,26 @@ class VerityViewModel(application: Application) : AndroidViewModel(application) 
 
     suspend fun startAppointmentAiVirtual(appointment: Appointment, explicitConsent: Boolean, explicitVoiceConsent: Boolean): DirectGeminiSession {
         require(explicitConsent && explicitVoiceConsent) { "Explicit AI Virtual and microphone consent is required." }
+        // Persist the consultation ID immediately after /start succeeds, before
+        // requesting an ephemeral credential. A token failure/retry can then
+        // reuse the same session instead of accidentally starting another one.
         val sessionId = aiConsultationSessions[appointment.id]
             ?: preferences.aiConsultationSession(appointment.id)
-        if (sessionId != null) {
-            aiConsultationSessions[appointment.id] = sessionId
-            val credential = backend.issueLiveCredential(sessionId)
-            val token = credential.optString("credential")
-            val model = credential.optString("model")
-            val config = credential.optJSONObject("config")
-            if (token.isBlank() || model.isBlank() || config == null) throw IOException("Gemini Live setup was incomplete.")
-            return DirectGeminiSession(sessionId, token, model, config)
+            ?: backend.startAiConsultation(
+                appointment.id, "ai_virtual", consent = true, voiceConsent = true
+            ).also {
+                aiConsultationSessions[appointment.id] = it
+                preferences.saveAiConsultationSession(appointment.id, it)
+            }
+        aiConsultationSessions[appointment.id] = sessionId
+        val credential = backend.issueLiveCredential(sessionId)
+        val token = credential.optString("credential")
+        val model = credential.optString("model")
+        val config = credential.optJSONObject("config")
+        if (token.isBlank() || model.isBlank() || config == null) {
+            throw IOException("Gemini Live setup was incomplete.")
         }
-        val live = backend.startAiVirtual(appointment.id, consent = true, voiceConsent = true)
-        aiConsultationSessions[appointment.id] = live.sessionId
-        preferences.saveAiConsultationSession(appointment.id, live.sessionId)
-        return live
+        return DirectGeminiSession(sessionId, token, model, config)
     }
 
     suspend fun persistAppointmentAiVirtualTurn(sessionId: String, requestKey: String, input: String, output: String) {

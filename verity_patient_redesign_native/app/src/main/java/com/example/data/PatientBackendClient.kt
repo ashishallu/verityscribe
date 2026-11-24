@@ -398,6 +398,8 @@ class PatientBackendClient(
             "PATCH" -> builder.patch((body?.toString() ?: "{}").toRequestBody(jsonType)).build()
             else -> builder.get().build()
         }
+        val diagnosticPath = diagnosticPath(request.url.encodedPath)
+        Log.d(LOG_TAG, "$method $diagnosticPath request started")
         http.newCall(request).execute().use { response ->
             val raw = response.body?.string().orEmpty()
             val parsed = runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
@@ -405,12 +407,32 @@ class PatientBackendClient(
                 val detail = parsed.optString("detail").ifBlank {
                     parsed.optString("msg").ifBlank { parsed.optString("message") }
                 }
-                Log.w(LOG_TAG, "$method API request failed with HTTP ${response.code}")
+                Log.w(
+                    LOG_TAG,
+                    "$method $diagnosticPath failed HTTP ${response.code} " +
+                        "error=${safeDiagnostic(detail.ifBlank { raw })}"
+                )
                 throw ApiFailure(response.code, detail.ifBlank { "Service request failed (HTTP ${response.code})." })
             }
+            Log.d(LOG_TAG, "$method $diagnosticPath completed HTTP ${response.code}")
             return parsed
         }
     }
+
+    /** Keep route/action visible while masking patient/session UUIDs and all query credentials. */
+    private fun diagnosticPath(path: String): String = path.replace(
+        Regex("(?i)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),
+        "/[id]"
+    ).take(240)
+
+    private fun safeDiagnostic(detail: String): String = detail
+        .replace(Regex("(?i)(access_token=)[^&\\s\"<>]+")) { "${it.groupValues[1]}[REDACTED]" }
+        .replace(Regex("(?i)(AIza)[A-Za-z0-9_-]{20,}"), "[REDACTED_API_KEY]")
+        .replace(Regex("(?i)sb_publishable_[A-Za-z0-9_-]+"), "[REDACTED_PUBLISHABLE_KEY]")
+        .replace(Regex("(?i)auth_tokens/[A-Za-z0-9._~-]+"), "auth_tokens/[REDACTED]")
+        .replace(Regex("(?i)(Bearer\\s+)[A-Za-z0-9._~-]+")) { "${it.groupValues[1]}[REDACTED]" }
+        .replace(Regex("[\\r\\n\\t]+"), " ")
+        .take(400)
 
     private fun refreshSupabaseSession(): String? {
         val refresh = refreshToken ?: return null
