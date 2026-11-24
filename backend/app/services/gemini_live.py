@@ -608,8 +608,10 @@ class GeminiLiveService:
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=False,
-                    prefix_padding_ms=200,
-                    silence_duration_ms=max(500, min(self.silence_duration_ms, 2000)),
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=40,
+                    silence_duration_ms=500,
                 )
             ),
         )

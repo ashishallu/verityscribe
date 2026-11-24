@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+import hashlib
 import base64
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
@@ -12,10 +13,13 @@ import random
 import re
 import traceback
 import time
+import threading
+import httpx
 from time import perf_counter
 from time import sleep
 from uuid import uuid4
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from huggingface_hub import InferenceClient
@@ -25,6 +29,9 @@ from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 _ASR_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="cloudflare-asr")
+_GEMINI_QUOTA_COOLDOWN_SECONDS = 60.0
+_GEMINI_QUOTA_COOLDOWNS: dict[tuple[str, str], float] = {}
+_GEMINI_QUOTA_COOLDOWN_LOCK = threading.Lock()
 
 
 def _gemini_error_info(exc: Exception, api_key: str = "") -> tuple[int | None, str, bool]:
@@ -87,17 +94,39 @@ def _cloudflare_credentials() -> tuple[str, str]:
 
 @lru_cache(maxsize=2)
 def _gemini_consultation_client(api_key: str, timeout_ms: int):
-    """Reuse the Gemini HTTP client/connection pool for consultation text calls."""
-    from google import genai
-    from google.genai import types
+    """Reuse a Gemini REST connection pool for consultation text calls.
 
-    return genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            timeout=timeout_ms,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        ),
+    The pinned google-genai SDK predates Gemini 3's thinkingLevel field and
+    rejects it in its strict config model. The REST surface lets chat request
+    low thinking for Gemini 3 without upgrading the SDK used by Gemini Live.
+    The permanent key remains in this backend-only client's header.
+    """
+    return httpx.Client(
+        timeout=httpx.Timeout(timeout_ms / 1000.0),
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
     )
+
+
+def _gemini_quota_key(api_key: str, model: str) -> tuple[str, str]:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest(), model
+
+
+def _gemini_quota_cooldown_remaining(api_key: str, model: str) -> float:
+    key = _gemini_quota_key(api_key, model)
+    now = time.monotonic()
+    with _GEMINI_QUOTA_COOLDOWN_LOCK:
+        until = _GEMINI_QUOTA_COOLDOWNS.get(key, 0.0)
+        if until <= now:
+            _GEMINI_QUOTA_COOLDOWNS.pop(key, None)
+            return 0.0
+        return until - now
+
+
+def _record_gemini_quota_cooldown(api_key: str, model: str) -> None:
+    with _GEMINI_QUOTA_COOLDOWN_LOCK:
+        _GEMINI_QUOTA_COOLDOWNS[_gemini_quota_key(api_key, model)] = (
+            time.monotonic() + _GEMINI_QUOTA_COOLDOWN_SECONDS
+        )
 
 
 @dataclass(frozen=True)
@@ -1184,9 +1213,38 @@ class AIProvider:
         def generate(model_id: str, stage: str):
             started = perf_counter()
             try:
-                response = client.models.generate_content(
-                    model=model_id, contents=prompt, config=generation_config,
+                api_generation_config = {
+                    "temperature": generation_config["temperature"],
+                    "maxOutputTokens": generation_config["max_output_tokens"],
+                }
+                if chat_summary:
+                    api_generation_config["responseMimeType"] = "application/json"
+                if model_id.startswith("gemini-3"):
+                    # Gemini 3 models use thinkingLevel (not thinkingBudget).
+                    api_generation_config["thinkingConfig"] = {
+                        "thinkingLevel": "LOW",
+                    }
+                elif model_id.startswith("gemini-2.5-") and intake_reply:
+                    api_generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+                response = client.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{quote(model_id, safe='-._')}:generateContent",
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": api_generation_config,
+                    },
                 )
+                if not response.is_success:
+                    try:
+                        error_body = response.json().get("error", {})
+                        provider_message = str(error_body.get("message") or "Gemini request failed")
+                    except Exception:
+                        provider_message = "Gemini request failed"
+                    provider_error = RuntimeError(provider_message[:500])
+                    provider_error.code = response.status_code
+                    provider_error.response = response
+                    raise provider_error
+                payload = response.json()
             except Exception as exc:
                 status, message, transient = _gemini_error_info(exc, api_key)
                 logger.warning(
@@ -1202,15 +1260,16 @@ class AIProvider:
                     message,
                 )
                 raise GeminiUpstreamError(stage, status, message, transient) from exc
-            answer = getattr(response, "text", None)
-            candidates = getattr(response, "candidates", None) or []
-            candidate = candidates[0] if candidates else None
-            finish_reason = getattr(candidate, "finish_reason", None)
-            finish_name = (
-                getattr(finish_reason, "name", None)
-                or str(finish_reason or "unknown").rsplit(".", 1)[-1]
-            ).upper()
-            usage = getattr(response, "usage_metadata", None)
+            candidates = payload.get("candidates") or []
+            candidate = candidates[0] if candidates else {}
+            content = candidate.get("content") or {}
+            parts = content.get("parts") or []
+            answer = "".join(
+                str(part.get("text", "")) for part in parts
+                if isinstance(part, dict) and not part.get("thought")
+            )
+            finish_name = str(candidate.get("finishReason") or "unknown").rsplit(".", 1)[-1].upper()
+            usage = payload.get("usageMetadata") or {}
             if intake_reply or chat_summary:
                 logger.info(
                     "ai_chat_generation profile=%s model=%s stage=%s elapsed_ms=%d text_chars=%d finish=%s output_tokens=%s thought_tokens=%s",
@@ -1220,8 +1279,8 @@ class AIProvider:
                     round((perf_counter() - started) * 1000),
                     len(answer) if isinstance(answer, str) else 0,
                     finish_name,
-                    getattr(usage, "candidates_token_count", None),
-                    getattr(usage, "thoughts_token_count", None),
+                    usage.get("candidatesTokenCount"),
+                    usage.get("thoughtsTokenCount"),
                 )
             if finish_name == "MAX_TOKENS":
                 logger.warning(
@@ -1246,10 +1305,59 @@ class AIProvider:
                 raise RuntimeError(f"Gemini {stage} returned no complete text (finish={finish_name})")
             return answer.strip()
 
+        cooldown_remaining = _gemini_quota_cooldown_remaining(api_key, model)
+        if cooldown_remaining > 0:
+            logger.info(
+                "ai_chat_gemini_primary_skipped model=%s reason=recent_429 cooldown_remaining_seconds=%.1f",
+                model,
+                cooldown_remaining,
+            )
+            # Keep using the fast Gemini fallback while only the primary model
+            # is quota-limited. In a live probe this model answered in <1s,
+            # whereas the configured Cloudflare model took ~29s.
+            try:
+                if fallback_model and fallback_model != model:
+                    fallback_remaining = _gemini_quota_cooldown_remaining(api_key, fallback_model)
+                    if fallback_remaining <= 0:
+                        try:
+                            return generate(fallback_model, "fallback_after_primary_cooldown")
+                        except GeminiUpstreamError as fallback_error:
+                            if fallback_error.status == 429:
+                                _record_gemini_quota_cooldown(api_key, fallback_model)
+                            logger.warning(
+                                "ai_chat_gemini_fallback_after_cooldown_failed model=%s status=%s transient=%s",
+                                fallback_model,
+                                fallback_error.status if fallback_error.status is not None else "none",
+                                fallback_error.transient,
+                            )
+                    else:
+                        logger.info(
+                            "ai_chat_gemini_fallback_skipped model=%s reason=recent_429 cooldown_remaining_seconds=%.1f",
+                            fallback_model,
+                            fallback_remaining,
+                        )
+                return self._cloudflare_chat(
+                    prompt,
+                    timeout=max(8.0, min(15.0 if intake_reply else 35.0, float(config.ai_chat_timeout_seconds))),
+                    max_tokens=1000 if chat_summary else 512,
+                    disable_reasoning=True,
+                )
+            except Exception as cloudflare_exc:
+                logger.warning(
+                    "ai_chat_cloudflare_after_quota_cooldown_failed error_type=%s",
+                    type(cloudflare_exc).__name__,
+                )
+                raise RuntimeError(
+                    "Gemini text chat is quota-limited and the Cloudflare fallback failed "
+                    f"({type(cloudflare_exc).__name__})"
+                ) from cloudflare_exc
+
         try:
             return generate(model, "primary")
         except GeminiUpstreamError as primary_error:
             _, _, transient = _gemini_error_info(primary_error, api_key)
+            if primary_error.status == 429:
+                _record_gemini_quota_cooldown(api_key, model)
             if not transient or model == fallback_model:
                 raise
             # Fail over immediately; don't spend another full request and
@@ -1264,10 +1372,11 @@ class AIProvider:
             try:
                 return generate(fallback_model, "fallback")
             except GeminiUpstreamError as fallback_error:
-                if not _gemini_error_info(fallback_error, api_key)[2]:
-                    raise
+                if fallback_error.status == 429:
+                    _record_gemini_quota_cooldown(api_key, fallback_model)
                 # Cloudflare remains a last-resort text provider only after both
-                # configured Gemini text models report transient unavailability.
+                # configured Gemini text models fail. This also covers a stale
+                # Render fallback-model override without breaking patient chat.
                 try:
                     return self._cloudflare_chat(
                         prompt,

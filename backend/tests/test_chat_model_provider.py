@@ -2,21 +2,85 @@ import json
 import unittest
 from unittest.mock import patch
 
-from app.services.ai_service import AIProvider, _gemini_consultation_client
+from app.services.ai_service import (
+    AIProvider,
+    _GEMINI_QUOTA_COOLDOWN_LOCK,
+    _GEMINI_QUOTA_COOLDOWNS,
+    _gemini_consultation_client,
+)
+
+
+class _FakeGeminiResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.is_success = status_code < 400
+
+    def json(self):
+        return self._payload
+
+
+class _GeminiRestAdapter:
+    """Adapt existing mocked generate_content responses to the backend REST call."""
+
+    def __init__(self, generate_content):
+        self.generate_content = generate_content
+        self.post = unittest.mock.Mock(side_effect=self._post)
+
+    def _post(self, url, *, json):
+        model = url.split("/models/", 1)[1].split(":", 1)[0]
+        api_config = json["generationConfig"]
+        config = {
+            "temperature": api_config["temperature"],
+            "max_output_tokens": api_config["maxOutputTokens"],
+        }
+        if "responseMimeType" in api_config:
+            config["response_mime_type"] = api_config["responseMimeType"]
+        if "thinkingConfig" in api_config:
+            config["thinking_config"] = api_config["thinkingConfig"]
+        try:
+            response = self.generate_content(
+                model=model,
+                contents=json["contents"][0]["parts"][0]["text"],
+                config=config,
+            )
+        except Exception as error:
+            status = getattr(error, "code", 503)
+            return _FakeGeminiResponse({"error": {"message": str(error)}}, status)
+
+        finish = getattr(getattr(response, "candidates", [None])[0], "finish_reason", None)
+        finish = getattr(finish, "name", None) or str(finish or "STOP")
+        usage = getattr(response, "usage_metadata", None)
+        metadata = {}
+        if usage is not None:
+            metadata = {
+                "candidatesTokenCount": getattr(usage, "candidates_token_count", None),
+                "thoughtsTokenCount": getattr(usage, "thoughts_token_count", None),
+            }
+        return _FakeGeminiResponse({
+            "candidates": [{
+                "finishReason": finish,
+                "content": {"parts": [{"text": getattr(response, "text", "")}]},
+            }],
+            "usageMetadata": metadata,
+        })
 
 
 class CloudflareChatProviderTests(unittest.TestCase):
     def setUp(self):
         self.provider = AIProvider()
         _gemini_consultation_client.cache_clear()
+        with _GEMINI_QUOTA_COOLDOWN_LOCK:
+            _GEMINI_QUOTA_COOLDOWNS.clear()
 
     def test_consultation_gemini_client_is_reused(self):
         client = object()
-        with patch("google.genai.Client", return_value=client) as create_client:
+        with patch("httpx.Client", return_value=client) as create_client:
             first = _gemini_consultation_client("test-key", 35000)
             second = _gemini_consultation_client("test-key", 35000)
         self.assertIs(first, second)
         create_client.assert_called_once()
+        self.assertEqual(create_client.call_args.kwargs["headers"]["x-goog-api-key"], "test-key")
 
     def test_gemini_chat_model_aliases_load_render_and_legacy_env_names(self):
         from app.core.config import Settings
@@ -189,16 +253,19 @@ class CloudflareChatProviderTests(unittest.TestCase):
         from app.core.config import Settings
 
         generate = unittest.mock.Mock(return_value=SimpleNamespace(text="How long have you had the fever?"))
-        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
-        with patch("google.genai.Client", return_value=client) as constructor, patch(
+        client = _GeminiRestAdapter(generate)
+        with patch("app.services.ai_service._gemini_consultation_client", return_value=client) as constructor, patch(
             "app.services.ai_service.settings",
             return_value=Settings(_env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash"),
         ):
             reply = self.provider.answer_consultation("Patient reports fever")
         self.assertEqual(reply, "How long have you had the fever?")
-        self.assertEqual(constructor.call_args.kwargs["api_key"], "test-key")
+        self.assertEqual(constructor.call_args.args, ("test-key", 35000))
         self.assertEqual(generate.call_args.kwargs["model"], "gemini-3.8-flash")
         self.assertEqual(generate.call_args.kwargs["config"]["max_output_tokens"], 220)
+        self.assertEqual(generate.call_args.kwargs["config"]["thinking_config"]["thinkingLevel"], "LOW")
+        request_body = client.post.call_args.kwargs["json"]
+        self.assertEqual(request_body["generationConfig"]["thinkingConfig"], {"thinkingLevel": "LOW"})
 
     def test_ai_chat_intake_uses_larger_output_budget(self):
         from types import SimpleNamespace
@@ -210,8 +277,8 @@ class CloudflareChatProviderTests(unittest.TestCase):
             usage_metadata=SimpleNamespace(candidates_token_count=24, thoughts_token_count=64),
         )
         generate = unittest.mock.Mock(return_value=response)
-        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
-        with patch("google.genai.Client", return_value=client), patch(
+        client = _GeminiRestAdapter(generate)
+        with patch("app.services.ai_service._gemini_consultation_client", return_value=client), patch(
             "app.services.ai_service.settings",
             return_value=Settings(_env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash"),
         ):
@@ -230,8 +297,8 @@ class CloudflareChatProviderTests(unittest.TestCase):
             usage_metadata=SimpleNamespace(candidates_token_count=30, thoughts_token_count=80),
         )
         generate = unittest.mock.Mock(return_value=response)
-        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
-        with patch("google.genai.Client", return_value=client), patch(
+        client = _GeminiRestAdapter(generate)
+        with patch("app.services.ai_service._gemini_consultation_client", return_value=client), patch(
             "app.services.ai_service.settings",
             return_value=Settings(_env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash"),
         ):
@@ -250,9 +317,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
             candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="MAX_TOKENS"))],
             usage_metadata=SimpleNamespace(candidates_token_count=4, thoughts_token_count=4092),
         )
-        client = SimpleNamespace(models=SimpleNamespace(generate_content=unittest.mock.Mock(return_value=truncated)))
+        client = _GeminiRestAdapter(unittest.mock.Mock(return_value=truncated))
         with (
-            patch("google.genai.Client", return_value=client),
+            patch("app.services.ai_service._gemini_consultation_client", return_value=client),
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
             )),
@@ -273,9 +340,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
             candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="MAX_TOKENS"))],
             usage_metadata=SimpleNamespace(candidates_token_count=4, thoughts_token_count=212),
         )
-        client = SimpleNamespace(models=SimpleNamespace(generate_content=unittest.mock.Mock(return_value=truncated)))
+        client = _GeminiRestAdapter(unittest.mock.Mock(return_value=truncated))
         with (
-            patch("google.genai.Client", return_value=client),
+            patch("app.services.ai_service._gemini_consultation_client", return_value=client),
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
             )),
@@ -293,9 +360,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
         transient = RuntimeError("temporary unavailable")
         transient.code = 503
         generate = unittest.mock.Mock(side_effect=[transient, SimpleNamespace(text="How long has it lasted?")])
-        fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        fake_client = _GeminiRestAdapter(generate)
         with (
-            patch("google.genai.Client", return_value=fake_client),
+            patch("app.services.ai_service._gemini_consultation_client", return_value=fake_client),
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
             )),
@@ -326,9 +393,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
             return fallback_response
 
         generate = unittest.mock.Mock(side_effect=generate_content)
-        fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        fake_client = _GeminiRestAdapter(generate)
         with (
-            patch("google.genai.Client", return_value=fake_client),
+            patch("app.services.ai_service._gemini_consultation_client", return_value=fake_client),
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None,
                 google_api_key="test-key",
@@ -354,9 +421,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
         transient = RuntimeError("temporary unavailable")
         transient.code = 503
         generate = unittest.mock.Mock(side_effect=transient)
-        fake_client = type("FakeClient", (), {"models": type("Models", (), {"generate_content": generate})()})()
+        fake_client = _GeminiRestAdapter(generate)
         with (
-            patch("google.genai.Client", return_value=fake_client),
+            patch("app.services.ai_service._gemini_consultation_client", return_value=fake_client),
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
             )),
@@ -392,9 +459,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
                         finish_reason=SimpleNamespace(name="STOP"),
                     )]),
                 ])
-                fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+                fake_client = _GeminiRestAdapter(generate)
                 with (
-                    patch("google.genai.Client", return_value=fake_client),
+                    patch("app.services.ai_service._gemini_consultation_client", return_value=fake_client),
                     patch("app.services.ai_service.settings", return_value=Settings(
                         _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
                     )),
@@ -406,14 +473,47 @@ class CloudflareChatProviderTests(unittest.TestCase):
                 self.assertEqual(generate.call_args_list[1].kwargs["model"], "gemini-3.5-flash-lite")
                 sleep.assert_not_called()
 
+    def test_primary_429_is_cooled_down_and_next_turn_skips_gemini(self):
+        from types import SimpleNamespace
+        from app.core.config import Settings
+
+        quota_error = RuntimeError("RESOURCE_EXHAUSTED: daily quota")
+        quota_error.code = 429
+        fallback_response = SimpleNamespace(
+            text="How long has the fever lasted?",
+            candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+        )
+        generate = unittest.mock.Mock(side_effect=[quota_error, fallback_response, fallback_response])
+        fake_client = _GeminiRestAdapter(generate)
+        with (
+            patch("app.services.ai_service._gemini_consultation_client", return_value=fake_client),
+            patch("app.services.ai_service.settings", return_value=Settings(
+                _env_file=None,
+                google_api_key="test-key",
+                gemini_chat_model="gemini-3.8-flash",
+                gemini_chat_fallback_model="gemini-3.5-flash-lite",
+            )),
+            patch.object(self.provider, "_cloudflare_chat", return_value="Cloudflare response") as cloudflare,
+        ):
+            first = self.provider.answer_consultation("Patient reports fever", intake_reply=True)
+            second = self.provider.answer_consultation("Patient reports fever for two days", intake_reply=True)
+
+        self.assertEqual(first, "How long has the fever lasted?")
+        self.assertEqual(second, "How long has the fever lasted?")
+        self.assertEqual(generate.call_count, 3)  # second turn skips primary but keeps using the fast fallback model
+        self.assertEqual([call.kwargs["model"] for call in generate.call_args_list], [
+            "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash-lite",
+        ])
+        cloudflare.assert_not_called()
+
     def test_appointment_consultation_uses_cloudflare_after_gemini_504_failover(self):
         from app.core.config import Settings
         transient = RuntimeError("gateway timeout")
         transient.code = 504
         generate = unittest.mock.Mock(side_effect=transient)
-        fake_client = type("FakeClient", (), {"models": type("Models", (), {"generate_content": generate})()})()
+        fake_client = _GeminiRestAdapter(generate)
         with (
-            patch("google.genai.Client", return_value=fake_client),
+            patch("app.services.ai_service._gemini_consultation_client", return_value=fake_client),
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
             )),

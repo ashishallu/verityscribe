@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -31,6 +32,9 @@ router = APIRouter(prefix="/ai-consultations", tags=["AI consultations"])
 logger = logging.getLogger(__name__)
 AI_TYPES = {"ai_chat", "ai_virtual"}
 _STALE_FINALIZATION_AFTER = timedelta(minutes=5)
+_AI_CONSULTATION_READ_POOL = ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="ai-consultation-read"
+)
 
 
 class _VoiceClientDisconnected(Exception):
@@ -582,10 +586,17 @@ def get_session(session_id: str, claims: dict = Depends(current_claims)):
 def _send_message(client, session: dict[str, Any], content: str, request_key: str):
     if session["status"] != "in_progress":
         raise HTTPException(status_code=409, detail="This consultation is not accepting messages")
-    prior = _messages(client, session["id"])
-    request_rows = client.table("ai_consultation_messages").select(
-        "id,role,content,created_at,request_key"
-    ).eq("session_id", session["id"]).eq("request_key", request_key).order("created_at").execute().data or []
+    # Conversation history and this idempotency-key lookup are independent
+    # database reads. Reuse a small pool to overlap their network latency.
+    prior_future = _AI_CONSULTATION_READ_POOL.submit(_messages, client, session["id"])
+    request_future = _AI_CONSULTATION_READ_POOL.submit(
+        lambda: client.table("ai_consultation_messages").select(
+            "id,role,content,created_at,request_key"
+        ).eq("session_id", session["id"]).eq("request_key", request_key)
+        .order("created_at").execute().data or []
+    )
+    prior = prior_future.result()
+    request_rows = request_future.result()
     patient_message = next((row for row in request_rows if row.get("role") == "patient"), None)
     assistant_message = next((row for row in request_rows if row.get("role") == "assistant"), None)
     if patient_message and patient_message.get("content") != content:
@@ -775,8 +786,11 @@ def create_direct_live_credential(session_id: str, claims: dict = Depends(curren
             output_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False, prefix_padding_ms=200,
-                    silence_duration_ms=max(500, min(gemini_live.silence_duration_ms, 2000)),
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=40,
+                    silence_duration_ms=500,
                 ),
             ),
             system_instruction=types.Content(parts=[types.Part(text=instructions)]),
