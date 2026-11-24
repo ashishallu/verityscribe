@@ -26,12 +26,16 @@ class Settings(BaseSettings):
     cloudflare_api_token: str = ""
     cloudflare_summary_model: str = "@cf/qwen/qwen3.8-27b"
     gemini_chat_model: str = "gemini-3.8-flash"
+    gemini_chat_fallback_model: str = "gemini-3.5-flash-lite"
     # Defaults align with the current Gemini Live implementation; deployments
     # may override either model through their process environment.
     gemini_live_model: str = "gemini-3.8-live"
     gemini_live_voice: str = "Aoede"
     gemini_live_silence_duration_ms: int = 600
     gemini_summary_model: str = "gemini-3.8-flash"
+    gemini_summary_fallback_model: str = "gemini-3.5-flash-lite"
+    gemini_summary_primary_timeout_seconds: float = 15.0
+    gemini_summary_fallback_timeout_seconds: float = 20.0
     cors_origins: str = DEFAULT_CORS_ORIGINS
     # Resolve backend/.env regardless of caller cwd. Pydantic Settings gives
     # process environment variables precedence over values loaded from dotenv.

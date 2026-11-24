@@ -1085,8 +1085,14 @@ class AIProvider:
         """Generate text-consultation output; voice summaries use their own provider path."""
         config = settings()
         api_key = config.google_api_key.strip()
+        model = config.gemini_chat_model.strip()
+        fallback_model = (
+            config.gemini_chat_fallback_model.strip() or "gemini-3.5-flash-lite"
+        ) if intake_reply or chat_summary else model
         if not api_key:
             raise RuntimeError("Gemini text chat is not configured")
+        if not model:
+            raise RuntimeError("Gemini text chat model is not configured")
         try:
             from google import genai
             from google.genai import types
@@ -1102,6 +1108,7 @@ class AIProvider:
         except Exception as exc:
             raise RuntimeError(f"Gemini text chat client initialization failed ({type(exc).__name__})") from exc
 
+        fallback_attempted = model == fallback_model
         for attempt in range(3):
             try:
                 output_limit = 4096 if chat_summary else 1024 if intake_reply else 220
@@ -1115,7 +1122,7 @@ class AIProvider:
                 if chat_summary:
                     generation_config["response_mime_type"] = "application/json"
                 response = client.models.generate_content(
-                    model=config.gemini_chat_model,
+                    model=model,
                     contents=prompt,
                     config=generation_config,
                 )
@@ -1132,7 +1139,7 @@ class AIProvider:
                     logger.info(
                         "ai_chat_generation profile=%s model=%s attempt=%d text_chars=%d finish=%s output_tokens=%s thought_tokens=%s",
                         "summary" if chat_summary else "intake",
-                        config.gemini_chat_model,
+                        model,
                         attempt + 1,
                         len(answer) if isinstance(answer, str) else 0,
                         finish_name,
@@ -1174,6 +1181,63 @@ class AIProvider:
                     raise RuntimeError(
                         f"Gemini text chat request failed ({type(exc).__name__})"
                     ) from exc
+                logger.warning(
+                    "ai_chat_gemini_retry profile=%s model=%s attempt=%d status=%s",
+                    "summary" if chat_summary else "intake",
+                    model,
+                    attempt + 1,
+                    status,
+                )
+                # A model-level 503 is not an authentication or request-format
+                # failure. Try the configured low-latency Gemini backup once
+                # immediately, preserving the exact same prompt and history.
+                # This avoids waiting through several slow retries while the
+                # primary model is overloaded.
+                if not fallback_attempted:
+                    fallback_attempted = True
+                    try:
+                        fallback_response = client.models.generate_content(
+                            model=fallback_model,
+                            contents=prompt,
+                            config=generation_config,
+                        )
+                        fallback_answer = getattr(fallback_response, "text", None)
+                        fallback_candidates = getattr(fallback_response, "candidates", None) or []
+                        fallback_candidate = fallback_candidates[0] if fallback_candidates else None
+                        fallback_finish = getattr(fallback_candidate, "finish_reason", None)
+                        fallback_finish_name = (
+                            getattr(fallback_finish, "name", None)
+                            or str(fallback_finish or "unknown").rsplit(".", 1)[-1]
+                        ).upper()
+                        if (
+                            isinstance(fallback_answer, str)
+                            and fallback_answer.strip()
+                            and fallback_finish_name != "MAX_TOKENS"
+                        ):
+                            fallback_usage = getattr(fallback_response, "usage_metadata", None)
+                            logger.info(
+                                "ai_chat_generation profile=%s model=%s fallback_for=%s text_chars=%d finish=%s output_tokens=%s",
+                                "summary" if chat_summary else "intake",
+                                fallback_model,
+                                model,
+                                len(fallback_answer),
+                                fallback_finish_name,
+                                getattr(fallback_usage, "candidates_token_count", None),
+                            )
+                            return fallback_answer.strip()
+                        raise RuntimeError("Gemini fallback returned no complete text")
+                    except Exception as fallback_exc:
+                        fallback_status = (
+                            getattr(fallback_exc, "code", None)
+                            or getattr(fallback_exc, "status_code", None)
+                        )
+                        logger.warning(
+                            "ai_chat_gemini_fallback_failed profile=%s model=%s error_type=%s status=%s",
+                            "summary" if chat_summary else "intake",
+                            fallback_model,
+                            type(fallback_exc).__name__,
+                            fallback_status if isinstance(fallback_status, (int, str)) else "unknown",
+                        )
                 if attempt == 2:
                     try:
                         # Text-only appointment intake fallback; AI Virtual uses
@@ -1185,6 +1249,14 @@ class AIProvider:
                             disable_reasoning=True,
                         )
                     except Exception as fallback_exc:
+                        safe_reason = str(fallback_exc)
+                        if not safe_reason.startswith("Cloudflare Workers AI "):
+                            safe_reason = type(fallback_exc).__name__
+                        logger.error(
+                            "ai_chat_cloudflare_fallback_failed profile=%s reason=%s",
+                            "summary" if chat_summary else "intake",
+                            safe_reason,
+                        )
                         raise RuntimeError(
                             "Gemini text chat temporarily unavailable after 3 attempts; "
                             f"Cloudflare text fallback failed ({type(fallback_exc).__name__})"

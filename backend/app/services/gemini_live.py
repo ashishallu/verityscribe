@@ -66,6 +66,9 @@ class GeminiLiveService:
         self.voice = cfg.gemini_live_voice
         self.silence_duration_ms = cfg.gemini_live_silence_duration_ms
         self.summary_model = cfg.gemini_summary_model
+        self.summary_fallback_model = cfg.gemini_summary_fallback_model
+        self.summary_primary_timeout_seconds = cfg.gemini_summary_primary_timeout_seconds
+        self.summary_fallback_timeout_seconds = cfg.gemini_summary_fallback_timeout_seconds
         self.google_api_key = cfg.google_api_key
         self.agent = None
         self.runner = None
@@ -143,9 +146,10 @@ class GeminiLiveService:
                 def instruction(ctx: Any) -> str:
                     context = ctx.state.get("clinical_context_json", "{}")
                     return (
-                        "You are Verity, an AI medical consultation intake assistant, not a licensed clinician. "
+                        "You are Verity, a transparent AI health-intake assistant preparing a draft for a human clinician. "
                         "Conduct a natural, adaptive, structured patient interview, not a fixed questionnaire. Begin with a "
                         "brief greeting and one open question, then choose each next question from what the patient just said. "
+                        "If asked whether you are human or a doctor, answer truthfully in one short sentence; never claim a real clinician identity. "
                         "introducing yourself as an AI intake assistant, and asking what brings them in. Identify "
                         "the primary concern and exact body location/laterality, then ask one clear question at a time. "
                         "For joint or limb pain, specifically clarify which joint/side, whether there was an injury, "
@@ -160,7 +164,8 @@ class GeminiLiveService:
                         "non-English fragments into a medical fact. Follow the patient's answers "
                         "to clarify relevant symptoms, onset, duration, severity, frequency, progression, associated "
                         "symptoms, relevant medical history, current medicines, and allergies. Do not ask irrelevant "
-                        "questions or repeat details already answered. Clarify ambiguous or incomplete answers. Keep each "
+                        "questions or repeat details already answered. Usually a few focused follow-ups are enough; do not force a question count. "
+                        "Ask exactly one question at a time. Clarify ambiguous or incomplete answers. Keep each "
                         "spoken turn brief: acknowledge the answer, ask one relevant follow-up, and avoid long explanations "
                         "or silent delays. Do not advance past a misunderstood body part, side, severity number, or procedure. "
                         "Use the clinical_context tool for patient-specific history or record questions, and treat its "
@@ -346,11 +351,17 @@ class GeminiLiveService:
                         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                         "generationConfig": {
                             "responseMimeType": "application/json",
-                            "maxOutputTokens": 1800,
-                            "thinkingConfig": {"thinkingLevel": "MEDIUM"},
+                            # The summary schema is deliberately compact. A
+                            # smaller generation budget reduces reserved
+                            # capacity and first-token latency under load.
+                            "maxOutputTokens": 800,
+                            "thinkingConfig": {"thinkingLevel": "LOW"},
                         },
                     },
-                    timeout=httpx.Timeout(60.0, connect=10.0),
+                    timeout=httpx.Timeout(
+                        max(5.0, min(30.0, float(getattr(self, "summary_primary_timeout_seconds", 15.0)))),
+                        connect=10.0,
+                    ),
                 )
                 response.raise_for_status()
                 response_data = response.json()
@@ -413,6 +424,17 @@ class GeminiLiveService:
                             "AI Virtual Gemini retry skipped model=%s provider_status=%s retry_after_s=%.0f reason=retry_window_exceeded",
                             summary_model, provider_status, provider_delay,
                         )
+                        # A project-wide quota cannot be relieved by retrying
+                        # the same model. Continue to the distinct fallback.
+                        break
+                    fallback_model = getattr(
+                        self, "summary_fallback_model", "gemini-3.5-flash-lite"
+                    )
+                    if fallback_model and fallback_model != summary_model:
+                        logger.info(
+                            "AI Virtual Gemini summary switching to Gemini fallback model=%s after primary_status=%s",
+                            fallback_model, provider_status or status_code or "transport_error",
+                        )
                         break
                     retry_delay = max(0.0, provider_delay) if provider_delay is not None else 5.0
                     logger.info(
@@ -458,6 +480,73 @@ class GeminiLiveService:
                 parsed = parse_summary(response_text)
             except Exception as exc:
                 gemini_error = exc
+
+        fallback_model = getattr(
+            self, "summary_fallback_model", "gemini-3.5-flash-lite"
+        )
+        summary_error_status = (
+            getattr(getattr(gemini_error, "response", None), "status_code", None)
+            or getattr(gemini_error, "code", None)
+            or getattr(gemini_error, "status_code", None)
+        )
+        summary_error_retryable = (
+            summary_error_status in {429, 500, 502, 503, 504}
+            or isinstance(gemini_error, (httpx.TimeoutException, httpx.TransportError))
+        )
+        if (
+            parsed is None
+            and summary_error_retryable
+            and fallback_model
+            and fallback_model != summary_model
+        ):
+            fallback_started = time.perf_counter()
+            try:
+                fallback_response = httpx.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{fallback_model.replace('/', '%2F')}:generateContent",
+                    headers={"x-goog-api-key": self.google_api_key},
+                    json={
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "responseMimeType": "application/json",
+                            "maxOutputTokens": 512,
+                            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
+                        },
+                    },
+                    timeout=httpx.Timeout(
+                        max(5.0, min(30.0, float(getattr(self, "summary_fallback_timeout_seconds", 20.0)))),
+                        connect=10.0,
+                    ),
+                )
+                fallback_response.raise_for_status()
+                fallback_data = fallback_response.json()
+                fallback_candidates = fallback_data.get("candidates") or []
+                fallback_parts = (
+                    (fallback_candidates[0].get("content") or {}).get("parts")
+                    if fallback_candidates else None
+                )
+                fallback_text = "".join(
+                    str(part.get("text", ""))
+                    for part in (fallback_parts or [])
+                    if isinstance(part, dict) and not part.get("thought")
+                ).strip()
+                parsed = parse_summary(fallback_text)
+                summary_provider = "gemini_fallback"
+                logger.info(
+                    "AI Virtual text summary response provider=gemini_fallback model=%s status=%d elapsed_ms=%d",
+                    fallback_model, fallback_response.status_code,
+                    round((time.perf_counter() - fallback_started) * 1000),
+                )
+            except Exception as fallback_error:
+                fallback_status = (
+                    getattr(getattr(fallback_error, "response", None), "status_code", None)
+                    or getattr(fallback_error, "code", None)
+                    or getattr(fallback_error, "status_code", None)
+                )
+                logger.warning(
+                    "AI Virtual Gemini summary fallback failed model=%s status=%s error_type=%s",
+                    fallback_model, fallback_status or "unknown", type(fallback_error).__name__,
+                )
 
         if parsed is None:
             logger.warning(

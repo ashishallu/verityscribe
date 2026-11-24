@@ -148,8 +148,8 @@ def test_virtual_summary_uses_gemini_json_and_preserves_incomplete_state():
     assert request["headers"]["x-goog-api-key"] == "test-key-not-real"
     config = request["json"]["generationConfig"]
     assert config["responseMimeType"] == "application/json"
-    assert config["maxOutputTokens"] == 1800
-    assert config["thinkingConfig"]["thinkingLevel"] == "MEDIUM"
+    assert config["maxOutputTokens"] == 800
+    assert config["thinkingConfig"]["thinkingLevel"] == "LOW"
     assert "temperature" not in config
     assert summary["clinical_summary"] == "Problem: Knee pain."
     assert summary["summary_generation_provider"] == "gemini"
@@ -266,7 +266,7 @@ def test_virtual_summary_retries_transient_gateway_timeout_once():
             appointment={"id": "appointment"}, interview_complete=True,
         )
     assert len(calls) == 2
-    sleep.assert_called_once_with(3.0)
+    sleep.assert_not_called()
     assert result["clinical_summary"] == "Problem: Headache."
     prompt = calls[-1][1]["json"]["contents"][0]["parts"][0]["text"]
     assert "irrelevant_large_field" not in prompt
@@ -304,11 +304,55 @@ def test_virtual_summary_backs_off_after_read_timeout_before_retry():
         )
 
     assert len(calls) == 2
-    sleep.assert_called_once_with(5.0)
+    sleep.assert_not_called()
     assert result["clinical_summary"] == "Problem: Headache."
 
 
-def test_virtual_summary_does_not_retry_after_daily_quota_exhaustion():
+def test_virtual_summary_uses_gemini_flash_lite_after_primary_503():
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-key-not-real"
+    service.summary_model = "gemini-3.8-flash"
+    service.summary_fallback_model = "gemini-3.5-flash-lite"
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if len(calls) == 1:
+            response = httpx.Response(
+                503, request=httpx.Request("POST", url),
+                json={"error": {"status": "UNAVAILABLE"}},
+            )
+            response.raise_for_status()
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"candidates": [{"content": {"parts": [{
+                "text": json.dumps({
+                    "clinical_summary": "Problem: Patient-reported headache.",
+                    "chief_complaint": "Headache",
+                })
+            }]}}]},
+        )
+
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post):
+        result = service.generate_consultation_summary(
+            transcript=[{"role": "patient", "content": "I have had a headache for two days."}],
+            patient_context={}, appointment={"id": "synthetic-appointment"},
+            interview_complete=True,
+        )
+
+    assert len(calls) == 2
+    assert calls[0][0].endswith("/models/gemini-3.8-flash:generateContent")
+    assert calls[1][0].endswith("/models/gemini-3.5-flash-lite:generateContent")
+    assert calls[1][1]["json"]["contents"] == calls[0][1]["json"]["contents"]
+    assert calls[1][1]["json"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "MINIMAL"
+    assert result["summary_generation_provider"] == "gemini_fallback"
+    assert result["review_required"] is True
+    assert result["draft_prescription"] is None
+
+
+def test_virtual_summary_uses_fallback_without_retrying_primary_after_daily_quota_exhaustion():
     service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
     service.summary_client = object()
     service.google_api_key = "test-key-not-real"
@@ -317,42 +361,50 @@ def test_virtual_summary_does_not_retry_after_daily_quota_exhaustion():
 
     def post(url, **kwargs):
         calls.append(url)
-        response = httpx.Response(
-            429,
+        if len(calls) == 1:
+            response = httpx.Response(
+                429,
+                request=httpx.Request("POST", url),
+                json={"error": {
+                    "status": "RESOURCE_EXHAUSTED",
+                    "details": [{
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "53925s",
+                    }],
+                }},
+            )
+            response.raise_for_status()
+        return httpx.Response(
+            200,
             request=httpx.Request("POST", url),
-            json={"error": {
-                "status": "RESOURCE_EXHAUSTED",
-                "details": [{
-                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
-                    "retryDelay": "53925s",
-                }],
-            }},
+            json={"candidates": [{"content": {"parts": [{
+                "text": json.dumps({
+                    "clinical_summary": "Problem: Headache.",
+                    "chief_complaint": "Headache",
+                })
+            }]}}]},
         )
-        response.raise_for_status()
-        return response
 
-    fallback_json = json.dumps({
-        "clinical_summary": "Problem: Headache.",
-        "chief_complaint": "Headache",
-    })
-    with patch.object(gemini_live_module.httpx, "post", side_effect=post), \
-         patch("app.services.ai_service.ai_provider.summarize_consultation", return_value=fallback_json) as fallback:
+    with patch.object(gemini_live_module.httpx, "post", side_effect=post):
         result = service.generate_consultation_summary(
             transcript=[{"role": "patient", "content": "Headache for three days"}],
             patient_context={}, appointment={"id": "appointment"},
             interview_complete=False,
         )
 
-    assert len(calls) == 1
-    fallback.assert_called_once()
-    assert result["summary_generation_provider"] == "cloudflare"
+    assert len(calls) == 2
+    assert calls[0].endswith("/models/test-fast-summary-model:generateContent")
+    assert calls[1].endswith("/models/gemini-3.5-flash-lite:generateContent")
+    assert result["summary_generation_provider"] == "gemini_fallback"
     assert result["review_required"] is True
 
 
 def test_summary_model_is_configurable_without_changing_live_model(monkeypatch):
     monkeypatch.setenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
     monkeypatch.setenv("GEMINI_SUMMARY_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("GEMINI_SUMMARY_FALLBACK_MODEL", "gemini-3.5-flash-lite")
     cfg = Settings(_env_file=None)
 
     assert cfg.gemini_live_model == "gemini-3.8-live"
     assert cfg.gemini_summary_model == "gemini-3.8-flash"
+    assert cfg.gemini_summary_fallback_model == "gemini-3.5-flash-lite"
