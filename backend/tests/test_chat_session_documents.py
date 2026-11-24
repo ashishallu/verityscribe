@@ -16,6 +16,7 @@ from app.routers.integration import (
     remove_chat_session_document,
     secure_chat,
 )
+from app.services.ai_service import AIProvider
 
 
 SESSION_A = "00000000-0000-4000-8000-000000000001"
@@ -133,6 +134,90 @@ class _InsertOnlyClient:
 
 
 class SessionScopedDocumentTests(unittest.TestCase):
+    def test_patient_chat_uses_gemini_and_returns_generated_text(self):
+        class _Models:
+            def generate_content(self, **kwargs):
+                self.request = kwargs
+                return type("_Response", (), {"text": "Please tell me when the fever started."})()
+
+        class _Client:
+            def __init__(self, **_kwargs):
+                self.models = _Models()
+
+        config = type("_Settings", (), {"google_api_key": "test-key", "gemini_chat_model": "test-gemini-model"})()
+        with (
+            patch("app.services.ai_service.settings", return_value=config),
+            patch("google.genai.Client", _Client),
+            patch.object(AIProvider, "_cloudflare_chat", side_effect=AssertionError("retired provider must not be called")),
+        ):
+            answer = AIProvider().answer("Patient reports fever. Ask one follow-up question.")
+
+        self.assertEqual(answer, "Please tell me when the fever started.")
+
+    def test_patient_chat_retries_transient_gemini_failure_only(self):
+        class _Models:
+            def __init__(self):
+                self.calls = 0
+
+            def generate_content(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    error = RuntimeError("temporary")
+                    error.code = 503
+                    raise error
+                return type("_Response", (), {"text": "How long have you had the fever?"})()
+
+        models = _Models()
+
+        class _Client:
+            def __init__(self, **_kwargs):
+                self.models = models
+
+        config = type("_Settings", (), {"google_api_key": "test-key", "gemini_chat_model": "test-gemini-model"})()
+        with (
+            patch("app.services.ai_service.settings", return_value=config),
+            patch("google.genai.Client", _Client),
+            patch("app.services.ai_service.time.sleep"),
+            patch("app.services.ai_service.random.uniform", return_value=0),
+            patch.object(AIProvider, "_cloudflare_chat", side_effect=AssertionError("no Cloudflare fallback")),
+        ):
+            answer = AIProvider().answer("Patient reports fever.")
+
+        self.assertEqual(answer, "How long have you had the fever?")
+        self.assertEqual(models.calls, 2)
+
+    def test_patient_chat_uses_gemini_backup_after_primary_overload(self):
+        class _Models:
+            def __init__(self):
+                self.models = []
+
+            def generate_content(self, **kwargs):
+                self.models.append(kwargs["model"])
+                if kwargs["model"] == "primary-model":
+                    error = RuntimeError("temporary overload")
+                    error.code = 503
+                    raise error
+                return type("_Response", (), {"text": "How long has the fever lasted?"})()
+
+        models = _Models()
+
+        class _Client:
+            def __init__(self, **_kwargs):
+                self.models = models
+
+        config = type("_Settings", (), {"google_api_key": "test-key", "gemini_chat_model": "primary-model"})()
+        with (
+            patch("app.services.ai_service.settings", return_value=config),
+            patch("google.genai.Client", _Client),
+            patch("app.services.ai_service.time.sleep"),
+            patch("app.services.ai_service.random.uniform", return_value=0),
+            patch.object(AIProvider, "_cloudflare_chat", side_effect=AssertionError("no Cloudflare fallback")),
+        ):
+            answer = AIProvider().answer("Patient reports fever.")
+
+        self.assertEqual(answer, "How long has the fever lasted?")
+        self.assertEqual(models.models, ["primary-model"] * 3 + ["gemini-3.5-flash-lite"])
+
     def test_session_creation_uses_supported_insert_execute_response(self):
         client = _InsertOnlyClient()
         claims = {"sub": "user-a", "app_metadata": {"role": "patient"}}

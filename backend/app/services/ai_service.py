@@ -129,10 +129,10 @@ class AIProvider:
     ASR_MODEL = os.getenv("AI_ASR_PRIMARY_MODEL", "@cf/deepgram/nova-3")
     SECONDARY_ASR_MODEL = os.getenv("AI_ASR_SECONDARY_MODEL", "@cf/openai/whisper-large-v3-turbo")
     LLM_MODEL = "Qwen/Qwen3-8B"
-    # Chat and report summarization use the existing Cloudflare account/token. Do
-    # not fall back to Hugging Face: its routed inference returned HTTP 402 in
-    # production after free credits were exhausted.
+    # Workers AI remains configured for document/clinical summaries and
+    # model-specific fallback paths. Patient AI Assist uses Gemini in answer().
     CHAT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
+    PATIENT_CHAT_GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
     # Separate clinical-summary fallback model. The chat model above is kept
     # stable for existing AI Chat callers; this model replaces it only for
     # consultation summaries and can be overridden during model rollouts.
@@ -836,8 +836,120 @@ class AIProvider:
         return self.transcribe_consensus(audio, filename).final_text
 
     def answer(self, prompt: str) -> str:
-        timeout = max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35"))))
-        return self._cloudflare_chat(prompt, timeout=timeout, max_tokens=260)
+        """Generate patient AI Assist replies through the configured Gemini text model.
+
+        Patient chat previously called Workers AI directly; production logs show
+        that route returning HTTP 410, which the API surfaced to the app as 503.
+        Keep this isolated from Gemini Live and do not fall back to the retired
+        Workers AI route or a hardcoded reply.
+        """
+        config = settings()
+        api_key = config.google_api_key.strip()
+        model = config.gemini_chat_model.strip()
+        if not api_key:
+            raise RuntimeError("Gemini patient chat is not configured")
+        if not model:
+            raise RuntimeError("Gemini patient chat model is not configured")
+
+        timeout_ms = int(max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35")))) * 1000)
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(
+                    timeout=timeout_ms,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Gemini patient chat client initialization failed ({type(exc).__name__})"
+            ) from exc
+
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={"temperature": 0.2, "max_output_tokens": 512},
+                )
+                answer = getattr(response, "text", None)
+                if not isinstance(answer, str) or not answer.strip():
+                    raise RuntimeError("Gemini patient chat returned an empty response")
+                logger.info(
+                    "patient_chat_generation model=%s attempt=%d text_chars=%d",
+                    model,
+                    attempt + 1,
+                    len(answer),
+                )
+                return answer.strip()
+            except Exception as exc:
+                response_obj = getattr(exc, "response", None)
+                status = (
+                    getattr(exc, "code", None)
+                    or getattr(exc, "status_code", None)
+                    or getattr(response_obj, "status_code", None)
+                )
+                try:
+                    status = int(status)
+                except (TypeError, ValueError):
+                    status = None
+                if status not in {429, 503, 504}:
+                    raise RuntimeError(
+                        f"Gemini patient chat request failed ({type(exc).__name__})"
+                    ) from exc
+                if attempt == 2:
+                    fallback_model = self.PATIENT_CHAT_GEMINI_FALLBACK_MODEL
+                    if model == fallback_model:
+                        raise RuntimeError(
+                            f"Gemini patient chat temporarily unavailable (HTTP {status})"
+                        ) from exc
+                    logger.warning(
+                        "patient_chat_gemini_fallback primary_model=%s fallback_model=%s status=%s",
+                        model,
+                        fallback_model,
+                        status,
+                    )
+                    try:
+                        fallback_response = client.models.generate_content(
+                            model=fallback_model,
+                            contents=prompt,
+                            config={"temperature": 0.2, "max_output_tokens": 512},
+                        )
+                        fallback_answer = getattr(fallback_response, "text", None)
+                        if not isinstance(fallback_answer, str) or not fallback_answer.strip():
+                            raise RuntimeError("Gemini patient chat fallback returned an empty response")
+                        logger.info(
+                            "patient_chat_generation model=%s fallback_for=%s text_chars=%d",
+                            fallback_model,
+                            model,
+                            len(fallback_answer),
+                        )
+                        return fallback_answer.strip()
+                    except Exception as fallback_exc:
+                        raise RuntimeError(
+                            "Gemini patient chat is temporarily unavailable after primary and fallback attempts "
+                            f"({type(fallback_exc).__name__})"
+                        ) from fallback_exc
+
+                headers = getattr(response_obj, "headers", {}) or {}
+                retry_after = headers.get("Retry-After") or headers.get("retry-after")
+                try:
+                    delay = min(12.0, max(0.0, float(retry_after))) if retry_after else None
+                except (TypeError, ValueError):
+                    delay = None
+                if delay is None:
+                    delay = min(4.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+                logger.warning(
+                    "patient_chat_retry model=%s attempt=%d status=%s delay_seconds=%.2f",
+                    model,
+                    attempt + 1,
+                    status,
+                    delay,
+                )
+                time.sleep(delay)
 
     def answer_doctor_assistant(self, prompt: str) -> str:
         """Generate doctor-assistant text with Gemini, without provider fallback.
