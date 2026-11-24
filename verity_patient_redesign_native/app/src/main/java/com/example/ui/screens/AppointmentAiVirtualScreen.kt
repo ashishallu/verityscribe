@@ -251,7 +251,11 @@ fun AppointmentAiVirtualScreen(
         }
     }
 
-    DisposableEffect(liveClient) {
+    // The live client changes from null -> connecting -> connected while the
+    // WebSocket handshake is still in progress. Keep cleanup keyed only to the
+    // owning appointment/screen lifetime so those state updates cannot dispose
+    // the client mid-handshake. Explicit hang-up and retry still close it below.
+    DisposableEffect(appointment.id) {
         onDispose { liveClient?.close() }
     }
 
