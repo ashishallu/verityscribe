@@ -385,6 +385,29 @@ class SessionScopedDocumentTests(unittest.TestCase):
         self.assertNotIn("Drug A 10 mg", captured["prompt"])
         self.assertNotIn("DOCUMENT EVIDENCE", captured["prompt"])
 
+    def test_symptom_chat_is_care_navigation_not_a_consultation(self):
+        client = _Client()
+        captured = {}
+
+        def answer(prompt):
+            captured["prompt"] = prompt
+            return "You can book an appointment with a clinician through the Appointments tab."
+
+        with patch("app.routers.integration.db", return_value=client), \
+             patch("app.routers.integration.get_current_patient", return_value={"id": "patient-a"}), \
+             patch("app.routers.integration.ai_provider.answer", side_effect=answer):
+            result = secure_chat(
+                ChatRequest(message="I have a headache. What should I do?", session_id=SESSION_A),
+                {"sub": "patient-a", "app_metadata": {"role": "patient"}},
+            )
+
+        self.assertIn("Do not conduct an intake or ask follow-up questions", captured["prompt"])
+        self.assertIn("Never invent findings or give a diagnosis", captured["prompt"])
+        self.assertIn("suggest booking an appointment", captured["prompt"])
+        self.assertIn("Do not append generic emergency disclaimers", captured["prompt"])
+        self.assertEqual(result["data"]["answer"], "You can book an appointment with a clinician through the Appointments tab.")
+        self.assertEqual([row["sender_type"] for row in client.messages], ["user", "assistant"])
+
     def test_remove_detaches_only_this_session_without_deleting_source_text(self):
         client = _Client()
         with patch("app.routers.integration.db", return_value=client), \
