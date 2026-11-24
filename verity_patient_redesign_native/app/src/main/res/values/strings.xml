@@ -1,0 +1,42 @@
+<resources>
+    <string name="app_name">Verity</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_ai">AI</string>
+    <string name="nav_medicines">Medicines</string>
+    <string name="nav_alarms">Alarms</string>
+    <string name="nav_records">Records</string>
+    <string name="nav_profile">Profile</string>
+
+    <string name="home_greeting">Good morning, Ashish</string>
+    <string name="home_date">Monday, 23 November 2026</string>
+    <string name="home_hero_top">How are you</string>
+    <string name="home_hero_bottom">feeling today?</string>
+    <string name="home_lumi_placeholder">Tell Lumi how you feel..</string>
+    <string name="home_ai_summary_title">Your AI health summary</string>
+    <string name="sample_ai_notice">Sample AI • Enable Firebase for live Gemini</string>
+    <string name="home_clinical_assistant_badge">AI CLINICAL ASSISTANT</string>
+    <string name="home_voice_consult_title">Start new voice consultation</string>
+    <string name="home_record_securely">Record securely</string>
+    <string name="home_today_at_a_glance">Today at a glance</string>
+    <string name="home_todays_medicines">Today\'s medicines</string>
+    <string name="home_view_all">View all</string>
+    <string name="home_health_snapshot">Health snapshot</string>
+    <string name="home_recent_activity">Recent activity</string>
+
+    <string name="ai_title">Verity AI</string>
+    <string name="ai_input_hint">Ask Verity anything...</string>
+    <string name="medicines_title">Medicines</string>
+    <string name="medicines_search_hint">Search medicines</string>
+    <string name="medicines_dashboard">Medication dashboard</string>
+    <string name="alarms_title">Medication planner</string>
+    <string name="records_title">Medical history</string>
+    <string name="records_consultations">Consultations</string>
+    <string name="profile_care_network">Your care network</string>
+    <string name="profile_preferences">Preferences</string>
+    <string name="action_download_pdf">Download prescription PDF</string>
+    <string name="cd_back">Back</string>
+    <string name="cd_notifications">Notifications</string>
+    <string name="cd_voice_input">Voice input</string>
+    <string name="cd_clear_chat">Clear conversation</string>
+    <string name="cd_scan_prescription">Scan prescription</string>
+</resources>
