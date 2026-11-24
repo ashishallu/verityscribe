@@ -231,7 +231,10 @@ class AIProvider:
     # Separate clinical-summary fallback model. The chat model above is kept
     # stable for existing AI Chat callers; this model replaces it only for
     # consultation summaries and can be overridden during model rollouts.
-    SUMMARY_MODEL = os.getenv("CLOUDFLARE_SUMMARY_MODEL", "@cf/qwen/qwen3.8-27b")
+    SUMMARY_MODEL = os.getenv(
+        "AI_CONSULTATION_SUMMARY_CLOUDFLARE_MODEL",
+        os.getenv("CLOUDFLARE_SUMMARY_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+    )
     DEFAULT_ASR_MODELS = (
         # Four user-verified working Cloudflare routes. Keep their weights and
         # wire formats stable; Flux was removed after repeated Gateway 401s.
@@ -1405,12 +1408,10 @@ class AIProvider:
         model = config.cloudflare_summary_model.strip() or self.SUMMARY_MODEL
         return self._cloudflare_chat(
             prompt, timeout=timeout, max_tokens=900, model=model,
-            # Qwen 3.8 may return reasoning without user-visible content when
-            # its thinking budget consumes the response budget. Constrain its
-            # documented reasoning effort and disable extended thinking so
-            # summaries return the final JSON payload within the output budget.
-            disable_reasoning=True,
-            reasoning_effort="low",
+            # Qwen can emit internal reasoning as text; the fast Llama summary
+            # model has no reasoning budget field, so send it a plain payload.
+            disable_reasoning=model.startswith("@cf/qwen/"),
+            reasoning_effort="low" if model.startswith("@cf/qwen/") else None,
         )
 
     def _cloudflare_chat(

@@ -2,6 +2,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 import json
 import httpx
+import pytest
 
 from app.core.config import Settings
 from app.services import gemini_live as gemini_live_module
@@ -23,6 +24,65 @@ def test_summary_timeout_defaults_are_bounded_and_environment_overridable(monkey
 
     monkeypatch.setenv("AI_SUMMARY_TIMEOUT_SECONDS", "10")
     assert Settings(_env_file=None).ai_summary_timeout_seconds == 10.0
+
+
+def test_summary_models_are_independently_configurable(monkeypatch):
+    for name in ("GEMINI_SUMMARY_MODEL", "GEMINI_SUMMARY_FALLBACK_MODEL", "AI_CONSULTATION_SUMMARY_CLOUDFLARE_MODEL", "CLOUDFLARE_SUMMARY_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    defaults = Settings(_env_file=None)
+    assert defaults.gemini_summary_model == "gemini-3.8-flash"
+    assert defaults.gemini_summary_fallback_model == "gemini-2.5-flash-lite"
+    assert defaults.cloudflare_summary_model == "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+
+    monkeypatch.setenv("GEMINI_SUMMARY_MODEL", "gemini-test-primary")
+    monkeypatch.setenv("GEMINI_SUMMARY_FALLBACK_MODEL", "gemini-test-fallback")
+    monkeypatch.setenv("AI_CONSULTATION_SUMMARY_CLOUDFLARE_MODEL", "@cf/test/summary")
+    configured = Settings(_env_file=None)
+    assert configured.gemini_summary_model == "gemini-test-primary"
+    assert configured.gemini_summary_fallback_model == "gemini-test-fallback"
+    assert configured.cloudflare_summary_model == "@cf/test/summary"
+    assert gemini_live_module._summary_thinking_config("gemini-2.5-flash-lite", level="MINIMAL") == {"thinkingBudget": 0}
+    assert gemini_live_module._summary_thinking_config("gemini-3.8-flash", level="LOW") == {"thinkingLevel": "LOW"}
+
+
+def test_summary_parser_handles_fenced_json_preamble_and_plain_prose():
+    parse = gemini_live_module._parse_json_object
+    expected = {"clinical_summary": "Patient reports fever."}
+    assert parse('```json\n{"clinical_summary":"Patient reports fever."}\n```') == expected
+    assert parse('Summary follows:\n{"clinical_summary":"Patient reports fever."}') == expected
+    assert parse("Patient reports fever for three days.") == {
+        "clinical_summary": "Patient reports fever for three days."
+    }
+
+
+def test_summary_parser_rejects_malformed_json_object():
+    with pytest.raises(ValueError, match="malformed JSON"):
+        gemini_live_module._parse_json_object('{"clinical_summary": "incomplete"')
+
+
+def test_summary_provider_failure_reason_identifies_gemini_and_cloudflare_errors(monkeypatch):
+    service = gemini_live_module.GeminiLiveService.__new__(gemini_live_module.GeminiLiveService)
+    service.summary_client = object()
+    service.google_api_key = "test-summary-key"
+    service.summary_model = "gemini-primary-test"
+    service.summary_fallback_model = "gemini-fallback-test"
+
+    def response_for(url, **_kwargs):
+        status = 429 if "gemini-primary-test" in url else 503
+        return httpx.Response(status, request=httpx.Request("POST", url), json={"error": {"status": "RESOURCE_EXHAUSTED"}})
+
+    from app.services import ai_service
+    with patch.object(gemini_live_module.httpx, "post", side_effect=response_for), \
+         patch.object(ai_service.ai_provider, "summarize_consultation", side_effect=RuntimeError("Cloudflare Workers AI request failed (TimeoutError)")):
+        with pytest.raises(gemini_live_module.ConsultationSummaryGenerationError) as failure:
+            service.generate_consultation_summary(
+                transcript=[{"role": "patient", "content": "Synthetic fever test."}],
+                patient_context={}, appointment={"id": "synthetic"}, interview_complete=False,
+            )
+
+    assert failure.value.summary_error_reason == (
+        "gemini_http_429__gemini_fallback_http_503__cloudflare_timeout"
+    )
 
 
 def test_cloudflare_summary_timeout_honors_remaining_provider_budget():

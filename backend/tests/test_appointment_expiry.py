@@ -333,4 +333,6 @@ def test_hangup_before_first_transcript_saves_incomplete_review_draft(monkeypatc
     assert saved["summary"]["interview_complete"] is False
     assert saved["summary"]["interview_state"] == "ended_early"
     assert "No clinical information was recorded" in saved["summary"]["clinical_summary"]
+    assert saved["summary"]["summary_error_reason"] == "no_saved_messages"
+    assert saved["summary"]["summary_generation_status"] == "not_attempted"
     assert len(writes) == 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,75 @@ CompletionHandler = Callable[[], Awaitable[None]]
 # real-time voice model. Keep the default configurable for deployments.
 SUMMARY_MODEL = "gemini-3.8-flash"
 SUMMARY_PROVIDER_BUDGET_SECONDS = 15.0
+
+
+class ConsultationSummaryGenerationError(RuntimeError):
+    """Provider failure carrying a safe machine-readable reason for clients."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.summary_error_reason = reason
+
+
+def _parse_json_object(response_text: str) -> dict[str, Any]:
+    """Extract model JSON robustly, or preserve non-empty plain prose as the summary."""
+    text = str(response_text or "").strip()
+    if not text:
+        raise ValueError("Summary response was empty")
+    unfenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    start = unfenced.find("{")
+    if start >= 0:
+        try:
+            value, _ = json.JSONDecoder().raw_decode(unfenced[start:])
+        except json.JSONDecodeError as exc:
+            if unfenced.lstrip().startswith("{") or text.startswith("```"):
+                raise ValueError("Summary response contains malformed JSON") from exc
+        else:
+            if not isinstance(value, dict):
+                raise ValueError("Summary response JSON must be an object")
+            clinical_summary = value.get("clinical_summary")
+            if isinstance(clinical_summary, str) and clinical_summary.strip():
+                if clinical_summary.lstrip().startswith(("{", "```")):
+                    raise ValueError("Summary response contains nested JSON instead of readable text")
+                value["clinical_summary"] = clinical_summary.strip()
+                return value
+            raise ValueError("Summary response JSON has no clinical_summary")
+    if unfenced.startswith("["):
+        raise ValueError("Summary response JSON must be an object")
+    return {"clinical_summary": unfenced}
+
+
+def _summary_provider_error_code(provider: str, error: Exception) -> str:
+    response = getattr(error, "response", None)
+    detail = str(error).casefold()
+    status = (
+        getattr(response, "status_code", None)
+        or getattr(error, "status_code", None)
+        or getattr(error, "code", None)
+    )
+    if status is not None:
+        try:
+            return f"{provider}_http_{int(status)}"
+        except (TypeError, ValueError):
+            pass
+    embedded_status = re.search(r"\bhttp\s+(\d{3})\b", detail)
+    if embedded_status:
+        return f"{provider}_http_{embedded_status.group(1)}"
+    if "recent-429" in detail or "recent 429" in detail:
+        return f"{provider}_429_cooldown"
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)) or "timeout" in detail or "timed out" in detail:
+        return f"{provider}_timeout"
+    if "not configured" in detail or "missing credential" in detail:
+        return f"{provider}_unconfigured"
+    if isinstance(error, ValueError) and "json" in detail:
+        return "json_parse_error"
+    return f"{provider}_unavailable"
+
+
+def _summary_thinking_config(model: str, *, level: str) -> dict[str, Any]:
+    if model.startswith("gemini-2.5-"):
+        return {"thinkingBudget": 0}
+    return {"thinkingLevel": level}
 
 
 def _bind_tool_context_annotation(function: Any, tool_context_type: type) -> None:
@@ -378,7 +448,7 @@ class GeminiLiveService:
                             # smaller generation budget reduces reserved
                             # capacity and first-token latency under load.
                             "maxOutputTokens": 800,
-                            "thinkingConfig": {"thinkingLevel": "LOW"},
+                            "thinkingConfig": _summary_thinking_config(summary_model, level="LOW"),
                         },
                     },
                     timeout=httpx.Timeout(
@@ -454,7 +524,7 @@ class GeminiLiveService:
                         # the same model. Continue to the distinct fallback.
                         break
                     fallback_model = getattr(
-                        self, "summary_fallback_model", "gemini-3.5-flash-lite"
+                        self, "summary_fallback_model", "gemini-2.5-flash-lite"
                     )
                     if fallback_model and fallback_model != summary_model:
                         logger.info(
@@ -473,24 +543,7 @@ class GeminiLiveService:
                 break
 
         def parse_summary(response_text: str) -> dict[str, Any]:
-            text = response_text.strip()
-            # Tolerate a short preamble or fenced JSON from a compatible
-            # fallback model without ever accepting a non-object response.
-            start = text.find("{")
-            if start < 0:
-                raise ValueError("Summary response contains no JSON object")
-            parsed_value, _ = json.JSONDecoder().raw_decode(text[start:])
-            if not isinstance(parsed_value, dict) or not isinstance(
-                parsed_value.get("clinical_summary"), str
-            ) or not parsed_value["clinical_summary"].strip():
-                raise ValueError("Summary response has no clinical summary")
-            # A syntactically valid outer JSON response may still wrap a
-            # second JSON object/fence in clinical_summary. Treat that as an
-            # unusable model result and let the configured summary provider
-            # recover it instead of displaying raw JSON after the voice call.
-            if parsed_value["clinical_summary"].lstrip().startswith(("{", "```")):
-                raise ValueError("Summary response contains non-readable nested JSON")
-            return parsed_value
+            return _parse_json_object(response_text)
 
         parsed: dict[str, Any] | None = None
         summary_provider = "gemini"
@@ -518,8 +571,10 @@ class GeminiLiveService:
         summary_error_retryable = primary_cooldown > 0 or (
             summary_error_status in {400, 404, 429, 500, 502, 503, 504}
             or isinstance(gemini_error, (httpx.TimeoutException, httpx.TransportError))
+            or isinstance(gemini_error, ValueError)
         )
         fallback_cooldown = _gemini_quota_cooldown_remaining(self.google_api_key, fallback_model)
+        gemini_fallback_error: Exception | None = None
         if (
             parsed is None
             and summary_error_retryable
@@ -541,7 +596,7 @@ class GeminiLiveService:
                         "generationConfig": {
                             "responseMimeType": "application/json",
                             "maxOutputTokens": 512,
-                            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
+                            "thinkingConfig": _summary_thinking_config(fallback_model, level="MINIMAL"),
                         },
                     },
                     timeout=httpx.Timeout(
@@ -569,6 +624,7 @@ class GeminiLiveService:
                     round((time.perf_counter() - fallback_started) * 1000),
                 )
             except Exception as fallback_error:
+                gemini_fallback_error = fallback_error
                 fallback_status = (
                     getattr(getattr(fallback_error, "response", None), "status_code", None)
                     or getattr(fallback_error, "code", None)
@@ -612,13 +668,23 @@ class GeminiLiveService:
                     os.getenv("CLOUDFLARE_SUMMARY_MODEL", ai_provider.SUMMARY_MODEL),
                 )
             except Exception as fallback_error:
+                failure_codes = []
+                if gemini_error is not None:
+                    failure_codes.append(_summary_provider_error_code("gemini", gemini_error))
+                if gemini_fallback_error is not None:
+                    failure_codes.append(_summary_provider_error_code("gemini_fallback", gemini_fallback_error))
+                elif fallback_cooldown > 0:
+                    failure_codes.append("gemini_fallback_recent_429")
+                failure_codes.append(_summary_provider_error_code("cloudflare", fallback_error))
+                summary_error_reason = "__".join(failure_codes)[:160]
                 logger.warning(
-                    "AI Virtual secondary summary provider failed provider=cloudflare model=%s error_type=%s error=%s",
+                    "AI Virtual secondary summary provider failed provider=cloudflare model=%s reason=%s error_type=%s error=%s",
                     os.getenv("CLOUDFLARE_SUMMARY_MODEL", ai_provider.SUMMARY_MODEL),
-                    type(fallback_error).__name__, str(fallback_error)[:400],
+                    summary_error_reason, type(fallback_error).__name__, str(fallback_error)[:400],
                 )
-                raise RuntimeError(
-                    "Gemini and Cloudflare could not generate a structured consultation summary"
+                raise ConsultationSummaryGenerationError(
+                    "Gemini and Cloudflare could not generate a structured consultation summary",
+                    summary_error_reason,
                 ) from fallback_error
 
         parsed["summary_generation_provider"] = summary_provider

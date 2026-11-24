@@ -1749,6 +1749,8 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
                 "draft_prescription": None,
                 "review_required": True,
                 "completion_status": "ended_early",
+                "summary_generation_status": "not_attempted",
+                "summary_error_reason": "no_saved_messages",
             }
             ended = client.table("ai_consultation_sessions").update({
                 "status": "awaiting_doctor_review",
@@ -1804,14 +1806,20 @@ def end_consultation(session_id: str, claims: dict = Depends(current_claims)):
                 similar_case_consent=bool(session.get("similar_case_consent_at")),
             )
     except Exception as exc:
+        summary_error_reason = str(
+            getattr(exc, "summary_error_reason", "summary_provider_unavailable")
+        )
+        if not re.fullmatch(r"[a-z0-9_]{1,160}", summary_error_reason):
+            summary_error_reason = "summary_provider_unavailable"
         logger.exception(
-            "AI consultation summary generation failed mode=%s error_type=%s",
-            session["mode"], type(exc).__name__,
+            "AI consultation summary generation failed mode=%s error_type=%s summary_error_reason=%s",
+            session["mode"], type(exc).__name__, summary_error_reason,
         )
         fallback = _fallback_clinical_summary(messages, interview_complete=interview_complete)
         fallback.update({"summary_id": str(uuid.uuid4()), "session_id": session_id,
                          "interview_state": "ended_early" if not interview_complete else "summary_fallback",
                          "summary_generation_status": "failed",
+                         "summary_error_reason": summary_error_reason,
                          "uncertainties": fallback["uncertainties"] + ["Some transcript wording may need confirmation against the original conversation."],
                          "items_for_doctor_review": fallback["items_for_doctor_review"] + ["Confirm the location, side, and prior procedure details with the patient."],
                          "completion_status": "incomplete"})

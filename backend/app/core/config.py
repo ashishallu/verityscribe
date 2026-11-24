@@ -29,7 +29,12 @@ class Settings(BaseSettings):
         default="@cf/qwen/qwen3.8-27b",
         validation_alias=AliasChoices("CLOUDFLARE_CHAT_MODEL", "CLOUDFLARE_SUMMARY_MODEL"),
     )
-    cloudflare_summary_model: str = "@cf/qwen/qwen3.8-27b"
+    cloudflare_summary_model: str = Field(
+        default="@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        validation_alias=AliasChoices(
+            "AI_CONSULTATION_SUMMARY_CLOUDFLARE_MODEL", "CLOUDFLARE_SUMMARY_MODEL"
+        ),
+    )
     gemini_chat_model: str = Field(
         default="gemini-3.8-flash",
         validation_alias=AliasChoices("GEMINI_CHAT_MODEL", "GEMINI_MODEL"),
@@ -44,8 +49,14 @@ class Settings(BaseSettings):
     gemini_live_model: str = "gemini-3.8-live"
     gemini_live_voice: str = "Aoede"
     gemini_live_silence_duration_ms: int = 600
-    gemini_summary_model: str = "gemini-3.8-flash"
-    gemini_summary_fallback_model: str = "gemini-3.5-flash-lite"
+    gemini_summary_model: str = Field(
+        default="gemini-3.8-flash",
+        validation_alias=AliasChoices("GEMINI_SUMMARY_MODEL"),
+    )
+    gemini_summary_fallback_model: str = Field(
+        default="gemini-2.5-flash-lite",
+        validation_alias=AliasChoices("GEMINI_SUMMARY_FALLBACK_MODEL"),
+    )
     gemini_summary_primary_timeout_seconds: float = 8.0
     gemini_summary_fallback_timeout_seconds: float = 8.0
     ai_summary_timeout_seconds: float = Field(

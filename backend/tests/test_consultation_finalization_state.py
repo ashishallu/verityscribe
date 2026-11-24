@@ -197,6 +197,7 @@ class ConsultationFinalizationStateTests(unittest.TestCase):
             self.assertEqual(saved['data']['finalization']['state'], 'incomplete')
             self.assertEqual(saved['data']['session']['status'], 'awaiting_doctor_review')
             self.assertEqual(draft['summary_generation_status'], 'failed')
+            self.assertEqual(draft['summary_error_reason'], 'summary_provider_unavailable')
             self.assertTrue(draft['summary_id'])
             self.assertEqual(draft['session_id'], 's-1')
             self.assertIn('headache began two days ago', draft['clinical_summary'])
@@ -206,6 +207,7 @@ class ConsultationFinalizationStateTests(unittest.TestCase):
             self.assertEqual(retry['data']['finalization']['state'], 'completed')
             self.assertNotEqual(retry['data']['session']['summary']['summary_id'], draft['summary_id'])
             self.assertNotEqual(retry['data']['session']['summary'].get('summary_generation_status'), 'failed')
+            self.assertNotIn('summary_error_reason', retry['data']['session']['summary'])
             self.assertEqual(generate.call_count, 2)
 
     def test_legacy_transcript_draft_is_regenerated_with_gemini_on_retry(self):
