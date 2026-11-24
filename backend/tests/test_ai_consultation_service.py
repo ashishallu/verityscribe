@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.services import ai_consultation
+from app.services.ai_service import GeminiUpstreamError
 from app.routers import ai_consultations
 
 
@@ -226,6 +227,19 @@ class AIConsultationServiceTests(unittest.TestCase):
       result = ai_consultations._send_message(client, session, "My head hurts", "turn-2")
     self.assertEqual([row["role"] for row in result["messages"]], ["patient", "assistant"])
     self.assertEqual(len(client.tables["ai_consultation_messages"]), 2)
+
+  def test_provider_failure_log_contains_sanitized_upstream_status_and_message(self):
+    client = _MemoryClient()
+    session = {"id": "session-1", "patient_id": "patient-1", "hospital_id": "hospital-1", "mode": "ai_chat", "status": "in_progress"}
+    error = GeminiUpstreamError("primary", 503, "UNAVAILABLE: overloaded, key=[REDACTED]", True)
+    with patch.object(ai_consultations, "generate_reply", side_effect=error):
+      with self.assertLogs("app.routers.ai_consultations", level="WARNING") as logs:
+        with self.assertRaises(HTTPException):
+          ai_consultations._send_message(client, session, "My head hurts", "turn-diagnostic")
+    diagnostic = " ".join(logs.output)
+    self.assertIn("upstream_status=503", diagnostic)
+    self.assertIn("UNAVAILABLE: overloaded", diagnostic)
+    self.assertEqual(len(client.tables["ai_consultation_messages"]), 1)
 
   def test_review_payload_size_is_bounded(self):
     with self.assertRaises(ValidationError):

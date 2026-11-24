@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,9 +25,20 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     cloudflare_account_id: str = ""
     cloudflare_api_token: str = ""
+    cloudflare_chat_model: str = Field(
+        default="@cf/qwen/qwen3.8-27b",
+        validation_alias=AliasChoices("CLOUDFLARE_CHAT_MODEL", "CLOUDFLARE_SUMMARY_MODEL"),
+    )
     cloudflare_summary_model: str = "@cf/qwen/qwen3.8-27b"
-    gemini_chat_model: str = "gemini-3.8-flash"
-    gemini_chat_fallback_model: str = "gemini-3.5-flash-lite"
+    gemini_chat_model: str = Field(
+        default="gemini-3.8-flash",
+        validation_alias=AliasChoices("GEMINI_CHAT_MODEL", "GEMINI_MODEL"),
+    )
+    gemini_chat_fallback_model: str = Field(
+        default="gemini-3.5-flash-lite",
+        validation_alias=AliasChoices("GEMINI_CHAT_FALLBACK_MODEL", "GEMINI_FALLBACK_MODEL"),
+    )
+    ai_chat_timeout_seconds: float = 35.0
     # Defaults align with the current Gemini Live implementation; deployments
     # may override either model through their process environment.
     gemini_live_model: str = "gemini-3.8-live"
@@ -39,7 +51,9 @@ class Settings(BaseSettings):
     cors_origins: str = DEFAULT_CORS_ORIGINS
     # Resolve backend/.env regardless of caller cwd. Pydantic Settings gives
     # process environment variables precedence over values loaded from dotenv.
-    model_config = SettingsConfigDict(env_file=BACKEND_ROOT / ".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=BACKEND_ROOT / ".env", extra="ignore", populate_by_name=True,
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:

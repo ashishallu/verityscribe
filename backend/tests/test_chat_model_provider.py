@@ -2,12 +2,60 @@ import json
 import unittest
 from unittest.mock import patch
 
-from app.services.ai_service import AIProvider
+from app.services.ai_service import AIProvider, _gemini_consultation_client
 
 
 class CloudflareChatProviderTests(unittest.TestCase):
     def setUp(self):
         self.provider = AIProvider()
+        _gemini_consultation_client.cache_clear()
+
+    def test_consultation_gemini_client_is_reused(self):
+        client = object()
+        with patch("google.genai.Client", return_value=client) as create_client:
+            first = _gemini_consultation_client("test-key", 35000)
+            second = _gemini_consultation_client("test-key", 35000)
+        self.assertIs(first, second)
+        create_client.assert_called_once()
+
+    def test_gemini_chat_model_aliases_load_render_and_legacy_env_names(self):
+        from app.core.config import Settings
+
+        with patch.dict("os.environ", {
+            "GEMINI_MODEL": "gemini-3.8-flash",
+            "GEMINI_FALLBACK_MODEL": "gemini-3.5-flash-lite",
+        }, clear=True):
+            settings = Settings(_env_file=None)
+
+        self.assertEqual(settings.gemini_chat_model, "gemini-3.8-flash")
+        self.assertEqual(settings.gemini_chat_fallback_model, "gemini-3.5-flash-lite")
+
+    def test_explicit_chat_model_env_names_take_precedence_over_legacy_alias(self):
+        from app.core.config import Settings
+
+        with patch.dict("os.environ", {
+            "GEMINI_CHAT_MODEL": "gemini-3.8-flash",
+            "GEMINI_MODEL": "ignored-legacy-model",
+        }, clear=True):
+            settings = Settings(_env_file=None)
+
+        self.assertEqual(settings.gemini_chat_model, "gemini-3.8-flash")
+
+    def test_cloudflare_chat_model_uses_explicit_or_legacy_setting(self):
+        from app.core.config import Settings
+
+        with patch.dict("os.environ", {
+            "CLOUDFLARE_CHAT_MODEL": "@cf/qwen/qwen3.8-27b",
+            "CLOUDFLARE_SUMMARY_MODEL": "legacy-model",
+        }, clear=True):
+            configured = Settings(_env_file=None)
+        self.assertEqual(configured.cloudflare_chat_model, "@cf/qwen/qwen3.8-27b")
+
+        with patch.dict("os.environ", {
+            "CLOUDFLARE_SUMMARY_MODEL": "@cf/qwen/qwen3.8-27b",
+        }, clear=True):
+            legacy = Settings(_env_file=None)
+        self.assertEqual(legacy.cloudflare_chat_model, "@cf/qwen/qwen3.8-27b")
 
     def test_patient_chat_uses_gemini_and_returns_model_text(self):
         from types import SimpleNamespace
@@ -28,6 +76,8 @@ class CloudflareChatProviderTests(unittest.TestCase):
         self.assertEqual(generate.call_args.kwargs["contents"], "How can I manage a mild headache?")
 
     def test_chat_parses_openai_compatible_workers_ai_response(self):
+        from app.core.config import Settings
+
         class Response:
             def __enter__(self):
                 return self
@@ -48,6 +98,9 @@ class CloudflareChatProviderTests(unittest.TestCase):
             "CLOUDFLARE_ACCOUNT_ID": "account-test",
             "CLOUDFLARE_API_TOKEN": "secret-test-token",
         }, clear=True), patch(
+            "app.services.ai_service.settings",
+            return_value=Settings(_env_file=None, cloudflare_chat_model="@cf/qwen/qwen3.8-27b"),
+        ), patch(
             "app.services.ai_service.urlopen", return_value=Response(),
         ) as request:
             answer = self.provider._cloudflare_chat(
@@ -56,6 +109,7 @@ class CloudflareChatProviderTests(unittest.TestCase):
             )
 
         self.assertEqual(answer, "How long have you had the fever?")
+        self.assertTrue(request.call_args.args[0].full_url.endswith("/ai/run/@cf/qwen/qwen3.8-27b"))
         payload = json.loads(request.call_args.args[0].data)
         self.assertTrue(payload["messages"][0]["content"].endswith("/no_think"))
 
@@ -295,7 +349,7 @@ class CloudflareChatProviderTests(unittest.TestCase):
         self.assertEqual(generate.call_args_list[1].kwargs["contents"], generate.call_args_list[0].kwargs["contents"])
         sleep.assert_not_called()
 
-    def test_appointment_consultation_stops_after_three_transient_failures(self):
+    def test_appointment_consultation_uses_cloudflare_after_gemini_models_fail(self):
         from app.core.config import Settings
         transient = RuntimeError("temporary unavailable")
         transient.code = 503
@@ -306,13 +360,53 @@ class CloudflareChatProviderTests(unittest.TestCase):
             patch("app.services.ai_service.settings", return_value=Settings(
                 _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
             )),
-            patch("app.services.ai_service.time.sleep"),
+            patch("app.services.ai_service.time.sleep") as sleep,
+            patch.object(self.provider, "_cloudflare_chat", return_value="How long has it lasted?") as cloudflare,
         ):
-            with self.assertRaisesRegex(RuntimeError, "after 3 attempts"):
-                self.provider.answer_consultation("Harmless retry test", intake_reply=True)
-        self.assertEqual(generate.call_count, 4)  # primary, backup once, then two primary retries
+            answer = self.provider.answer_consultation("Harmless retry test", intake_reply=True)
+        self.assertEqual(answer, "How long has it lasted?")
+        self.assertEqual(generate.call_count, 2)  # one primary attempt + immediate Gemini fallback
+        self.assertEqual([call.kwargs["model"] for call in generate.call_args_list], [
+            "gemini-3.8-flash", "gemini-3.5-flash-lite",
+        ])
+        sleep.assert_not_called()
+        cloudflare.assert_called_once()
 
-    def test_appointment_consultation_uses_cloudflare_after_gemini_504_retries(self):
+    def test_appointment_consultation_fails_over_on_500_502_and_read_timeout(self):
+        from types import SimpleNamespace
+        from app.core.config import Settings
+
+        failures = []
+        for status in (500, 502):
+            failure = RuntimeError(f"upstream HTTP {status}")
+            failure.code = status
+            failures.append(failure)
+        failures.append(TimeoutError("provider read timed out"))
+
+        for failure in failures:
+            with self.subTest(error=type(failure).__name__, status=getattr(failure, "code", None)):
+                _gemini_consultation_client.cache_clear()
+                generate = unittest.mock.Mock(side_effect=[
+                    failure,
+                    SimpleNamespace(text="When did it start?", candidates=[SimpleNamespace(
+                        finish_reason=SimpleNamespace(name="STOP"),
+                    )]),
+                ])
+                fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+                with (
+                    patch("google.genai.Client", return_value=fake_client),
+                    patch("app.services.ai_service.settings", return_value=Settings(
+                        _env_file=None, google_api_key="test-key", gemini_chat_model="gemini-3.8-flash",
+                    )),
+                    patch("app.services.ai_service.time.sleep") as sleep,
+                ):
+                    reply = self.provider.answer_consultation("Patient reports fever", intake_reply=True)
+                self.assertEqual(reply, "When did it start?")
+                self.assertEqual(generate.call_count, 2)
+                self.assertEqual(generate.call_args_list[1].kwargs["model"], "gemini-3.5-flash-lite")
+                sleep.assert_not_called()
+
+    def test_appointment_consultation_uses_cloudflare_after_gemini_504_failover(self):
         from app.core.config import Settings
         transient = RuntimeError("gateway timeout")
         transient.code = 504
@@ -328,7 +422,7 @@ class CloudflareChatProviderTests(unittest.TestCase):
         ):
             reply = self.provider.answer_consultation("Patient reports fever", intake_reply=True)
         self.assertEqual(reply, "How long have you had the fever?")
-        self.assertEqual(generate.call_count, 4)  # primary, backup once, then two primary retries
+        self.assertEqual(generate.call_count, 2)  # primary + immediate Gemini fallback
         fallback.assert_called_once()
         self.assertEqual(fallback.call_args.kwargs["max_tokens"], 512)
         self.assertTrue(fallback.call_args.kwargs["disable_reasoning"])

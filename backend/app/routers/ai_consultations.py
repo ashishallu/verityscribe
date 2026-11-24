@@ -24,6 +24,7 @@ from ..services.ai_consultation import (
     emergency_warning, generate_reply, generate_summary, patient_context,
     store_approved_case,
 )
+from ..services.ai_service import GeminiUpstreamError
 from ..services.appointment_expiry import ensure_appointment_not_expired
 from ..services.gemini_live import gemini_live
 router = APIRouter(prefix="/ai-consultations", tags=["AI consultations"])
@@ -637,7 +638,18 @@ def _send_message(client, session: dict[str, Any], content: str, request_key: st
                 reason = "unsuccessful_response"
             elif message == "Cloudflare Workers AI returned an empty answer":
                 reason = "empty_answer"
-        logger.warning("AI consultation provider unavailable (%s, reason=%s)", type(exc).__name__, reason)
+        if isinstance(exc, GeminiUpstreamError):
+            logger.warning(
+                "AI consultation provider unavailable provider=gemini stage=%s upstream_status=%s error=%s",
+                exc.stage,
+                exc.status if exc.status is not None else "none",
+                exc.provider_message,
+            )
+        else:
+            logger.warning(
+                "AI consultation provider unavailable (%s, reason=%s)",
+                type(exc).__name__, reason,
+            )
         raise HTTPException(status_code=503, detail="Your message was saved. The AI reply is temporarily unavailable; you can retry your message.")
     try:
         assistant_message = client.table("ai_consultation_messages").insert({
