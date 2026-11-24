@@ -25,6 +25,16 @@ def test_summary_timeout_defaults_are_bounded_and_environment_overridable(monkey
     assert Settings(_env_file=None).ai_summary_timeout_seconds == 10.0
 
 
+def test_cloudflare_summary_timeout_honors_remaining_provider_budget():
+    from app.services.ai_service import AIProvider
+
+    provider = AIProvider()
+    with patch.object(provider, "_cloudflare_chat", return_value="summary") as chat:
+        assert provider.summarize_consultation("synthetic test", timeout_seconds=4.25) == "summary"
+
+    assert chat.call_args.kwargs["timeout"] == 4.25
+
+
 def test_live_model_defaults_to_documented_target_and_keeps_rollback(monkeypatch):
     monkeypatch.delenv("GEMINI_LIVE_MODEL", raising=False)
     assert Settings(_env_file=None).gemini_live_model == "gemini-3.8-live"

@@ -1396,10 +1396,12 @@ class AIProvider:
                         "Gemini text chat temporarily unavailable after primary and fallback failures"
                     ) from cloudflare_exc
 
-    def summarize_consultation(self, prompt: str) -> str:
+    def summarize_consultation(self, prompt: str, *, timeout_seconds: float | None = None) -> str:
         """Use the configured Cloudflare text model only if Gemini summary fails."""
         config = settings()
         timeout = max(5.0, min(12.0, float(config.ai_summary_timeout_seconds)))
+        if timeout_seconds is not None:
+            timeout = min(timeout, max(0.1, float(timeout_seconds)))
         model = config.cloudflare_summary_model.strip() or self.SUMMARY_MODEL
         return self._cloudflare_chat(
             prompt, timeout=timeout, max_tokens=900, model=model,

@@ -20,6 +20,7 @@ CompletionHandler = Callable[[], Awaitable[None]]
 # The post-call summarizer is a separate text-generation model; it is not the
 # real-time voice model. Keep the default configurable for deployments.
 SUMMARY_MODEL = "gemini-3.8-flash"
+SUMMARY_PROVIDER_BUDGET_SECONDS = 15.0
 
 
 def _bind_tool_context_annotation(function: Any, tool_context_type: type) -> None:
@@ -342,6 +343,11 @@ class GeminiLiveService:
 
         response_data = None
         gemini_error: Exception | None = None
+        provider_deadline = time.perf_counter() + SUMMARY_PROVIDER_BUDGET_SECONDS
+
+        def remaining_provider_budget() -> float:
+            return max(0.0, provider_deadline - time.perf_counter())
+
         primary_cooldown = _gemini_quota_cooldown_remaining(self.google_api_key, summary_model)
         if primary_cooldown > 0:
             logger.info(
@@ -350,6 +356,10 @@ class GeminiLiveService:
             )
             gemini_error = RuntimeError("Gemini summary model is in its recent-429 cooldown")
         for attempt in range(0 if primary_cooldown > 0 else 2):
+            remaining = remaining_provider_budget()
+            if remaining <= 0:
+                gemini_error = TimeoutError("consultation summary provider budget exhausted")
+                break
             started = time.perf_counter()
             try:
                 # google-genai 1.36 (the project's pinned SDK) does not expose
@@ -372,8 +382,8 @@ class GeminiLiveService:
                         },
                     },
                     timeout=httpx.Timeout(
-                        max(5.0, min(8.0, float(getattr(self, "summary_primary_timeout_seconds", 8.0)))),
-                        connect=3.0,
+                        min(8.0, remaining),
+                        connect=min(3.0, remaining),
                     ),
                 )
                 response.raise_for_status()
@@ -519,6 +529,9 @@ class GeminiLiveService:
         ):
             fallback_started = time.perf_counter()
             try:
+                remaining = remaining_provider_budget()
+                if remaining <= 0:
+                    raise TimeoutError("consultation summary provider budget exhausted")
                 fallback_response = httpx.post(
                     "https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{fallback_model.replace('/', '%2F')}:generateContent",
@@ -532,8 +545,8 @@ class GeminiLiveService:
                         },
                     },
                     timeout=httpx.Timeout(
-                        max(5.0, min(8.0, float(getattr(self, "summary_fallback_timeout_seconds", 8.0)))),
-                        connect=3.0,
+                        min(8.0, remaining),
+                        connect=min(3.0, remaining),
                     ),
                 )
                 fallback_response.raise_for_status()
@@ -586,7 +599,12 @@ class GeminiLiveService:
             try:
                 from .ai_service import ai_provider
 
-                response_text = ai_provider.summarize_consultation(prompt)
+                remaining = remaining_provider_budget()
+                if remaining <= 0:
+                    raise TimeoutError("consultation summary provider budget exhausted")
+                response_text = ai_provider.summarize_consultation(
+                    prompt, timeout_seconds=remaining
+                )
                 parsed = parse_summary(response_text)
                 summary_provider = "cloudflare"
                 logger.info(
