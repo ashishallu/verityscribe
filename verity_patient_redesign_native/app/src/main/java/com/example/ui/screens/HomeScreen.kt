@@ -57,6 +57,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -87,6 +88,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.health.connect.client.PermissionController
@@ -97,6 +99,7 @@ import coil.compose.AsyncImage
 import com.example.data.GoogleFitHealthConnectManager
 import com.example.data.HealthBridgeStatus
 import com.example.model.Appointment
+import com.example.model.AppointmentExpiry
 import com.example.model.HealthSnapshotMetric
 import com.example.ui.components.VerityGlassBackdrop
 import com.example.ui.components.VerityGlassCard
@@ -451,9 +454,20 @@ private fun TodayAtAGlanceDeckSection(
     onReschedule: (Appointment) -> Unit,
     onJoinCall: (Appointment) -> Unit
 ) {
-    if (appointments.isEmpty()) return
+    var now by remember { mutableStateOf(java.time.LocalDateTime.now()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            now = java.time.LocalDateTime.now()
+        }
+    }
+    val visibleAppointments = appointments.withIndex()
+        .filterNot { AppointmentExpiry.isExpired(it.value, now) }
+    if (visibleAppointments.isEmpty()) return
 
-    val safeIndex = currentIndex.coerceIn(0, appointments.lastIndex)
+    val selectedVisibleIndex = visibleAppointments.indexOfFirst { it.index == currentIndex }
+    val safeIndex = selectedVisibleIndex.takeIf { it >= 0 } ?: 0
+    val visibleCount = visibleAppointments.size
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val swipeThresholdPx = with(density) { 96.dp.toPx() }
@@ -462,14 +476,14 @@ private fun TodayAtAGlanceDeckSection(
     var isAnimating by remember { mutableStateOf(false) }
 
     fun animateAndSwitch(direction: Float, targetIndex: Int) {
-        if (isAnimating || appointments.size <= 1) return
+        if (isAnimating || visibleCount <= 1) return
         scope.launch {
             isAnimating = true
             dragOffsetX.animateTo(
                 targetValue = direction * throwDistancePx,
                 animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing)
             )
-            onSelectIndex(targetIndex)
+            onSelectIndex(visibleAppointments[targetIndex].index)
             dragOffsetX.snapTo(0f)
             isAnimating = false
         }
@@ -490,7 +504,7 @@ private fun TodayAtAGlanceDeckSection(
                     color = PlatinumWhite
                 )
                 Text(
-                    text = "${safeIndex + 1} of ${appointments.size} • Swipe card",
+                    text = "${safeIndex + 1} of $visibleCount • Swipe card",
                     style = MaterialTheme.typography.bodySmall,
                     color = PeriwinkleMist
                 )
@@ -523,10 +537,10 @@ private fun TodayAtAGlanceDeckSection(
                 }
                 IconButton(
                     onClick = {
-                        val next = (safeIndex + 1).coerceAtMost(appointments.lastIndex)
+                        val next = (safeIndex + 1).coerceAtMost(visibleCount - 1)
                         animateAndSwitch(1f, next)
                     },
-                    enabled = safeIndex < appointments.lastIndex && !isAnimating,
+                    enabled = safeIndex < visibleCount - 1 && !isAnimating,
                     modifier = Modifier
                         .size(48.dp)
                         .testTag("appointment_next_button")
@@ -542,7 +556,7 @@ private fun TodayAtAGlanceDeckSection(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                             contentDescription = "Next appointment",
-                            tint = if (safeIndex < appointments.lastIndex) PlatinumWhite else SilverText.copy(alpha = 0.4f)
+                            tint = if (safeIndex < visibleCount - 1) PlatinumWhite else SilverText.copy(alpha = 0.4f)
                         )
                     }
                 }
@@ -552,7 +566,7 @@ private fun TodayAtAGlanceDeckSection(
         Spacer(modifier = Modifier.height(10.dp))
 
         val dragProgress = (abs(dragOffsetX.value) / (swipeThresholdPx * 1.6f)).coerceIn(0f, 1f)
-        val visibleLayers = appointments.size.coerceAtMost(3)
+        val visibleLayers = visibleCount.coerceAtMost(3)
 
         // Stacked deck: back layers drawn underneath the front interactive card
         Box(
@@ -563,8 +577,8 @@ private fun TodayAtAGlanceDeckSection(
             contentAlignment = Alignment.TopCenter
         ) {
             for (layerOffset in (visibleLayers - 1) downTo 0) {
-                val cardIndex = (safeIndex + layerOffset) % appointments.size
-                val appointment = appointments[cardIndex]
+                val cardIndex = (safeIndex + layerOffset) % visibleCount
+                val appointment = visibleAppointments[cardIndex].value
 
                 key(appointment.id, layerOffset) {
                     when (layerOffset) {
@@ -628,8 +642,8 @@ private fun TodayAtAGlanceDeckSection(
                                         rotationZ = tiltDegrees
                                         alpha = frontAlpha
                                     }
-                                    .pointerInput(safeIndex, appointments.size) {
-                                        if (appointments.size <= 1) return@pointerInput
+                                    .pointerInput(safeIndex, visibleCount) {
+                                        if (visibleCount <= 1) return@pointerInput
                                         detectHorizontalDragGestures(
                                             onHorizontalDrag = { _, dragAmount ->
                                                 if (!isAnimating) {
@@ -642,7 +656,7 @@ private fun TodayAtAGlanceDeckSection(
                                                 if (isAnimating) return@detectHorizontalDragGestures
                                                 if (abs(dragOffsetX.value) > swipeThresholdPx) {
                                                     val dir = if (dragOffsetX.value >= 0f) 1f else -1f
-                                                    val nextIndex = (safeIndex + 1) % appointments.size
+                                                    val nextIndex = (safeIndex + 1) % visibleCount
                                                     animateAndSwitch(dir, nextIndex)
                                                 } else {
                                                     scope.launch {

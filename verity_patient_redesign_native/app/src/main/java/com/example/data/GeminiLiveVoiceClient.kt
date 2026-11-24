@@ -67,6 +67,7 @@ class GeminiLiveVoiceClient(
     private var voicedFrameCount = 0
     private var silenceFrameCount = 0
     private var inputObservedThisTurn = false
+    private var openingGreetingSent = false
 
     suspend fun connect() {
         withContext(Dispatchers.IO) {
@@ -228,6 +229,17 @@ class GeminiLiveVoiceClient(
             flushPendingAudio()
             if (!ready.isCompleted) ready.complete(Unit)
             onReady()
+            if (!openingGreetingSent) {
+                openingGreetingSent = true
+                socket?.send(JSONObject().put("clientContent", JSONObject()
+                    .put("turns", org.json.JSONArray().put(JSONObject()
+                        .put("role", "user")
+                        .put("parts", org.json.JSONArray().put(JSONObject().put(
+                            "text",
+                            "Greet the patient warmly and briefly, then ask one focused question: what is bothering them today? Follow the consultation instructions already configured for this session."
+                        )))))
+                    .put("turnComplete", true)).toString())
+            }
             return
         }
         val content = envelope.optJSONObject("serverContent") ?: return

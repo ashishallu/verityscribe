@@ -172,6 +172,8 @@ class AIConsultationServiceTests(unittest.TestCase):
     self.assertEqual(reply, "When did it start?")
     prompt = generate.call_args.args[0]
     self.assertIn("Ask exactly one relevant follow-up question per response", prompt)
+    self.assertIn("thank the patient", prompt)
+    self.assertIn("Do not volunteer generic or repetitive disclaimers", prompt)
     generate.assert_called_once_with(prompt, intake_reply=True)
 
   def test_similar_case_retrieval_uses_symptom_terms_and_authenticated_scope(self):

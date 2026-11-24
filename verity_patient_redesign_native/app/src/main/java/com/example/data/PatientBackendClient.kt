@@ -456,7 +456,9 @@ class PatientBackendClient(
             dateLabel = runCatching { SimpleDateFormat("EEE, dd MMM", Locale.getDefault()).format(SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).parse(optString("appointment_date"))!!) }.getOrDefault(optString("appointment_date")),
             timeLabel = optString("appointment_time"), consultationType = displayType,
             notes = listOf(optString("reason_for_visit"), optString("notes")).filter(String::isNotBlank).joinToString(" • "),
-            avatarRes = R.drawable.img_doctor_meera
+            avatarRes = R.drawable.img_doctor_meera,
+            appointmentDateIso = optString("appointment_date"),
+            appointmentTimeIso = optString("appointment_time")
         )
     }
 

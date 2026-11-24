@@ -4,10 +4,13 @@ import org.junit.Assert.*
 import org.junit.Test
 import com.example.model.MedicalReport
 import com.example.model.deduplicateMedicalReports
+import com.example.model.Appointment
+import com.example.model.AppointmentExpiry
 import com.example.data.VeritySeedData
 import com.example.ui.screens.availableBookingSlots
 import com.example.ui.screens.generateNext15Days
 import java.time.LocalDate
+import java.time.LocalDateTime
 
 /**
  * Example local unit test, which will execute on the development machine (host).
@@ -67,5 +70,23 @@ class ExampleUnitTest {
       )
     )
     assertEquals(listOf("one", "three"), results.map { it.id })
+  }
+
+  @Test
+  fun todayAtAGlanceExpiresAppointmentsThirtyMinutesAfterScheduledStart() {
+    val appointment = Appointment(
+      id = "today",
+      doctorName = "Dr. Example",
+      specialty = "General Medicine",
+      hospital = "Verity Hospital",
+      dateLabel = "24 Nov",
+      timeLabel = "10:00 AM",
+      notes = "",
+      avatarRes = 0,
+      appointmentDateIso = "2026-11-24",
+      appointmentTimeIso = "10:00:00"
+    )
+    assertFalse(AppointmentExpiry.isExpired(appointment, LocalDateTime.parse("2026-11-24T10:29:59")))
+    assertTrue(AppointmentExpiry.isExpired(appointment, LocalDateTime.parse("2026-11-24T10:30:00")))
   }
 }

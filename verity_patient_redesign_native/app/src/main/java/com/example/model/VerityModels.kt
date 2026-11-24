@@ -20,7 +20,9 @@ data class Appointment(
     val timeLabel: String,
     val consultationType: String = ConsultationType.VIDEO.label,
     val notes: String,
-    @DrawableRes val avatarRes: Int
+    @DrawableRes val avatarRes: Int,
+    val appointmentDateIso: String = "",
+    val appointmentTimeIso: String = ""
 )
 
 data class PharmacyPrice(

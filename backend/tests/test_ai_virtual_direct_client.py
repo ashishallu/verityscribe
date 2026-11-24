@@ -158,7 +158,11 @@ def test_direct_credential_keeps_patient_context_server_side(monkeypatch):
     assert "responseModalities" not in response["config"]
     assert "speechConfig" not in response["config"]
     bound_config = captured["token_config"].live_connect_constraints.config
-    assert bound_config.kwargs["system_instruction"].parts[0].text.find(patient_marker) >= 0
+    instruction = bound_config.kwargs["system_instruction"].parts[0].text
+    assert patient_marker in instruction
+    assert "one focused follow-up at a time" in instruction
+    assert "thank the patient" in instruction
+    assert "generic or repetitive disclaimers" in instruction
     assert captured["token_config"].uses == 1
     assert captured["token_config"].live_connect_constraints.model == live.model
 
