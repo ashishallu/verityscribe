@@ -134,6 +134,10 @@ class _InsertOnlyClient:
 
 
 class SessionScopedDocumentTests(unittest.TestCase):
+    def setUp(self):
+        from app.services import ai_service
+        ai_service._PATIENT_CHAT_CLIENTS.clear()
+
     def test_patient_chat_uses_gemini_and_returns_generated_text(self):
         class _Models:
             def generate_content(self, **kwargs):
@@ -216,7 +220,7 @@ class SessionScopedDocumentTests(unittest.TestCase):
             answer = AIProvider().answer("Patient reports fever.")
 
         self.assertEqual(answer, "How long has the fever lasted?")
-        self.assertEqual(models.models, ["primary-model"] * 3 + ["gemini-3.5-flash-lite"])
+        self.assertEqual(models.models, ["primary-model", "gemini-3.5-flash-lite"])
 
     def test_session_creation_uses_supported_insert_execute_response(self):
         client = _InsertOnlyClient()
@@ -382,6 +386,9 @@ class SessionScopedDocumentTests(unittest.TestCase):
                 {"sub": "patient-a", "app_metadata": {"role": "patient"}},
             )
         self.assertIn("MODE: GENERAL", captured["prompt"])
+        self.assertIn("general medical and medication questions directly", captured["prompt"])
+        self.assertNotIn("using only supplied verified record or document facts", captured["prompt"])
+        self.assertIn("RECENT CHAT TURNS", captured["prompt"])
         self.assertNotIn("Drug A 10 mg", captured["prompt"])
         self.assertNotIn("DOCUMENT EVIDENCE", captured["prompt"])
 
@@ -402,9 +409,9 @@ class SessionScopedDocumentTests(unittest.TestCase):
             )
 
         self.assertIn("Do not conduct an intake or ask follow-up questions", captured["prompt"])
-        self.assertIn("Never invent findings or give a diagnosis", captured["prompt"])
-        self.assertIn("suggest booking an appointment", captured["prompt"])
-        self.assertIn("Do not append generic emergency disclaimers", captured["prompt"])
+        self.assertIn("Never invent patient-specific findings", captured["prompt"])
+        self.assertIn("suggest booking with an appropriate clinician", captured["prompt"])
+        self.assertIn("Avoid boilerplate emergency disclaimers", captured["prompt"])
         self.assertEqual(result["data"]["answer"], "You can book an appointment with a clinician through the Appointments tab.")
         self.assertEqual([row["sender_type"] for row in client.messages], ["user", "assistant"])
 

@@ -29,6 +29,8 @@ from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 _ASR_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="cloudflare-asr")
+_PATIENT_CHAT_CLIENTS: dict[tuple[str, int], object] = {}
+_PATIENT_CHAT_CLIENT_LOCK = threading.Lock()
 _GEMINI_QUOTA_COOLDOWN_SECONDS = 60.0
 _GEMINI_QUOTA_COOLDOWNS: dict[tuple[str, str], float] = {}
 _GEMINI_QUOTA_COOLDOWN_LOCK = threading.Lock()
@@ -228,6 +230,25 @@ class AIProvider:
     # the model selected by Pydantic settings; the old Qwen 3 30B route returns
     # HTTP 410 after its retirement.
     PATIENT_CHAT_GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+
+    @staticmethod
+    def _patient_chat_client(api_key: str, timeout_ms: int):
+        """Reuse the Gemini client (and its pooled HTTP transports) across turns."""
+        cache_key = (api_key, timeout_ms)
+        with _PATIENT_CHAT_CLIENT_LOCK:
+            client = _PATIENT_CHAT_CLIENTS.get(cache_key)
+            if client is None:
+                from google import genai
+                from google.genai import types
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(
+                        timeout=timeout_ms,
+                        retry_options=types.HttpRetryOptions(attempts=1),
+                    ),
+                )
+                _PATIENT_CHAT_CLIENTS[cache_key] = client
+            return client
     # Separate clinical-summary fallback model. The chat model above is kept
     # stable for existing AI Chat callers; this model replaces it only for
     # consultation summaries and can be overridden during model rollouts.
@@ -951,27 +972,20 @@ class AIProvider:
 
         timeout_ms = int(max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35")))) * 1000)
         try:
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(
-                    timeout=timeout_ms,
-                    retry_options=types.HttpRetryOptions(attempts=1),
-                ),
-            )
+            client = self._patient_chat_client(api_key, timeout_ms)
         except Exception as exc:
             raise RuntimeError(
                 f"Gemini patient chat client initialization failed ({type(exc).__name__})"
             ) from exc
 
-        for attempt in range(3):
+        # One primary attempt then immediate model failover avoids several
+        # seconds of backoff before the fallback can begin.
+        for attempt in range(1):
             try:
                 response = client.models.generate_content(
                     model=model,
                     contents=prompt,
-                    config={"temperature": 0.2, "max_output_tokens": 512},
+                    config={"temperature": 0.2, "max_output_tokens": 220},
                 )
                 answer = getattr(response, "text", None)
                 if not isinstance(answer, str) or not answer.strip():
@@ -998,7 +1012,7 @@ class AIProvider:
                     raise RuntimeError(
                         f"Gemini patient chat request failed ({type(exc).__name__})"
                     ) from exc
-                if attempt == 2:
+                if attempt == 0:
                     fallback_model = self.PATIENT_CHAT_GEMINI_FALLBACK_MODEL
                     if model == fallback_model:
                         raise RuntimeError(
@@ -1014,7 +1028,7 @@ class AIProvider:
                         fallback_response = client.models.generate_content(
                             model=fallback_model,
                             contents=prompt,
-                            config={"temperature": 0.2, "max_output_tokens": 512},
+                            config={"temperature": 0.2, "max_output_tokens": 220},
                         )
                         fallback_answer = getattr(fallback_response, "text", None)
                         if not isinstance(fallback_answer, str) or not fallback_answer.strip():
@@ -1048,6 +1062,40 @@ class AIProvider:
                     delay,
                 )
                 time.sleep(delay)
+
+    async def stream_answer(self, prompt: str):
+        """Yield Gemini text deltas; fail over only before any primary text is emitted."""
+        config = settings()
+        api_key = config.google_api_key.strip()
+        model = config.gemini_chat_model.strip()
+        fallback_model = self.PATIENT_CHAT_GEMINI_FALLBACK_MODEL
+        if not api_key or not model:
+            raise RuntimeError("Gemini patient chat is not configured")
+        timeout_ms = int(max(10.0, min(60.0, float(os.getenv("AI_CHAT_TIMEOUT_SECONDS", "35")))) * 1000)
+        client = self._patient_chat_client(api_key, timeout_ms)
+        for model_id in (model, fallback_model):
+            emitted = False
+            try:
+                stream = await client.aio.models.generate_content_stream(
+                    model=model_id,
+                    contents=prompt,
+                    config={"temperature": 0.2, "max_output_tokens": 220},
+                )
+                async for chunk in stream:
+                    text = getattr(chunk, "text", None)
+                    if isinstance(text, str) and text:
+                        emitted = True
+                        yield text
+                if emitted:
+                    return
+                raise RuntimeError("Gemini patient chat returned an empty stream")
+            except Exception as exc:
+                if emitted or model_id == fallback_model:
+                    raise RuntimeError(
+                        f"Gemini patient chat stream failed ({type(exc).__name__})"
+                    ) from exc
+                logger.warning("patient_chat_stream_fallback primary_model=%s fallback_model=%s error_type=%s",
+                               model, fallback_model, type(exc).__name__)
 
     def answer_doctor_assistant(self, prompt: str) -> str:
         """Generate doctor-assistant text with Gemini, without provider fallback.

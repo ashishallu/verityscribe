@@ -68,6 +68,8 @@ class _GeminiRestAdapter:
 
 class CloudflareChatProviderTests(unittest.TestCase):
     def setUp(self):
+        from app.services import ai_service
+        ai_service._PATIENT_CHAT_CLIENTS.clear()
         self.provider = AIProvider()
         _gemini_consultation_client.cache_clear()
         with _GEMINI_QUOTA_COOLDOWN_LOCK:
