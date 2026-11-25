@@ -1930,6 +1930,112 @@ def doctor_review_detail(appointment_id: str, doctor: dict = Depends(get_current
     return {"data": {**_response(client, session, include_similar_cases=True), "appointment": appointment, "patient": patient}}
 
 
+@router.post("/doctor/sessions/{session_id}/retry-summary")
+def retry_doctor_consultation_summary(
+    session_id: str,
+    doctor: dict = Depends(get_current_doctor),
+):
+    """Regenerate a failed AI consultation summary for its assigned doctor."""
+    client = db()
+    session = _session_or_404(client, session_id, doctor_id=doctor["id"])
+    if session.get("mode") not in AI_TYPES:
+        raise HTTPException(status_code=422, detail="This is not an AI consultation")
+
+    original_status = session.get("status")
+    if original_status not in {"awaiting_doctor_review", "failed"}:
+        raise HTTPException(status_code=409, detail="This summary is not ready to retry")
+    if original_status != "failed" and not _summary_needs_regeneration(session):
+        raise HTTPException(status_code=409, detail="This consultation does not have a failed summary")
+
+    appointment = _maybe_single_data(
+        client.table("appointments").select("*")
+        .eq("id", session["appointment_id"])
+        .eq("doctor_id", doctor["id"])
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found for this doctor")
+    messages = _messages(client, session_id)
+    if not messages:
+        raise HTTPException(status_code=409, detail="No saved transcript is available to summarize")
+
+    now = datetime.now(timezone.utc).isoformat()
+    claimed = client.table("ai_consultation_sessions").update({
+        "status": "processing",
+        "updated_at": now,
+    }).eq("id", session_id).eq("doctor_id", doctor["id"]).eq(
+        "status", original_status
+    ).execute().data or []
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Another request is already regenerating this summary")
+
+    interview_complete = bool(
+        session.get("summary", {}).get("interview_complete", False)
+    ) if session.get("mode") == "ai_virtual" and isinstance(session.get("summary"), dict) else session.get("mode") != "ai_virtual"
+    try:
+        if session["mode"] == "ai_virtual":
+            verified_context = patient_context(client, session["patient_id"])
+            summary = gemini_live.generate_consultation_summary(
+                transcript=messages,
+                patient_context=verified_context,
+                appointment=appointment,
+                interview_complete=interview_complete,
+            )
+            summary["interview_state"] = "complete" if interview_complete else "ended_early"
+            summary["completion_status"] = summary["interview_state"]
+        else:
+            summary = generate_summary(
+                client,
+                patient_id=session["patient_id"],
+                hospital_id=session["hospital_id"],
+                mode=session["mode"],
+                appointment=appointment,
+                messages=messages,
+                similar_case_consent=bool(session.get("similar_case_consent_at")),
+            )
+        summary.pop("summary_error_reason", None)
+        summary["summary_generation_status"] = "generated"
+        summary["summary_id"] = str(uuid.uuid4())
+        summary["session_id"] = session_id
+        summary.setdefault("generated_at", datetime.now(timezone.utc).isoformat())
+    except Exception as exc:
+        reason = str(getattr(exc, "summary_error_reason", "summary_provider_unavailable"))
+        if not re.fullmatch(r"[a-z0-9_]{1,160}", reason):
+            reason = "summary_provider_unavailable"
+        logger.exception(
+            "Doctor-triggered AI consultation summary retry failed mode=%s error_type=%s summary_error_reason=%s",
+            session["mode"], type(exc).__name__, reason,
+        )
+        summary = _fallback_clinical_summary(messages, interview_complete=interview_complete)
+        summary.update({
+            "summary_generation_status": "failed",
+            "summary_error_reason": reason,
+            "summary_id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "completion_status": "incomplete",
+        })
+
+    updated = client.table("ai_consultation_sessions").update({
+        "status": "awaiting_doctor_review",
+        "summary": summary,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", session_id).eq("doctor_id", doctor["id"]).eq(
+        "status", "processing"
+    ).execute().data or []
+    if not updated:
+        raise HTTPException(status_code=503, detail="The regenerated summary could not be saved")
+
+    patient = _maybe_single_data(
+        client.table("profiles").select("id,first_name,last_name")
+        .eq("id", session["patient_id"])
+    )
+    refreshed = updated[0]
+    return {"data": {
+        **_response(client, refreshed, include_similar_cases=True),
+        "appointment": appointment,
+        "patient": patient,
+    }}
+
+
 @router.post("/doctor/sessions/{session_id}/review")
 def review_consultation(session_id: str, payload: ReviewRequest, doctor: dict = Depends(get_current_doctor)):
     client = db()
