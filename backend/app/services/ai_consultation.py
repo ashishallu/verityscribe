@@ -196,14 +196,19 @@ def generate_summary(
     ]
     prompt = f"""Create a clinician-review draft for this AI {mode} consultation.
 Use only transcript/context facts. Never infer an unreported fact. This output is a draft for a
-physician, not patient-facing diagnosis, advice, or prescription. Medication entries are
-unapproved candidates only and MUST be left empty unless the available verified chart context
-supports safe clinician consideration. Never recommend a candidate that conflicts with a
-verified allergy, condition, or current medication. Do not invent patient-specific dosage,
-frequency, or duration; leave those fields blank unless explicitly supported by verified
-clinician-entered context. Patient-reported allergies/medications must be preserved as reports,
-not treated as verified or used as a prescription source. Clinical advice is a draft for the
-physician to review, not instructions for the patient to follow before approval.
+physician, not patient-facing diagnosis, advice, or prescription. After writing clinical_summary,
+review that concise summary and the documented symptom details for relevant generic medication
+options that a physician may consider. Do not leave suggested_medications empty solely because
+there is no current medication or allergy data in the chart; include a small, evidence-linked
+candidate list only when the documented symptoms reasonably support consideration. These are
+NOT prescriptions or patient instructions. Never claim a candidate is safe for this patient or
+conflicts with a verified allergy, condition, or current medication. Because contraindications
+may be unknown, put a physician verification note in instructions (including checking allergies,
+age, pregnancy status where relevant, comorbidities, and interactions). Do not invent patient-
+specific dosage, frequency, or duration; leave those fields blank unless explicitly supported by
+verified clinician-entered context. Patient-reported allergies/medications must be preserved as
+reports, not treated as verified or used as a prescription source. Clinical advice is a draft for
+the physician to review, not instructions for the patient to follow before approval.
 Leave unknown items empty or null. Do not fabricate citations or similar cases.
 Return only valid JSON with these keys: clinical_summary (string), symptoms (array of objects
 with name, duration, severity, frequency, source_message_id), relevant_history (array),
@@ -212,9 +217,10 @@ medications (array), allergies (array), clinical_considerations (array), suggest
 suggested_medications (array of objects with name, dosage, frequency, duration, instructions),
 clinical_advice (array of concise strings), evidence_references (array), uncertainties (array),
 warning_indicators (array), similar_cases (object with status and matches).
-Set suggested_medications to [] when safety or evidence is uncertain. Clearly label all generated
-medication suggestions as unapproved candidates requiring physician verification, and describe
-clinical considerations as unconfirmed.
+Set suggested_medications to [] when the documented symptoms do not support a reasonable generic
+option or when a potential contraindication in the available verified context cannot be resolved.
+Clearly label all generated medication suggestions as unapproved candidates requiring physician
+verification, and describe clinical considerations as unconfirmed.
 Similar cases, when supplied, are de-identified, doctor-approved symptom patterns from this hospital.
 They are contextual examples only, never evidence about this patient and never a diagnosis.
 

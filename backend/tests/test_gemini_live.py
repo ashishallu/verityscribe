@@ -245,6 +245,10 @@ def test_virtual_summary_uses_gemini_json_and_preserves_incomplete_state():
     assert "Problem; Symptoms and course" in serialized
     assert "Medications" in serialized
     assert "physician review is mandatory" in serialized.lower()
+    assert "review it and the documented symptoms for relevant" in serialized
+    assert "Do not leave suggested_medications empty only" in serialized
+    assert "These are not prescriptions or patient instructions" in serialized
+    assert "leave those fields blank unless verified clinician-" in serialized
     assert "entire" not in serialized.lower()  # concise summary contract, not an exhaustive narrative
 
 

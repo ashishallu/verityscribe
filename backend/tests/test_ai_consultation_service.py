@@ -93,7 +93,7 @@ class AIConsultationServiceTests(unittest.TestCase):
     self.assertFalse(ai_consultation.emergency_warning("My ankle aches after running"))
 
   def test_summary_never_returns_a_prescription_or_unverified_cases(self):
-    with patch.object(ai_consultation.ai_provider, "answer_consultation", return_value='{"clinical_summary":"Patient reports headache","draft_prescription":{"medicine":"made up"},"suggested_medications":[{"name":"Candidate","dosage":"","frequency":"","duration":"","instructions":"Review first"}],"clinical_advice":["Hydration for clinician review."],"similar_cases":{"matches":["made up"]}}'):
+    with patch.object(ai_consultation.ai_provider, "answer_consultation", return_value='{"clinical_summary":"Patient reports headache","draft_prescription":{"medicine":"made up"},"suggested_medications":[{"name":"Candidate","dosage":"","frequency":"","duration":"","instructions":"Review first"}],"clinical_advice":["Hydration for clinician review."],"similar_cases":{"matches":["made up"]}}') as generate:
       result = ai_consultation.generate_summary(
           _Client(), patient_id="patient-test", hospital_id="hospital-test", mode="ai_chat",
           appointment={"id": "appointment-test", "consultation_type": "ai_chat"}, messages=[],
@@ -107,6 +107,11 @@ class AIConsultationServiceTests(unittest.TestCase):
     self.assertEqual(result["suggested_medications_status"], "requires_doctor_review")
     self.assertEqual(result["clinical_advice"], ["Hydration for clinician review."])
     self.assertEqual(result["clinical_advice_status"], "requires_doctor_review")
+    prompt = generate.call_args.args[0]
+    self.assertIn("review that concise summary", prompt)
+    self.assertIn("Do not leave suggested_medications empty solely because", prompt)
+    self.assertIn("not prescriptions or patient instructions", prompt.lower())
+    self.assertIn("leave those fields blank", prompt)
 
   def test_chat_summary_parses_json_fenced_output(self):
     response = '```json\n{"clinical_summary":"Patient reports fever for two days.","symptoms":[]}\n```'
