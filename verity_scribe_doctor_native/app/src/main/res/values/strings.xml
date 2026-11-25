@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">VerityScribe</string>
+    <string name="sign_in_title">VerityScribe Doctor</string>
+    <string name="sign_in_subtitle">Clinical Precision Physician Workspace</string>
+    <string name="nav_home">Home</string>
+    <string name="nav_patients">Patients</string>
+    <string name="nav_assist">Assist</string>
+    <string name="nav_profile">Profile</string>
+    <string name="ai_draft_warning_banner">AI-Generated Intake Draft — Requires Physician Review &amp; Approval.</string>
+    <string name="consent_verified_label">Consent Verified</string>
+    <string name="retry_summary_button">Retry Summary</string>
+    <string name="approve_and_link_button">Approve &amp; Link to Record</string>
+    <string name="reject_draft_button">Reject Draft</string>
+    <string name="edit_draft_button">Edit Draft</string>
+    <string name="assist_title">Clinical AI Assistant</string>
+    <string name="assist_subtitle">Grounded in the local demonstration record.</string>
+    <string name="directory_title">Patient directory</string>
+    <string name="directory_search_hint">Search name, ID, disease, medicine...</string>
+</resources>

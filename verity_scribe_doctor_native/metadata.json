@@ -1,0 +1,6 @@
+{
+  "name": "VerityScribe Doctor",
+  "description": "Clinical precision physician workspace for AI-assisted intake review, patient directory, clinical documentation, and e-prescribing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
