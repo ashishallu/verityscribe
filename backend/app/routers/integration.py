@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -9,6 +9,7 @@ import time
 import uuid
 from functools import lru_cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -1817,14 +1818,32 @@ def create_appointment(payload: AppointmentCreate, claims: dict = Depends(curren
 
 
 @router.get("/me/appointments")
-def my_appointments(claims: dict = Depends(current_claims)):
+def my_appointments(include_past: bool = Query(False), claims: dict = Depends(current_claims)):
     client = db()
     role = claims.get("app_metadata", {}).get("role")
     column = "patient_id" if role == "patient" else "doctor_id" if role == "doctor" else None
     if not column:
         raise HTTPException(status_code=403, detail="Appointment scope is not available for this role")
     result = client.table("appointments").select("*").eq(column, claims["sub"]).order("appointment_date").order("appointment_time").execute()
-    return {"data": _appointment_details(client, result.data or [])}
+    rows = result.data or []
+    if role != "doctor":
+        return {"data": _appointment_details(client, rows)}
+
+    if not include_past:
+        today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        rows = [row for row in rows if (row.get("appointment_date") or "")[:10] >= today_ist]
+    if not rows:
+        return {"data": []}
+
+    appointment_ids = [row["id"] for row in rows if row.get("id")]
+    sessions = client.table("ai_consultation_sessions").select(
+        "id,appointment_id,status,mode,summary,summary_generation_status,updated_at"
+    ).in_("appointment_id", appointment_ids).execute().data or []
+    session_by_appointment = {row.get("appointment_id"): row for row in sessions}
+    appointments = _appointment_details(client, rows)
+    for appointment in appointments:
+        appointment["ai_session"] = session_by_appointment.get(appointment.get("id"))
+    return {"data": appointments}
 
 
 @router.get("/appointments")
