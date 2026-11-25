@@ -30,6 +30,13 @@ from ..services.document_ocr import (
 )
 from ..services.document_tables import format_result_row
 from ..services.appointment_expiry import appointment_expiry_payload, ensure_appointment_not_expired
+from ..services.clinical_drafts import (
+    decode_free_text_prescription_notes,
+    encode_free_text_prescription_notes,
+    format_treatment_plan,
+    normalize_clinical_advice,
+    normalize_suggested_medications,
+)
 
 router = APIRouter(tags=["integration"])
 logger = logging.getLogger(__name__)
@@ -82,11 +89,75 @@ class PrescriptionItemCreate(BaseModel):
     instructions: str | None = None
 
 
+class FreeTextPrescriptionItemCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    dosage: str = Field(default="", max_length=200)
+    frequency: str = Field(default="", max_length=200)
+    duration: str = Field(default="", max_length=200)
+    instructions: str = Field(default="", max_length=1000)
+
+
+class ConsultationCompleteRequest(BaseModel):
+    clinical_note: str = Field(default="", max_length=10000)
+    diagnoses: list[str] = Field(default_factory=list, max_length=20)
+    prescriptions: list[FreeTextPrescriptionItemCreate] = Field(default_factory=list, max_length=30)
+    clinical_advice: list[str] = Field(default_factory=list, max_length=30)
+    mark_completed: bool = True
+
+
 class PrescriptionCreate(BaseModel):
     expiry_date: date | None = None
     notes: str | None = None
     is_digital: bool = True
     items: list[PrescriptionItemCreate] = Field(min_length=1)
+
+
+def _upsert_free_text_prescription(
+    client: Client,
+    *,
+    consultation_id: str,
+    patient_id: str,
+    doctor_id: str,
+    source: str,
+    source_id: str,
+    items: list[dict[str, str]],
+    clinical_advice: list[str],
+    notes: str | None = None,
+) -> dict[str, Any] | None:
+    if not items:
+        return None
+    rows = client.table("prescriptions").select("*").eq(
+        "consultation_id", consultation_id
+    ).execute().data or []
+    existing = next((
+        row for row in rows
+        if (decode_free_text_prescription_notes(row.get("notes")) or {}).get("source_id") == source_id
+        and (decode_free_text_prescription_notes(row.get("notes")) or {}).get("source") == source
+    ), None)
+    payload_notes = encode_free_text_prescription_notes(
+        items=items,
+        clinical_advice=clinical_advice,
+        source=source,
+        source_id=source_id,
+        existing_notes=notes if notes is not None else (existing or {}).get("notes"),
+    )
+    if existing:
+        result = client.table("prescriptions").update({"notes": payload_notes}).eq(
+            "id", existing["id"]
+        ).execute().data or []
+        return result[0] if result else {**existing, "notes": payload_notes}
+    result = client.table("prescriptions").insert({
+        "consultation_id": consultation_id,
+        "patient_id": patient_id,
+        "doctor_id": doctor_id,
+        "prescription_date": date.today().isoformat(),
+        "expiry_date": None,
+        "notes": payload_notes,
+        # Free-text clinician-reviewed chart entries are not signed,
+        # catalog-based electronic prescriptions.
+        "is_digital": False,
+    }).execute().data or []
+    return result[0] if result else None
 
 
 class ReportCreate(BaseModel):
@@ -1748,7 +1819,12 @@ def _appointment_detail(client: Client, appointment: dict) -> dict[str, Any]:
     return {**appointment, "patient": patient, "doctor": doctor}
 
 
-def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[str, Any]]:
+def _appointment_details(
+    client: Client,
+    appointments: list[dict],
+    *,
+    include_patient_demographics: bool = False,
+) -> list[dict[str, Any]]:
     """Resolve appointment relationships in batches for list endpoints.
 
     Calling ``_appointment_detail`` for every row performs two remote
@@ -1760,16 +1836,17 @@ def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[
         return []
     patient_ids = list({row["patient_id"] for row in appointments})
     doctor_ids = list({row["doctor_id"] for row in appointments})
-    patients = client.table("profiles").select(
-        "id,first_name,last_name,email,phone"
-    ).in_("id", patient_ids).execute().data or []
+    profile_columns = "id,first_name,last_name,email,phone"
+    if include_patient_demographics:
+        profile_columns += ",date_of_birth,gender,profile_image_url"
+    patients = client.table("profiles").select(profile_columns).in_("id", patient_ids).execute().data or []
     doctors = client.table("doctors").select(
         "*,profiles!inner(id,first_name,last_name,email,phone),"
         "hospitals!inner(id,name),departments!inner(id,name)"
     ).in_("id", doctor_ids).execute().data or []
     patients_by_id = {row["id"]: row for row in patients}
     doctors_by_id = {row["id"]: row for row in doctors}
-    return [
+    result = [
         {
             **appointment_expiry_payload(appointment),
             "patient": patients_by_id.get(appointment["patient_id"]),
@@ -1777,6 +1854,25 @@ def _appointment_details(client: Client, appointments: list[dict]) -> list[dict[
         }
         for appointment in appointments
     ]
+    if include_patient_demographics:
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        for appointment in result:
+            patient = appointment.get("patient")
+            if not patient:
+                continue
+            first = str(patient.get("first_name") or "").strip()
+            last = str(patient.get("last_name") or "").strip()
+            patient["full_name"] = " ".join(part for part in (first, last) if part) or None
+            birth_date = patient.get("date_of_birth")
+            try:
+                born = date.fromisoformat(str(birth_date)[:10]) if birth_date else None
+                patient["age"] = (
+                    today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+                    if born else None
+                )
+            except (TypeError, ValueError):
+                patient["age"] = None
+    return result
 
 
 @router.post("/appointments", status_code=status.HTTP_201_CREATED)
@@ -1837,10 +1933,10 @@ def my_appointments(include_past: bool = Query(False), claims: dict = Depends(cu
 
     appointment_ids = [row["id"] for row in rows if row.get("id")]
     sessions = client.table("ai_consultation_sessions").select(
-        "id,appointment_id,status,mode,summary,summary_generation_status,updated_at"
+        "id,appointment_id,status,mode,summary,updated_at"
     ).in_("appointment_id", appointment_ids).execute().data or []
     session_by_appointment = {row.get("appointment_id"): row for row in sessions}
-    appointments = _appointment_details(client, rows)
+    appointments = _appointment_details(client, rows, include_patient_demographics=True)
     for appointment in appointments:
         appointment["ai_session"] = session_by_appointment.get(appointment.get("id"))
     return {"data": appointments}
@@ -1892,6 +1988,87 @@ def create_consultation(payload: ConsultationCreate, doctor: dict = Depends(get_
         raise HTTPException(status_code=409, detail="A consultation already exists for this appointment")
     created = client.table("consultations").insert({"appointment_id": payload.appointment_id, "patient_id": appointment["patient_id"], "doctor_id": doctor["id"], "consultation_date": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), "symptoms": payload.symptoms, "diagnosis": payload.diagnosis, "treatment_plan": payload.treatment_plan, "follow_up_date": payload.follow_up_date.isoformat() if payload.follow_up_date else None, "consultation_type": payload.consultation_type, "consultation_fee": payload.consultation_fee}).execute().data[0]
     return {"data": created}
+
+
+@router.post("/doctor/appointments/{appointment_id}/complete")
+def complete_doctor_appointment(
+    appointment_id: str,
+    payload: ConsultationCompleteRequest,
+    doctor: dict = Depends(get_current_doctor),
+):
+    """Persist clinician-entered consultation data and complete an appointment.
+
+    Free-text medication entries are kept in the existing prescriptions.notes
+    JSON envelope because the deployed prescription_items schema requires a
+    catalog medicine_id and has no free-text name column.
+    """
+    client = db()
+    appointment = client.table("appointments").select("*").eq(
+        "id", appointment_id
+    ).maybe_single().execute().data
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if appointment.get("doctor_id") != doctor["id"]:
+        raise HTTPException(status_code=403, detail="You cannot complete this appointment")
+    if appointment.get("status") in {"cancelled", "no_show"}:
+        raise HTTPException(status_code=409, detail="This appointment cannot be completed")
+
+    diagnoses = list(dict.fromkeys(
+        value.strip()[:500]
+        for value in payload.diagnoses
+        if isinstance(value, str) and value.strip()
+    ))
+    diagnosis = "; ".join(diagnoses)[:2000] or None
+    medications = normalize_suggested_medications([
+        item.model_dump() | {"name": item.name}
+        for item in payload.prescriptions
+    ])
+    advice = normalize_clinical_advice(payload.clinical_advice)
+    treatment_plan = format_treatment_plan(payload.clinical_note, advice, medications)
+    existing = client.table("consultations").select("*").eq(
+        "appointment_id", appointment_id
+    ).eq("doctor_id", doctor["id"]).limit(1).execute().data or []
+    if existing:
+        consultation = client.table("consultations").update({
+            "symptoms": payload.clinical_note.strip() or existing[0].get("symptoms"),
+            "diagnosis": diagnosis or existing[0].get("diagnosis"),
+            "treatment_plan": treatment_plan or existing[0].get("treatment_plan"),
+        }).eq("id", existing[0]["id"]).execute().data[0]
+    else:
+        consultation = client.table("consultations").insert({
+            "appointment_id": appointment_id,
+            "patient_id": appointment["patient_id"],
+            "doctor_id": doctor["id"],
+            "consultation_date": datetime.now().astimezone().isoformat(),
+            "consultation_type": appointment.get("consultation_type"),
+            "symptoms": payload.clinical_note.strip() or appointment.get("reason_for_visit"),
+            "diagnosis": diagnosis,
+            "treatment_plan": treatment_plan,
+        }).execute().data[0]
+
+    prescription = _upsert_free_text_prescription(
+        client,
+        consultation_id=consultation["id"],
+        patient_id=appointment["patient_id"],
+        doctor_id=doctor["id"],
+        source="doctor_completed_consultation",
+        source_id=appointment_id,
+        items=medications,
+        clinical_advice=advice,
+        notes=payload.clinical_note.strip() or None,
+    )
+    updated_appointment = appointment
+    if payload.mark_completed:
+        updated = client.table("appointments").update({"status": "completed"}).eq(
+            "id", appointment_id
+        ).eq("doctor_id", doctor["id"]).execute().data or []
+        if updated:
+            updated_appointment = updated[0]
+    return {"data": {
+        "appointment": updated_appointment,
+        "consultation": consultation,
+        "prescription": prescription,
+    }}
 
 
 @router.get("/me/consultations")
@@ -2355,10 +2532,24 @@ def my_prescriptions(claims: dict = Depends(current_claims)):
     if not column: raise HTTPException(status_code=403, detail="Prescription scope is not available for this role")
     rows = client.table("prescriptions").select("*").eq(column, claims["sub"]).order("prescription_date", desc=True).execute().data or []
     for row in rows:
+        free_text = decode_free_text_prescription_notes(row.get("notes"))
         items = client.table("prescription_items").select("*").eq("prescription_id", row["id"]).execute().data or []
         medicine_ids = [item.get("medicine_id") for item in items if item.get("medicine_id")]
         medicines = _index(_rows(client, "medicines", "id", medicine_ids, "*"))
         row["items"] = [{**item, "medicine": medicines.get(str(item.get("medicine_id")))} for item in items]
+        if free_text:
+            row["items"].extend({
+                "id": f"free-text-{row['id']}-{index}",
+                "prescription_id": row["id"],
+                "medicine_id": None,
+                "medicine_name": item["name"],
+                "dosage": item["dosage"],
+                "frequency": item["frequency"],
+                "duration": item["duration"],
+                "instructions": item["instructions"],
+                "medicine": None,
+            } for index, item in enumerate(free_text["free_text_items"]))
+            row["notes"] = free_text.get("notes") or "; ".join(free_text["clinical_advice"]) or "Physician-reviewed medication entry."
     return {"data": rows}
 
 

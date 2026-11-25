@@ -8,6 +8,7 @@ from typing import Any
 from supabase import Client
 
 from .ai_service import ai_provider
+from .clinical_drafts import normalize_clinical_advice, normalize_suggested_medications
 
 logger = logging.getLogger(__name__)
 
@@ -194,14 +195,26 @@ def generate_summary(
         if row.get("role") in {"patient", "assistant", "system"}
     ]
     prompt = f"""Create a clinician-review draft for this AI {mode} consultation.
-Use only transcript/context facts. Never infer an unreported fact. This is not a diagnosis or
-prescription. Leave unknown items empty or null. Do not fabricate citations or similar cases.
+Use only transcript/context facts. Never infer an unreported fact. This output is a draft for a
+physician, not patient-facing diagnosis, advice, or prescription. Medication entries are
+unapproved candidates only and MUST be left empty unless the available verified chart context
+supports safe clinician consideration. Never recommend a candidate that conflicts with a
+verified allergy, condition, or current medication. Do not invent patient-specific dosage,
+frequency, or duration; leave those fields blank unless explicitly supported by verified
+clinician-entered context. Patient-reported allergies/medications must be preserved as reports,
+not treated as verified or used as a prescription source. Clinical advice is a draft for the
+physician to review, not instructions for the patient to follow before approval.
+Leave unknown items empty or null. Do not fabricate citations or similar cases.
 Return only valid JSON with these keys: clinical_summary (string), symptoms (array of objects
 with name, duration, severity, frequency, source_message_id), relevant_history (array),
 medications (array), allergies (array), clinical_considerations (array), suggested_investigations
 (array, empty unless explicitly supported as a consideration), draft_prescription (null),
-evidence_references (array), uncertainties (array), warning_indicators (array),
-similar_cases (object with status and matches). Clearly describe considerations as unconfirmed.
+suggested_medications (array of objects with name, dosage, frequency, duration, instructions),
+clinical_advice (array of concise strings), evidence_references (array), uncertainties (array),
+warning_indicators (array), similar_cases (object with status and matches).
+Set suggested_medications to [] when safety or evidence is uncertain. Clearly label all generated
+medication suggestions as unapproved candidates requiring physician verification, and describe
+clinical considerations as unconfirmed.
 Similar cases, when supplied, are de-identified, doctor-approved symptom patterns from this hospital.
 They are contextual examples only, never evidence about this patient and never a diagnosis.
 
@@ -258,6 +271,7 @@ Transcript: {json.dumps(transcript, ensure_ascii=False)}
                 "clinical_summary": raw[:4000], "symptoms": [], "relevant_history": [],
                 "medications": [], "allergies": [], "clinical_considerations": [],
                 "suggested_investigations": [], "draft_prescription": None,
+                "suggested_medications": [], "clinical_advice": [],
                 "evidence_references": [], "uncertainties": ["Structured extraction needs clinician review."],
                 "warning_indicators": [], "similar_cases": {"status": "not_available", "matches": []},
             }
@@ -289,6 +303,12 @@ Transcript: {json.dumps(transcript, ensure_ascii=False)}
             logger.warning("AI Chat summary field contained non-readable structured output")
             raise RuntimeError("AI Chat summary provider returned non-readable structured output")
     parsed["draft_prescription"] = None
+    parsed["suggested_medications"] = normalize_suggested_medications(
+        parsed.get("suggested_medications")
+    )
+    parsed["clinical_advice"] = normalize_clinical_advice(parsed.get("clinical_advice"))
+    parsed["suggested_medications_status"] = "requires_doctor_review"
+    parsed["clinical_advice_status"] = "requires_doctor_review"
     parsed["similar_cases"] = {"status": "not_consented", "matches": []}
     valid_sources = {str(row.get("id")) for row in messages if row.get("id")}
     for rows in context.values():

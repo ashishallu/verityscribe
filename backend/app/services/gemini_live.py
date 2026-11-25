@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from ..core.config import settings
+from .clinical_drafts import normalize_clinical_advice, normalize_suggested_medications
 
 logger = logging.getLogger(__name__)
 APP_NAME = "verityscribe_ai_virtual"
@@ -375,7 +376,12 @@ class GeminiLiveService:
             "and the small verified-record context. This is a summary, NOT a transcript: remove greetings, repeated "
             "questions, acknowledgements, filler, and duplicate details. Patient turns are the only conversation "
             "evidence. Interviewer turns are question/context only, never patient facts. Clearly mark record-derived "
-            "facts as from the chart. Do not infer a diagnosis or recommend treatment. "
+            "facts as from the chart. This output is a physician-review draft, not patient-facing advice or a "
+            "prescription. Suggested medications are unapproved physician-review candidates only: leave the list "
+            "empty unless verified chart context supports safe consideration; never conflict with a verified allergy, "
+            "condition, or current medication; do not invent patient-specific dosage, frequency, or duration. "
+            "Patient-reported medicines and allergies are reports, not verified prescription sources. Clinical advice "
+            "must be a draft for the physician to review, not patient-facing instructions before approval. "
             "Set clinical_summary to a brief professional summary with these headings and content: "
             "Problem; Symptoms and course (location, onset/duration, severity/frequency, associated symptoms only "
             "when stated); Medications; Relevant history and allergies; Clarifications needed; Status. "
@@ -385,14 +391,16 @@ class GeminiLiveService:
             "Preserve contradictions as needing clarification. Do not use assistant questions as evidence. Do not "
             "translate or guess unclear Telugu, Hindi, code-switched, or other-language words; retain meaning only "
             "when unambiguous, otherwise say the transcript needs confirmation. The complete original transcript "
-            "is stored separately and must not be rewritten. No diagnosis, prescription, dosage, examination finding, "
-            "or clinician advice may be invented. Physician review is mandatory. "
+            "is stored separately and must not be rewritten. Do not invent a diagnosis, examination finding, or "
+            "patient-specific medication dose. Physician review is mandatory. "
             "Return one JSON object with keys: "
             "clinical_summary (string), chief_complaint (string or null), symptoms (array), "
             "onset_duration (array), severity_frequency (array), associated_symptoms (array), "
             "relevant_history (array), medications (array), allergies (array), additional_notes (array), "
             "positive_findings (array), negative_findings (array), risk_indicators (array), "
-            "follow_up_recommendations (array), items_for_doctor_review (array), unanswered_questions (array), "
+            "follow_up_recommendations (array), clinical_advice (array of strings), "
+            "suggested_medications (array of objects with name, dosage, frequency, duration, instructions), "
+            "items_for_doctor_review (array), unanswered_questions (array), "
             "uncertainties (array), completion_status (complete or ended_early), "
             "draft_prescription (null), review_required (true), interview_complete (boolean). "
             "Do not infer missing facts. For incomplete interviews say ended early and require clinician review. "
@@ -689,13 +697,19 @@ class GeminiLiveService:
 
         parsed["summary_generation_provider"] = summary_provider
         parsed["draft_prescription"] = None
+        parsed["suggested_medications"] = normalize_suggested_medications(
+            parsed.get("suggested_medications")
+        )
+        parsed["clinical_advice"] = normalize_clinical_advice(parsed.get("clinical_advice"))
+        parsed["suggested_medications_status"] = "requires_doctor_review"
+        parsed["clinical_advice_status"] = "requires_doctor_review"
         parsed["review_required"] = True
         parsed["interview_complete"] = interview_complete
         for field in (
             "symptoms", "onset_duration", "severity_frequency", "associated_symptoms",
             "relevant_history", "medications", "allergies", "additional_notes",
             "positive_findings", "negative_findings", "risk_indicators",
-            "follow_up_recommendations", "items_for_doctor_review",
+            "follow_up_recommendations", "clinical_advice", "items_for_doctor_review",
             "unanswered_questions", "uncertainties",
         ):
             value = parsed.get(field)

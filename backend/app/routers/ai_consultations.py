@@ -9,7 +9,7 @@ import uuid
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -253,6 +253,7 @@ class DirectLiveTurnRequest(BaseModel):
 class ReviewRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected|request_information)$")
     summary: dict[str, Any] | None = None
+    edited_summary: dict[str, Any] | None = None
     note: str | None = Field(default=None, max_length=4000)
 
     @field_validator("summary")
@@ -2045,20 +2046,97 @@ def review_consultation(session_id: str, payload: ReviewRequest, doctor: dict = 
     if session["status"] not in {"awaiting_doctor_review", "failed"}:
         raise HTTPException(status_code=409, detail="This consultation is not ready for review")
     before = session.get("summary")
-    after = payload.summary if payload.summary is not None else before
+    submitted_summary = payload.edited_summary if payload.edited_summary is not None else payload.summary
+    after = submitted_summary if submitted_summary is not None else before
     if payload.decision == "approved":
         if not isinstance(after, dict) or not str(after.get("clinical_summary", "")).strip():
             raise HTTPException(status_code=422, detail="A reviewed clinical summary is required")
-        existing = client.table("consultations").select("id").eq("appointment_id", session["appointment_id"]).limit(1).execute().data or []
+        from ..services.clinical_drafts import (
+            encode_free_text_prescription_notes,
+            format_treatment_plan,
+            normalize_clinical_advice,
+            normalize_suggested_medications,
+            decode_free_text_prescription_notes,
+        )
+
+        approved_medications = normalize_suggested_medications(after.get("suggested_medications"))
+        reviewed_advice = normalize_clinical_advice(after.get("clinical_advice"))
+        after = {
+            **after,
+            "suggested_medications": approved_medications,
+            "clinical_advice": reviewed_advice,
+            "suggested_medications_status": "doctor_approved" if approved_medications else "none",
+            "clinical_advice_status": "doctor_approved" if reviewed_advice else "none",
+        }
+        existing = client.table("consultations").select("*").eq("appointment_id", session["appointment_id"]).limit(1).execute().data or []
+        explicit_diagnosis = str(after.get("doctor_confirmed_diagnosis") or after.get("diagnosis") or "").strip()
+        clinical_considerations = after.get("clinical_considerations")
+        if isinstance(clinical_considerations, list):
+            considerations_text = "; ".join(str(item).strip() for item in clinical_considerations if str(item).strip())
+        else:
+            considerations_text = str(clinical_considerations or "").strip()
+        treatment_plan = format_treatment_plan(
+            existing[0].get("treatment_plan") if existing else None,
+            reviewed_advice,
+            approved_medications,
+        )
+        if considerations_text:
+            treatment_plan = "\n\n".join(
+                part for part in (
+                    treatment_plan,
+                    "Clinical considerations for physician review (not a confirmed diagnosis): " + considerations_text[:2000],
+                ) if part
+            )[:12000]
         if existing:
-            consultation = existing[0]
+            consultation_id = existing[0]["id"]
+            consultation_patch = {
+                "symptoms": after.get("clinical_summary"),
+                "treatment_plan": treatment_plan,
+            }
+            if explicit_diagnosis:
+                consultation_patch["diagnosis"] = explicit_diagnosis[:1000]
+            consultation = client.table("consultations").update(
+                consultation_patch
+            ).eq("id", consultation_id).execute().data[0]
         else:
             consultation = client.table("consultations").insert({
                 "appointment_id": session["appointment_id"], "patient_id": session["patient_id"],
                 "doctor_id": doctor["id"], "consultation_date": datetime.now(timezone.utc).isoformat(),
                 "consultation_type": session["mode"], "symptoms": after.get("clinical_summary"),
-                "diagnosis": None, "treatment_plan": None,
+                "diagnosis": explicit_diagnosis[:1000] if explicit_diagnosis else None,
+                "treatment_plan": treatment_plan,
             }).execute().data[0]
+        if approved_medications:
+            prescription_rows = client.table("prescriptions").select("*").eq(
+                "consultation_id", consultation["id"]
+            ).execute().data or []
+            matching = next((
+                row for row in prescription_rows
+                if (decode_free_text_prescription_notes(row.get("notes")) or {}).get("source_id") == session_id
+            ), None)
+            prescription_notes = encode_free_text_prescription_notes(
+                items=approved_medications,
+                clinical_advice=reviewed_advice,
+                source="doctor_approved_ai_consultation",
+                source_id=session_id,
+                existing_notes=matching.get("notes") if matching else None,
+            )
+            if matching:
+                client.table("prescriptions").update({"notes": prescription_notes}).eq(
+                    "id", matching["id"]
+                ).execute()
+            else:
+                client.table("prescriptions").insert({
+                    "consultation_id": consultation["id"],
+                    "patient_id": session["patient_id"],
+                    "doctor_id": doctor["id"],
+                    "prescription_date": date.today().isoformat(),
+                    "expiry_date": None,
+                    "notes": prescription_notes,
+                    # This is a physician-reviewed chart entry, not a signed
+                    # catalog-based e-prescription.
+                    "is_digital": False,
+                }).execute()
         session = client.table("ai_consultation_sessions").update({
             "status": "approved", "summary": after, "consultation_id": consultation["id"],
             "reviewed_by": doctor["id"], "reviewed_at": datetime.now(timezone.utc).isoformat(), "review_note": payload.note,
